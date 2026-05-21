@@ -43,14 +43,28 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid version: $Version" }
 $Tag = "v$Version"
 Write-Host "=== Pantoufa Release v$Version ===" -ForegroundColor Cyan
 
-# ── token ─────────────────────────────────────────────────────────────
+# ── token (NEVER stored in this file — read at runtime) ────────────
 if (-not $Token) {
+  # 1. GH_TOKEN environment variable (recommended)
+  $Token = $env:GH_TOKEN
+}
+if (-not $Token) {
+  # 2. .env file
+  $envFile = Join-Path $RepoRoot ".env"
+  if (Test-Path $envFile) {
+    $envContent = Get-Content $envFile -Raw
+    if ($envContent -match 'GH_TOKEN=(\S+)') { $Token = $Matches[1] }
+  }
+}
+if (-not $Token) {
+  # 3. Extract from git remote (local .git/config — never committed)
   $remote = git remote get-url origin 2>$null
   if ($remote -match 'https://([^@]+)@github.com') {
     $Token = $Matches[1]
-  } else {
-    throw "No token found. Set GH_TOKEN env var or pass -Token"
   }
+}
+if (-not $Token) {
+  throw "No GitHub token found. Set GH_TOKEN env var, add GH_TOKEN= to .env, or pass -Token"
 }
 $ApiBase = "https://api.github.com/repos/techvibedz/anime-desktop"
 $ApiHeaders = @{ Authorization = "token $Token"; Accept = "application/vnd.github+json" }
