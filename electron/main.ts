@@ -64,9 +64,10 @@ function handleAuthCallbackUrl(url: string) {
 
 function createMainWindow() {
   // Resolve the bundled icon — packaged app reads from resources/build/, dev reads from ../../build/.
+  const iconExt = process.platform === "win32" ? "ico" : "png";
   const iconPath = app.isPackaged
-    ? path.join(process.resourcesPath, "build", "icon.ico")
-    : path.join(__dirname, "..", "..", "build", "icon.ico");
+    ? path.join(process.resourcesPath, "build", `icon.${iconExt}`)
+    : path.join(__dirname, "..", "..", "build", `icon.${iconExt}`);
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
