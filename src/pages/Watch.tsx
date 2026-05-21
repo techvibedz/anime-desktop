@@ -68,6 +68,7 @@ export function WatchPage() {
   const [retryServersNonce, setRetryServersNonce] = useState(0);
   const [brokenIds, setBrokenIds] = useState<Set<string>>(new Set());
   const [retryNonce, setRetryNonce] = useState(0);
+  const [userActivated, setUserActivated] = useState(false);
 
   // Sibling episode navigation
   const [siblings, setSiblings] = useState<Episode[]>([]);
@@ -143,14 +144,22 @@ export function WatchPage() {
     return () => { cancelled = true; };
   }, [resolvedAnimeHref]);
 
-  // Auto-pick the highest-ranked NON-broken server.
+  // Auto-pick the highest-ranked NON-broken server (highlight only).
   useEffect(() => {
     if (sortedServers.length === 0) return;
     const firstGood = sortedServers.findIndex((s) => !brokenIds.has(s.id));
-    if (activeIdx === null || (activeIdx !== null && brokenIds.has(sortedServers[activeIdx]?.id))) {
-      if (firstGood >= 0) setActiveIdx(firstGood);
+    if (firstGood >= 0 && activeIdx === null) {
+      setActiveIdx(firstGood);
     }
   }, [sortedServers, brokenIds, activeIdx]);
+
+  const activateServer = useCallback((idx: number) => {
+    setActiveIdx(idx);
+    setUserActivated(true);
+    setResolved(null);
+    setStatus("resolving");
+    setRetryNonce((n) => n + 1);
+  }, []);
 
   const advanceToNext = useCallback(() => {
     if (activeIdx === null) return;
@@ -159,8 +168,10 @@ export function WatchPage() {
     setStatus("failed");
   }, [activeIdx, sortedServers]);
 
-  // Resolve the active server with auto-retry once.
+  // Resolve the active server only after user clicks (lazy-load to prevent
+  // tokenized stream URLs from expiring while the user is reading the page).
   useEffect(() => {
+    if (!userActivated) return;
     if (activeIdx === null || !sortedServers[activeIdx]) return;
     const srv = sortedServers[activeIdx];
     let cancelled = false;
@@ -254,9 +265,21 @@ export function WatchPage() {
       }
     };
 
+    // Fast recovery for chunk drops — the `stalled` event fires when the
+    // browser can't download data quickly enough (unlike the 15s stall
+    // timer which is the last resort). This catches transient CDN drops.
+    const onStalled = () => {
+      console.warn("[player] video stalled — chunk drop detected, attempting recovery");
+      if (v.paused) {
+        v.play().catch(() => {});
+      }
+      lastTimeUpdate = Date.now();
+    };
+
     v.addEventListener("playing", onPlaying);
     v.addEventListener("timeupdate", onTimeUpdate);
     v.addEventListener("progress", onProgress);
+    v.addEventListener("stalled", onStalled);
     
     const interval = setInterval(checkStall, 1000);
 
@@ -285,6 +308,7 @@ export function WatchPage() {
       });
       let recoveryUsed = false;
       let reextractUsed = false;
+      let recoveryCount = 0;
       hls.loadSource(proxied);
       hls.attachMedia(v);
       hls.on(Hls.Events.FRAG_LOADED, () => { if (!played) lastTimeUpdate = Date.now(); });
@@ -298,12 +322,20 @@ export function WatchPage() {
         if (!reextractUsed && (status === 410 || status === 403 || status === 401)) {
           reextractUsed = true;
           console.warn(`[player] HLS auth error (${status}), re-extracting fresh URL`);
-          // Drop cached extraction so resolveVideo runs again, then bump nonce.
           import("../lib/api").then(({ invalidateResolveCache }) => {
             try { invalidateResolveCache?.(resolved.embed); } catch {}
             setRetryNonce((n) => n + 1);
           });
           return;
+        }
+        // Fragment parsing errors — try network recovery before advancing
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && data.details === "fragParsingError") {
+          recoveryCount++;
+          if (recoveryCount <= 3) {
+            console.warn(`[player] frag parsing error, media recovery attempt ${recoveryCount}`);
+            hls.recoverMediaError();
+            return;
+          }
         }
         if (!recoveryUsed) {
           recoveryUsed = true;
@@ -327,6 +359,7 @@ export function WatchPage() {
       v.removeEventListener("playing", onPlaying);
       v.removeEventListener("timeupdate", onTimeUpdate);
       v.removeEventListener("progress", onProgress);
+      v.removeEventListener("stalled", onStalled);
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
     };
   }, [resolved, advanceToNext]);
@@ -717,6 +750,14 @@ export function WatchPage() {
                   Retry Loading Servers
                 </button>
               </>
+            ) : !loadingServers && activeIdx !== null && !userActivated ? (
+              <button
+                onClick={() => activateServer(activeIdx)}
+                className="flex items-center gap-2 rounded-full bg-accent px-6 py-3 text-base font-bold text-white shadow-glow hover:bg-accent/80 transition"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
+                {t.playNow ?? "▶ Play"}
+              </button>
             ) : (
               <>
                 {!allBroken && <div className="h-8 w-8 animate-spin rounded-full border-2 border-accent border-t-transparent" />}
@@ -778,8 +819,7 @@ export function WatchPage() {
                   key={s.id}
                   onClick={() => {
                     if (broken) setBrokenIds((prev) => { const c = new Set(prev); c.delete(s.id); return c; });
-                    setActiveIdx(i);
-                    setRetryNonce((n) => n + 1);
+                    activateServer(i);
                   }}
                   className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition ${
                     activeIdx === i

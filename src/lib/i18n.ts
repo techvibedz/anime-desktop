@@ -74,6 +74,7 @@ export const ar = {
   noResults: "لا توجد نتائج",
 
   // Watch / Player
+  playNow: "▶ تشغيل",
   loadingServers: "جاري تحميل المصادر…",
   noServers: "لا توجد مصادر متاحة.",
   resolving: (n: string) => `جاري تحضير ${n}…`,

@@ -186,6 +186,49 @@ function rewriteM3U8(text: string, baseUrl: string, referer: string): string {
 function registerVideoProxy() {
   const scraperSession = session.fromPartition("persist:scraper");
 
+  // Intercept ALL outgoing requests from the scraper session and inject
+  // default Referer + Origin for known video CDN domains. This is pre-emptive
+  // — happens before the request leaves, unlike the strategy race which is
+  // reactive. Essential for providers (mp4upload, streamwish) that reject
+  // requests with missing or wrong Referer. Also prevents the black-screen /
+  // infinite-loading issue where no strategy works because the CDN server
+  // already blocked the first request.
+  scraperSession.webRequest.onBeforeSendHeaders(
+    { urls: ["*://*.mp4upload.com/*", "*://*.streamwish.to/*", "*://*.hgcloud.cc/*", "*://*.hgcloud.to/*", "*://*.wishfast.com/*", "*://*.wishembed.pro/*", "*://*.jwembed.com/*", "*://*.hlswish.com/*", "*://*.vibuxer.com/*", "*://*.audinifer.com/*", "*://*.masukestin.com/*", "*://*.voe.sx/*", "*://*.dood.li/*", "*://*.doodstream.com/*", "*://*.uqload.io/*", "*://*.uqload.com/*", "*://*.share4max.com/*", "*://*.megamax.com/*", "*://*.videa.hu/*", "*://*.ok.ru/*"] },
+    (details, callback) => {
+      const host = new URL(details.url).hostname.toLowerCase();
+      let ref = "";
+      let ori = "";
+      if (/mp4upload/.test(host)) {
+        ref = "https://www.mp4upload.com/";
+        ori = "https://www.mp4upload.com";
+      } else if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin/.test(host)) {
+        const root = host.split(".").slice(-2).join(".");
+        ref = `https://${root}/`;
+        ori = `https://${root}`;
+      } else if (/voe\./.test(host)) {
+        ref = "https://voe.sx/";
+        ori = "https://voe.sx";
+      } else if (/doodstream|dood\./.test(host)) {
+        ref = "https://dood.li/";
+        ori = "https://dood.li";
+      } else if (/uqload/.test(host)) {
+        ref = "https://uqload.io/";
+        ori = "https://uqload.io";
+      } else if (/share4max|megamax/.test(host)) {
+        ref = "https://share4max.com/";
+        ori = "https://share4max.com";
+      } else {
+        const root = host.split(".").slice(-2).join(".");
+        ref = `https://${root}/`;
+        ori = `https://${root}`;
+      }
+      details.requestHeaders["Referer"] = ref;
+      details.requestHeaders["Origin"] = ori;
+      callback({ requestHeaders: details.requestHeaders });
+    },
+  );
+
   // Ported from mobile app (app/watch/[episode].tsx). Each provider has a
   // canonical embed origin that its CDN whitelists. mp4upload's segment
   // host (a4.mp4upload.com:183) rejects www.mp4upload.com embed-URL

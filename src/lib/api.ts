@@ -13,6 +13,12 @@ import {
   findCrossSourceUrl,
   extractVideoUrl as scrapeExtractVideoUrl,
 } from "./scraper";
+import {
+  searchAnilist,
+  getRelations,
+  findOnWitanime,
+  cleanTitle,
+} from "./anilist";
 
 const HOME_CACHE_KEY = "@home_cache_v1";
 const HOME_CACHE_TTL = 30 * 60 * 1000;
@@ -71,6 +77,7 @@ export interface AnimeDetail {
   metadata: Record<string, string>;
   externalLinks: { label: string; href: string }[];
   relatedAnime: { title: string; href: string; image: string; type: string | null }[];
+  anilistRelated: { title: string; href: string; image: string; type: string }[];
   totalEpisodes: number; episodes: Episode[];
 }
 export interface VideoServer {
@@ -199,19 +206,66 @@ async function fetchEpisodesFresh(animeUrl: string): Promise<EpisodesPayload> {
     image: imgOrEmpty(r.image),
     type: r.type,
   }));
+
+  // Start AniList enrichment in the background — non-blocking.
+  const anilistRelatedPromise = enrichRelatedFromAnilist(d.title).catch(() => [] as { title: string; href: string; image: string; type: string }[]);
+
   const payload: EpisodesPayload = {
     success: true,
     data: {
       title: d.title, poster: d.poster, banner: d.poster,
       synopsis: d.synopsis, genres: d.genres, rating: null,
       metadata: {}, externalLinks: [], relatedAnime,
+      anilistRelated: [],
       totalEpisodes: d.episodes.length, episodes: d.episodes,
       episodes4up: [], merged: null,
       up4Hint: d.up4Url ?? null,
     },
   };
-  void writeCache(DETAIL_CACHE_PREFIX + animeUrl, payload);
-  return payload;
+
+  // Wait for AniList enrichment, then update cache + return
+  return anilistRelatedPromise.then((anilistRelated) => {
+    payload.data.anilistRelated = anilistRelated;
+    void writeCache(DETAIL_CACHE_PREFIX + animeUrl, payload);
+    return payload;
+  });
+}
+
+async function enrichRelatedFromAnilist(
+  title: string
+): Promise<{ title: string; href: string; image: string; type: string }[]> {
+  try {
+    // 1. Find on AniList
+    const match = await searchAnilist(title);
+    if (!match) return [];
+
+    // 2. Get relations tree
+    const relations = await getRelations(match.id);
+    if (!relations.length) return [];
+
+    // 3. Map each relation back to witanime (with 5s timeout per relation)
+    const results = await Promise.all(
+      relations.map(async (rel) => {
+        try {
+          const searchTitle = `${cleanTitle(rel.title)}`;
+          const href = await findOnWitanime(searchTitle);
+          return {
+            title: rel.title,
+            href: href ?? "",
+            image: rel.image,
+            type: rel.relationType,
+          };
+        } catch {
+          return { title: rel.title, href: "", image: rel.image, type: rel.relationType };
+        }
+      })
+    );
+
+    return results.filter((r) => r.href); // Only show items we can link to
+  } catch (e) {
+    console.warn("[anilist] enrichment failed:", e);
+    return [];
+  }
 }
 
 export async function fetchEpisodes(animeUrl: string): Promise<EpisodesPayload> {

@@ -273,11 +273,12 @@ export function AnimeDetailPage() {
         </div>
       )}
 
-      {data.relatedAnime.length > 0 && (
+      {((data.anilistRelated ?? []).length > 0 || data.relatedAnime.length > 0) && (
         <section className="space-y-3">
           <h2 className="font-display text-2xl font-bold">المواسم والأعمال ذات الصلة</h2>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
-            {data.relatedAnime.map((r) => (
+            {/* AniList relations (primary — accurate, with type badges) */}
+            {(data.anilistRelated ?? []).map((r) => (
               <Link
                 key={r.href}
                 to={`/anime/${encodeURIComponent(r.href)}`}
@@ -295,11 +296,9 @@ export function AnimeDetailPage() {
                     <div className="h-full w-full shimmer" />
                   )}
                   <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/90 to-transparent" />
-                  {r.type && (
-                    <span className="absolute start-2 top-2 rounded-md bg-black/60 px-2 py-0.5 text-[10px] font-semibold text-white/90 backdrop-blur-sm">
-                      {r.type}
-                    </span>
-                  )}
+                  <span className="absolute start-2 top-2 rounded-md bg-accent/90 px-2 py-0.5 text-[10px] font-semibold text-white backdrop-blur-sm">
+                    {r.type}
+                  </span>
                   <div className="absolute inset-x-0 bottom-0 p-2.5">
                     <h3 className="line-clamp-2 text-[13px] font-semibold leading-tight text-white">
                       {r.title}
@@ -308,6 +307,40 @@ export function AnimeDetailPage() {
                 </div>
               </Link>
             ))}
+            {/* Scraper fallback (for items not covered by AniList) */}
+            {data.relatedAnime
+              .filter((r) => !(data.anilistRelated ?? []).some((a) => a.href === r.href))
+              .map((r) => (
+                <Link
+                  key={r.href}
+                  to={`/anime/${encodeURIComponent(r.href)}`}
+                  className="group block w-full"
+                >
+                  <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface">
+                    {r.image ? (
+                      <img
+                        src={r.image}
+                        alt={r.title}
+                        className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                        loading="lazy"
+                      />
+                    ) : (
+                      <div className="h-full w-full shimmer" />
+                    )}
+                    <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/90 to-transparent" />
+                    {r.type && (
+                      <span className="absolute start-2 top-2 rounded-md bg-black/60 px-2 py-0.5 text-[10px] font-semibold text-white/90 backdrop-blur-sm">
+                        {r.type}
+                      </span>
+                    )}
+                    <div className="absolute inset-x-0 bottom-0 p-2.5">
+                      <h3 className="line-clamp-2 text-[13px] font-semibold leading-tight text-white">
+                        {r.title}
+                      </h3>
+                    </div>
+                  </div>
+                </Link>
+              ))}
           </div>
         </section>
       )}
