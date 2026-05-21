@@ -63,34 +63,65 @@ export function SeeAllPage() {
     if (loadingMore || !hasMore) return;
     setLoadingMore(true);
     const next = page + 1;
+    console.info(`[see-all] loading page ${next} of "${section}"`);
     try {
       if (section === "recently_updated") {
         const r = await fetchRecent(next);
-        if (r.data.episodes.length === 0) setHasMore(false);
-        else setItems((prev) => dedupe(prev.concat(r.data.episodes)));
+        const fresh = r.data.episodes;
+        if (fresh.length === 0) {
+          console.info(`[see-all] page ${next} returned 0 episodes — end of list`);
+          setHasMore(false);
+        } else {
+          setItems((prev) => {
+            const merged = dedupe(prev.concat(fresh));
+            if (merged.length === prev.length) {
+              console.warn(`[see-all] page ${next} fetched ${fresh.length} items but all were duplicates — stopping`);
+              setHasMore(false);
+            }
+            return merged;
+          });
+        }
       } else if (section === "all_anime") {
         const r = await fetchAllAnime(next);
-        if (r.data.items.length === 0) setHasMore(false);
-        else setItems((prev) => dedupe(prev.concat(r.data.items)));
+        const fresh = r.data.items;
+        if (fresh.length === 0) {
+          setHasMore(false);
+        } else {
+          setItems((prev) => {
+            const merged = dedupe(prev.concat(fresh));
+            if (merged.length === prev.length) {
+              console.warn(`[see-all] page ${next} all duplicates — stopping`);
+              setHasMore(false);
+            }
+            return merged;
+          });
+        }
       } else {
         setHasMore(false);
       }
       setPage(next);
+    } catch (e) {
+      console.warn(`[see-all] load page ${next} failed:`, e);
     } finally {
       setLoadingMore(false);
     }
   }, [page, section, hasMore, loadingMore]);
 
-  // Infinite scroll via IntersectionObserver
+  // Infinite scroll via IntersectionObserver. Re-creates whenever items
+  // grow so the observer is attached to a fresh sentinel (the previous
+  // one may have been re-mounted by React after layout shift).
   useEffect(() => {
-    if (!sentinelRef.current || !hasMore) return;
+    if (!sentinelRef.current || !hasMore || loading) return;
     const el = sentinelRef.current;
     const io = new IntersectionObserver((entries) => {
-      if (entries[0]?.isIntersecting) loadMore();
-    }, { rootMargin: "600px" });
+      if (entries[0]?.isIntersecting && !loadingMore) {
+        console.info(`[see-all] sentinel visible — triggering loadMore`);
+        loadMore();
+      }
+    }, { rootMargin: "800px" });
     io.observe(el);
     return () => io.disconnect();
-  }, [loadMore, hasMore]);
+  }, [loadMore, hasMore, loading, loadingMore, items.length]);
 
   return (
     <div className="space-y-5">
@@ -115,11 +146,16 @@ export function SeeAllPage() {
       )}
 
       {hasMore && !loading && (
-        <div ref={sentinelRef} className="flex items-center justify-center py-8">
+        <div ref={sentinelRef} className="flex flex-col items-center justify-center gap-3 py-8">
           {loadingMore ? (
             <div className="h-8 w-8 animate-spin rounded-full border-2 border-accent border-t-transparent" />
           ) : (
-            <span className="text-sm text-text-muted">{t.loading}</span>
+            <button
+              onClick={loadMore}
+              className="rounded-full border border-white/10 bg-surface px-6 py-2.5 text-sm font-semibold text-white hover:border-accent hover:bg-accent/10"
+            >
+              عرض المزيد
+            </button>
           )}
         </div>
       )}

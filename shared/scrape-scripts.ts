@@ -208,6 +208,26 @@ if (episodes.length === 0) {
   episodes.sort(function (a, b) { return a.number - b.number; });
 }
 
+// Scrape related-anime cards (other seasons / OVAs / sequels of this anime).
+// witanime exposes them inside a "ذات صلة" section or as .related-anime cards.
+var related = [];
+var relatedSeen = {};
+document.querySelectorAll('.related-anime .anime-card-container, .anime-row .anime-card-container, [class*="related"] .anime-card-container').forEach(function (el) {
+  var hrefEl = el.querySelector('.anime-card-poster a.overlay, a[href*="/anime/"]');
+  var href = (hrefEl && hrefEl.getAttribute('href')) || '';
+  if (!href || relatedSeen[href]) return;
+  if (href.indexOf('/anime/') < 0) return;
+  // Skip the current anime if it shows up in its own related list.
+  if (href === location.href || href + '/' === location.href || href === location.href + '/') return;
+  relatedSeen[href] = true;
+  related.push({
+    title: (el.querySelector('.anime-card-title h3 a, .anime-card-title a') && el.querySelector('.anime-card-title h3 a, .anime-card-title a').textContent.trim()) || '',
+    href: href,
+    image: window.__pBestImg(el),
+    type: (el.querySelector('.anime-card-type a') && el.querySelector('.anime-card-type a').textContent.trim()) || null,
+  });
+});
+
 return {
   title: (titleEl && titleEl.textContent.trim()) || '',
   poster: (posterImg && (posterImg.getAttribute('data-image') || posterImg.getAttribute('src'))) || '',
@@ -215,6 +235,7 @@ return {
   genres: genres,
   episodes: episodes,
   up4Url: up4Url,
+  related: related,
 };
 })();`;
 

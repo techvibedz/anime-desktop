@@ -60,6 +60,8 @@ export type RawDetail = {
   episodes: { title: string; number: number; type: string; screenshot: string; href: string | null }[];
   /** Direct anime4up link discovered on the wit page (when present). */
   up4Url?: string | null;
+  /** Other seasons / OVAs of the same series scraped from the page. */
+  related?: { title: string; href: string; image: string | null; type: string | null }[];
 };
 
 export async function scrapeEpisodesPage(animeUrl: string) {

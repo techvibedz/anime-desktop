@@ -60,7 +60,14 @@ export function EpisodeCard({
     >
       <div className="relative aspect-video overflow-hidden rounded-lg bg-surface">
         {episode.image ? (
-          <img src={episode.image} alt={episode.title} className="h-full w-full object-contain bg-black transition-transform duration-300 group-hover:scale-105" loading="lazy" />
+          <img
+            src={episode.image}
+            alt={episode.title}
+            // object-cover fills the card without the tall black bars
+            // that appeared when the source image was a portrait poster.
+            className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+            loading="lazy"
+          />
         ) : (
           <div className="h-full w-full shimmer" />
         )}

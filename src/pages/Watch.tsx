@@ -537,11 +537,14 @@ export function WatchPage() {
 
       {/* Custom player — force LTR so seek bar fills left→right and
           prev/play/next buttons stay in their natural order regardless
-          of the page-wide RTL direction. */}
+          of the page-wide RTL direction. Also hide the mouse cursor
+          while playing + controls hidden, restore on mousemove. */}
       <div
         ref={playerRef}
         dir="ltr"
-        className="group relative aspect-video w-full overflow-hidden rounded-xl border border-white/10 bg-black shadow-card"
+        className={`group relative aspect-video w-full overflow-hidden rounded-xl border border-white/10 bg-black shadow-card ${
+          isPlaying && !controlsVisible ? "cursor-none" : "cursor-default"
+        }`}
         onMouseMove={showControls}
         onMouseLeave={() => { if (isPlaying) setControlsVisible(false); }}
       >

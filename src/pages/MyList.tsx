@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { getFavorites, removeFavorite, type FavoriteAnime, type FavoriteList } from "../lib/favorites";
 import { getHistory, type WatchEntry, isCompleted, progressPercent } from "../lib/history";
+import { extractEpisodeNumber } from "../lib/episode-utils";
 import { t } from "../lib/i18n";
 
 const TABS: { id: FavoriteList | "history"; label: string }[] = [
@@ -88,6 +89,7 @@ function FavRow({ fav, onRemove }: { fav: FavoriteAnime; onRemove: () => void })
 function HistoryRow({ entry }: { entry: WatchEntry }) {
   const pct = Math.round(progressPercent(entry) * 100);
   const done = isCompleted(entry);
+  const num = extractEpisodeNumber(entry.episodeTitle, entry.episodeHref);
   const params = new URLSearchParams();
   if (entry.image) params.set("img", entry.image);
   if (entry.animeHref) params.set("anime", entry.animeHref);
@@ -100,7 +102,7 @@ function HistoryRow({ entry }: { entry: WatchEntry }) {
     >
       <div className="relative h-16 w-28 flex-shrink-0 overflow-hidden rounded bg-bg">
         {entry.image ? (
-          <img src={entry.image} alt="" className="h-full w-full object-contain bg-black" />
+          <img src={entry.image} alt="" className="h-full w-full object-cover" />
         ) : (
           <div className="flex h-full w-full items-center justify-center bg-surface">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-text-muted">
@@ -109,6 +111,11 @@ function HistoryRow({ entry }: { entry: WatchEntry }) {
               <path d="M3.5 18c.5 1.9 1.7 3 3.7 3h9.6c2 0 3.3-1.1 3.7-3" />
             </svg>
           </div>
+        )}
+        {num != null && (
+          <span className="absolute end-1 top-1 rounded bg-accent px-1.5 py-0.5 text-[10px] font-bold leading-none text-white shadow-glow">
+            {t.episode} {num}
+          </span>
         )}
         <div className="absolute inset-x-0 bottom-0 h-1 bg-white/10">
           <div className="h-full bg-accent" style={{ width: `${done ? 100 : pct}%` }} />

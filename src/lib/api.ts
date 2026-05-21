@@ -191,12 +191,18 @@ type EpisodesPayload = {
 
 async function fetchEpisodesFresh(animeUrl: string): Promise<EpisodesPayload> {
   const d = await scrapeEpisodesPage(animeUrl);
+  const relatedAnime = (d.related ?? []).map((r) => ({
+    title: r.title,
+    href: r.href,
+    image: imgOrEmpty(r.image),
+    type: r.type,
+  }));
   const payload: EpisodesPayload = {
     success: true,
     data: {
       title: d.title, poster: d.poster, banner: d.poster,
       synopsis: d.synopsis, genres: d.genres, rating: null,
-      metadata: {}, externalLinks: [], relatedAnime: [],
+      metadata: {}, externalLinks: [], relatedAnime,
       totalEpisodes: d.episodes.length, episodes: d.episodes,
       episodes4up: [], merged: null,
       up4Hint: d.up4Url ?? null,
