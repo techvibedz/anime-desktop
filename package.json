@@ -19,6 +19,8 @@
     "release": "npm run build && electron-builder --win --publish always",
     "release:linux": "npm run build && electron-builder --linux --publish always",
     "release:all": "npm run build && electron-builder --win --linux --publish always",
+    "ship": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1",
+    "ship:dry": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1 -DryRun",
     "typecheck": "tsc --noEmit && tsc --noEmit -p electron/tsconfig.json"
   },
   "dependencies": {
