@@ -1,0 +1,46 @@
+name: Build Linux release
+
+# Triggered on every push of a v* tag (i.e. when a Windows release was
+# published locally and the matching tag was pushed). Builds AppImage + deb
+# and attaches them to the existing GitHub release for that tag.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.4)"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install system deps for AppImage + native modules
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxss1 \
+            libgbm1 libasound2 libxcomposite1 libxdamage1 libxrandr2 \
+            libxshmfence1 libxkbcommon0 libpangocairo-1.0-0 fakeroot dpkg
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Build renderer + electron + icons
+        run: npm run build
+
+      - name: Build + publish Linux artifacts to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --linux --publish always
