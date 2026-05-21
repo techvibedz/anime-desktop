@@ -2,6 +2,7 @@
   "name": "pantoufa-desktop",
   "version": "0.1.4",
   "description": "Pantoufa anime desktop app — both witanime + anime4up, no backend needed.",
+  "author": "techvibedz <contact@techvibedz.com>",
   "main": "dist-electron/electron/main.js",
   "private": true,
   "scripts": {
