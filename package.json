@@ -1,0 +1,90 @@
+{
+  "name": "pantoufa-desktop",
+  "version": "0.1.0",
+  "description": "Pantoufa anime desktop app — both witanime + anime4up, no backend needed.",
+  "main": "dist-electron/electron/main.js",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "icons": "node scripts/build-icons.mjs",
+    "electron:build": "tsc -p electron/tsconfig.json",
+    "electron:dev": "npm run electron:build && concurrently -k -n VITE,ELECTRON -c green,blue \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "build:renderer": "vite build",
+    "build:electron": "tsc -p electron/tsconfig.json",
+    "build": "npm run icons && npm run build:renderer && npm run build:electron",
+    "start": "npm run build && electron .",
+    "dist": "npm run build && electron-builder",
+    "dist:win": "npm run build && electron-builder --win",
+    "release": "npm run build && electron-builder --win --publish always",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p electron/tsconfig.json"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.105.4",
+    "electron-updater": "^6.3.9",
+    "hls.js": "^1.5.17",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "png-to-ico": "^3.0.1",
+    "postcss": "^8.4.49",
+    "sharp": "^0.34.5",
+    "tailwindcss": "^3.4.15",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.5",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.pantoufa.desktop",
+    "productName": "Pantoufa",
+    "directories": {
+      "buildResources": "build",
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      { "from": "build/icon.ico", "to": "build/icon.ico" },
+      { "from": "build/icon.png", "to": "build/icon.png" }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "${productName}-Setup-${version}.${ext}",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "techvibedz",
+        "repo": "anime-desktop",
+        "releaseType": "release"
+      }
+    ]
+  }
+}
