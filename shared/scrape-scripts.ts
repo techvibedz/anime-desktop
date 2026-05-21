@@ -208,25 +208,90 @@ if (episodes.length === 0) {
   episodes.sort(function (a, b) { return a.number - b.number; });
 }
 
-// Scrape related-anime cards (other seasons / OVAs / sequels of this anime).
-// witanime exposes them inside a "ذات صلة" section or as .related-anime cards.
+// Scrape related-anime cards. witanime's markup for this section varies
+// per template version. Strategy: find a heading whose text mentions
+// "ذات صلة" / "مشابهة" / "related" / "similar" / "أنميات أخرى" and walk
+// to the nearest sibling/parent that contains anime cards. Fall back to
+// scanning ALL anime cards on the page and filtering out the current anime
+// + anything in a "trending"/"latest" widget.
 var related = [];
 var relatedSeen = {};
-document.querySelectorAll('.related-anime .anime-card-container, .anime-row .anime-card-container, [class*="related"] .anime-card-container').forEach(function (el) {
-  var hrefEl = el.querySelector('.anime-card-poster a.overlay, a[href*="/anime/"]');
+var pageHref = location.href.replace(/\\/+$/, '');
+
+function addRelatedCard(el) {
+  var hrefEl = el.querySelector('a[href*="/anime/"]');
   var href = (hrefEl && hrefEl.getAttribute('href')) || '';
-  if (!href || relatedSeen[href]) return;
+  if (!href) return;
   if (href.indexOf('/anime/') < 0) return;
-  // Skip the current anime if it shows up in its own related list.
-  if (href === location.href || href + '/' === location.href || href === location.href + '/') return;
-  relatedSeen[href] = true;
+  var normHref = href.replace(/\\/+$/, '');
+  if (normHref === pageHref) return;  // skip current anime
+  if (relatedSeen[normHref]) return;
+  relatedSeen[normHref] = true;
+  var titleEl = el.querySelector('.anime-card-title h3 a, .anime-card-title a, h3 a, a[href*="/anime/"]');
+  var title = (titleEl && titleEl.textContent.trim()) || '';
+  if (!title) return;
   related.push({
-    title: (el.querySelector('.anime-card-title h3 a, .anime-card-title a') && el.querySelector('.anime-card-title h3 a, .anime-card-title a').textContent.trim()) || '',
+    title: title,
     href: href,
     image: window.__pBestImg(el),
     type: (el.querySelector('.anime-card-type a') && el.querySelector('.anime-card-type a').textContent.trim()) || null,
   });
-});
+}
+
+// Strategy A: look for any element with related-ish class names.
+document.querySelectorAll(
+  '.related-anime .anime-card-container, ' +
+  '[class*="related"] .anime-card-container, ' +
+  '[class*="similar"] .anime-card-container, ' +
+  '[id*="related"] .anime-card-container'
+).forEach(addRelatedCard);
+
+// Strategy B: find heading text mentioning related keywords and grab cards
+// after / inside it (works for templates that don't use a class name).
+if (related.length === 0) {
+  var headingPattern = /ذات[\\s\\-]*صلة|مشاب[هي]|مشابهة|related|similar|أنميات[\\s\\-]*أخرى|قد[\\s\\-]*يعجبك/i;
+  var headings = document.querySelectorAll('h1, h2, h3, h4, h5, .section-title, .widget-title, [class*="title"], [class*="header"]');
+  for (var hi = 0; hi < headings.length; hi++) {
+    var h = headings[hi];
+    var txt = (h.textContent || '').trim();
+    if (!headingPattern.test(txt)) continue;
+    // Look for anime-card-container inside the heading's parent / next siblings.
+    var container = h.parentElement;
+    if (container) {
+      container.querySelectorAll('.anime-card-container').forEach(addRelatedCard);
+    }
+    // Also check the next 3 siblings of the heading itself.
+    var sib = h.nextElementSibling;
+    var hops = 0;
+    while (sib && hops++ < 4) {
+      sib.querySelectorAll('.anime-card-container').forEach(addRelatedCard);
+      if (sib.classList && (sib.classList.contains('anime-card-container'))) addRelatedCard(sib);
+      sib = sib.nextElementSibling;
+    }
+  }
+}
+
+// Strategy C (fallback): the wit page sometimes shows "نفس السلسلة" links
+// as plain <a href="/anime/..."> inside the metadata table. Scrape those too.
+if (related.length === 0) {
+  document.querySelectorAll('a[href*="/anime/"]').forEach(function (a) {
+    var href = a.getAttribute('href') || '';
+    if (!href || href.indexOf('/anime/') < 0) return;
+    var normHref = href.replace(/\\/+$/, '');
+    if (normHref === pageHref) return;
+    if (relatedSeen[normHref]) return;
+    // Only count links inside paragraphs / list items / dedicated link rows.
+    var parent = a.closest('.anime-info, .anime-details, .anime-meta, .metadata, .meta, li, td');
+    if (!parent) return;
+    relatedSeen[normHref] = true;
+    related.push({
+      title: (a.textContent || '').trim() || href,
+      href: href,
+      image: null,
+      type: null,
+    });
+  });
+}
 
 return {
   title: (titleEl && titleEl.textContent.trim()) || '',

@@ -147,29 +147,21 @@ export function AnimeDetailPage() {
                 {data.synopsis}
               </p>
               <div className="flex flex-wrap items-center gap-3">
-                <div className="relative">
-                  {bookmarkList ? (
-                    <button
-                      onClick={onUnbookmark}
-                      className="flex items-center gap-2 rounded-full bg-accent px-5 py-2 text-sm font-semibold text-white shadow-glow"
-                    >
-                      ♥ {t.saved} ({bookmarkList === "watching" ? t.currentlyWatching : t.planToWatch})
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => setPickerOpen((v) => !v)}
-                      className="flex items-center gap-2 rounded-full border border-white/15 bg-surface px-5 py-2 text-sm font-semibold text-white hover:border-accent"
-                    >
-                      ♡ {t.addToList}
-                    </button>
-                  )}
-                  {pickerOpen && (
-                    <div className="absolute end-0 mt-2 w-44 rounded-lg border border-white/10 bg-surface p-1 shadow-card">
-                      <button onClick={() => onBookmark("watching")} className="block w-full rounded-md px-3 py-2 text-start text-sm hover:bg-white/5">{t.currentlyWatching}</button>
-                      <button onClick={() => onBookmark("planned")} className="block w-full rounded-md px-3 py-2 text-start text-sm hover:bg-white/5">{t.planToWatch}</button>
-                    </div>
-                  )}
-                </div>
+                {bookmarkList ? (
+                  <button
+                    onClick={onUnbookmark}
+                    className="flex items-center gap-2 rounded-full bg-accent px-5 py-2 text-sm font-semibold text-white shadow-glow"
+                  >
+                    ♥ {t.saved} ({bookmarkList === "watching" ? t.currentlyWatching : t.planToWatch})
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => setPickerOpen(true)}
+                    className="flex items-center gap-2 rounded-full border border-white/15 bg-surface px-5 py-2 text-sm font-semibold text-white hover:border-accent"
+                  >
+                    ♡ {t.addToList}
+                  </button>
+                )}
                 {merged?.anime4up && (
                   <span className="rounded-full border border-violet/40 bg-violet/10 px-3 py-1 text-[11px] font-semibold text-violet">
                     {t.bothSources}
@@ -229,6 +221,57 @@ export function AnimeDetailPage() {
           })}
         </div>
       </section>
+
+      {/* Add-to-list modal — rendered outside the banner so the parent
+          overflow-hidden doesn't clip it. */}
+      {pickerOpen && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 backdrop-blur-sm"
+          onClick={() => setPickerOpen(false)}
+        >
+          <div
+            className="w-[min(360px,92vw)] overflow-hidden rounded-2xl border border-white/10 bg-surface shadow-card"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="border-b border-white/5 px-5 py-4">
+              <h3 className="font-display text-base font-bold text-white">{t.addToList}</h3>
+              <p className="mt-0.5 line-clamp-1 text-xs text-text-secondary">{data.title}</p>
+            </div>
+            <div className="space-y-1 p-2">
+              <button
+                onClick={() => onBookmark("watching")}
+                className="flex w-full items-center gap-3 rounded-lg px-3 py-3 text-start hover:bg-white/5"
+              >
+                <span className="flex h-9 w-9 items-center justify-center rounded-full bg-accent/15 text-accent">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
+                </span>
+                <span className="flex-1">
+                  <p className="text-sm font-semibold text-white">{t.currentlyWatching}</p>
+                  <p className="text-xs text-text-muted">ما تتابعه الآن</p>
+                </span>
+              </button>
+              <button
+                onClick={() => onBookmark("planned")}
+                className="flex w-full items-center gap-3 rounded-lg px-3 py-3 text-start hover:bg-white/5"
+              >
+                <span className="flex h-9 w-9 items-center justify-center rounded-full bg-violet/15 text-violet">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M19 4h-1V2h-2v2H8V2H6v2H5c-1.11 0-1.99.9-1.99 2L3 20a2 2 0 002 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 16H5V10h14v10zM9 14H7v-2h2v2zm4 0h-2v-2h2v2zm4 0h-2v-2h2v2z" /></svg>
+                </span>
+                <span className="flex-1">
+                  <p className="text-sm font-semibold text-white">{t.planToWatch}</p>
+                  <p className="text-xs text-text-muted">احفظه للاحقًا</p>
+                </span>
+              </button>
+            </div>
+            <button
+              onClick={() => setPickerOpen(false)}
+              className="block w-full border-t border-white/5 py-3 text-sm text-text-muted hover:text-white"
+            >
+              {t.cancel}
+            </button>
+          </div>
+        </div>
+      )}
 
       {data.relatedAnime.length > 0 && (
         <section className="space-y-3">

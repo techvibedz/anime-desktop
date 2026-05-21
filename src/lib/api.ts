@@ -16,7 +16,9 @@ import {
 
 const HOME_CACHE_KEY = "@home_cache_v1";
 const HOME_CACHE_TTL = 30 * 60 * 1000;
-const DETAIL_CACHE_PREFIX = "@detail_v1:";
+// Bumped to v2 so the old cached anime-detail payloads (which were
+// missing the `relatedAnime` field) get re-scraped on next view.
+const DETAIL_CACHE_PREFIX = "@detail_v2:";
 const DETAIL_CACHE_TTL = 30 * 60 * 1000;
 const UP4_CACHE_PREFIX = "@up4_eps_v1:";
 const UP4_CACHE_TTL = 24 * 60 * 60 * 1000;
