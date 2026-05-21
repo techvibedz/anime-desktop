@@ -264,23 +264,27 @@ export function WatchPage() {
       const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: false,
-        // Default to best quality available, hls.js will adapt down if bw is low.
         startLevel: -1,
-        // Keep 90s of back-buffer for instant seeks; trim aggressively to bound RAM.
         backBufferLength: 90,
         maxBufferLength: 60,
         maxMaxBufferLength: 300,
-        // Generous timeouts/retries — proxy + first-byte CDN latency can be slow.
+        // Generous timeouts.
         manifestLoadingTimeOut: 20000,
-        manifestLoadingMaxRetry: 2,
+        manifestLoadingMaxRetry: 3,
+        manifestLoadingRetryDelay: 1500,
         levelLoadingTimeOut: 20000,
-        levelLoadingMaxRetry: 2,
+        levelLoadingMaxRetry: 3,
+        levelLoadingRetryDelay: 1500,
+        // Bumped fragment retries — transient CDN errors are common.
+        // 5 retries × 2s backoff = 10s of trying before declaring fatal.
         fragLoadingTimeOut: 30000,
-        fragLoadingMaxRetry: 3,
+        fragLoadingMaxRetry: 5,
+        fragLoadingRetryDelay: 2000,
         // Proxy handles cookies/Referer — renderer XHR doesn't need creds.
         xhrSetup: (xhr) => { xhr.withCredentials = false; },
       });
       let recoveryUsed = false;
+      let reextractUsed = false;
       hls.loadSource(proxied);
       hls.attachMedia(v);
       hls.on(Hls.Events.FRAG_LOADED, () => { if (!played) lastTimeUpdate = Date.now(); });
@@ -288,6 +292,19 @@ export function WatchPage() {
       hls.on(Hls.Events.MANIFEST_PARSED, () => { if (!played) lastTimeUpdate = Date.now(); });
       hls.on(Hls.Events.ERROR, (_e, data) => {
         if (!data.fatal) return;
+        // Proxy returned 410 → upstream signed URL expired. Re-extract
+        // a fresh URL from the embed instead of jumping to the next server.
+        const status = (data.response as any)?.code;
+        if (!reextractUsed && (status === 410 || status === 403 || status === 401)) {
+          reextractUsed = true;
+          console.warn(`[player] HLS auth error (${status}), re-extracting fresh URL`);
+          // Drop cached extraction so resolveVideo runs again, then bump nonce.
+          import("../lib/api").then(({ invalidateResolveCache }) => {
+            try { invalidateResolveCache?.(resolved.embed); } catch {}
+            setRetryNonce((n) => n + 1);
+          });
+          return;
+        }
         if (!recoveryUsed) {
           recoveryUsed = true;
           console.warn("[player] HLS fatal, attempting recovery", data);

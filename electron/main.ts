@@ -515,8 +515,24 @@ function registerVideoProxy() {
 
       return new Response(buf, { status: upstream.status, headers: outHeaders });
     } catch (e: any) {
-      console.warn(`[pantoufa-video] FINAL ERR ${e?.code || e?.name || ""} ${e?.message || e} for ${target}`);
-      return new Response("proxy error", { status: 502 });
+      const msg = e?.message || String(e);
+      // If every strategy returned 401/403/410, the URL's signed token is
+      // dead — likely the page was idle long enough for it to expire. Tell
+      // the renderer with a recognizable status so it can re-extract.
+      const m = msg.match(/last status:\s*(\d+)/i);
+      const lastStatus = m ? parseInt(m[1], 10) : 0;
+      if (lastStatus === 401 || lastStatus === 403 || lastStatus === 410) {
+        console.warn(`[pantoufa-video] URL EXPIRED (${lastStatus}) for ${target}`);
+        return new Response("url expired", {
+          status: 410,
+          headers: { "X-Pantoufa-Reextract": "1", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+      console.warn(`[pantoufa-video] FINAL ERR ${e?.code || e?.name || ""} ${msg} for ${target}`);
+      return new Response("proxy error", {
+        status: 502,
+        headers: { "Access-Control-Allow-Origin": "*" },
+      });
     }
   });
 }

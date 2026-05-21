@@ -368,7 +368,6 @@ export function resolveVideo(iframeUrl: string, provider: string): Promise<Resol
   const hit = resolveCache.get(iframeUrl);
   if (hit && Date.now() - hit.ts < RESOLVE_TTL) return hit.promise;
   const promise = doResolveVideo(iframeUrl, provider).then((r) => {
-    // Drop the cache entry on failure so a retry actually re-scrapes.
     if (!r.success) resolveCache.delete(iframeUrl);
     return r;
   }).catch((e) => {
@@ -377,6 +376,15 @@ export function resolveVideo(iframeUrl: string, provider: string): Promise<Resol
   });
   resolveCache.set(iframeUrl, { ts: Date.now(), promise });
   return promise;
+}
+
+/**
+ * Drop a cached resolveVideo entry so the next call re-scrapes the embed
+ * and gets a fresh signed URL. Called when the player detects 401/403/410
+ * from the proxy (a sign that the URL's token expired).
+ */
+export function invalidateResolveCache(iframeUrl: string) {
+  resolveCache.delete(iframeUrl);
 }
 
 async function doResolveVideo(iframeUrl: string, _provider: string) {
