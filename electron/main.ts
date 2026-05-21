@@ -445,7 +445,31 @@ function registerVideoProxy() {
         });
       }
 
-      const range = request.headers.get("range");
+      // Chunk open-ended Range requests so we never wait on a 100+MB
+      // download before responding. For mp4 sources the browser sends
+      // `Range: bytes=0-` which used to suck the whole file into RAM,
+      // causing the renderer to time out → black screen. We cap to a
+      // 4 MB window per request; the browser will issue more Range
+      // requests as it needs them.
+      const CHUNK_SIZE = 4 * 1024 * 1024;
+      const isLargeMedia = /\.(mp4|m4s|ts)(\?|$)/i.test(target);
+      let range = request.headers.get("range");
+      if (isLargeMedia) {
+        if (!range) {
+          range = `bytes=0-${CHUNK_SIZE - 1}`;
+        } else {
+          // bytes=START- (open-ended) → bytes=START-(START+CHUNK-1)
+          const m = range.match(/^bytes=(\d+)-(\d*)$/);
+          if (m) {
+            const start = parseInt(m[1], 10);
+            const end = m[2] ? parseInt(m[2], 10) : NaN;
+            if (!isFinite(end) || end - start > CHUNK_SIZE - 1) {
+              range = `bytes=${start}-${start + CHUNK_SIZE - 1}`;
+            }
+          }
+        }
+      }
+
       let { upstream, strategy } = await tryFetch(target, referer, range, request.method, request.signal);
 
       // mp4upload CDN sometimes only accepts Range requests — if the
@@ -489,10 +513,22 @@ function registerVideoProxy() {
         const v = upstream.headers.get(k);
         if (v) outHeaders.set(k, v);
       }
-      // Force the actual length we have (upstream content-length might be
-      // wrong after redirect or for chunked encoding).
       outHeaders.set("content-length", String(buf.byteLength));
       outHeaders.set("accept-ranges", "bytes");
+
+      // If we chunked the upstream request but it answered 200 with the
+      // full body (server ignored Range), synthesize a Content-Range so
+      // the browser still treats this as partial content and requests more.
+      let outStatus = upstream.status;
+      if (isLargeMedia && range && !outHeaders.get("content-range")) {
+        const m = range.match(/^bytes=(\d+)-(\d+)$/);
+        if (m) {
+          const start = parseInt(m[1], 10);
+          const total = parseInt(upstream.headers.get("content-length") || "0", 10) || (start + buf.byteLength);
+          outHeaders.set("content-range", `bytes ${start}-${start + buf.byteLength - 1}/${total}`);
+          outStatus = 206;
+        }
+      }
 
       // MIME fixups.
       const outCt = (outHeaders.get("content-type") || "").toLowerCase();
@@ -511,9 +547,9 @@ function registerVideoProxy() {
       outHeaders.set("Access-Control-Allow-Headers", "*");
       outHeaders.set("Access-Control-Expose-Headers", "*");
 
-      console.info(`[pantoufa-video] ${upstream.status} ${outHeaders.get("content-type") || "?"} ${buf.byteLength}B (${strategy}) ${target}${range ? " " + range : ""}`);
+      console.info(`[pantoufa-video] ${outStatus} ${outHeaders.get("content-type") || "?"} ${buf.byteLength}B (${strategy}) ${target}${range ? " " + range : ""}`);
 
-      return new Response(buf, { status: upstream.status, headers: outHeaders });
+      return new Response(buf, { status: outStatus, headers: outHeaders });
     } catch (e: any) {
       const msg = e?.message || String(e);
       // If every strategy returned 401/403/410, the URL's signed token is
