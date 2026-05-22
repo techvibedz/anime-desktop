@@ -26,6 +26,8 @@ if (!gotLock) {
   app.quit();
 }
 
+if (gotLock) {
+
 if (process.defaultApp) {
   if (process.argv.length >= 2) {
     app.setAsDefaultProtocolClient(PROTOCOL, process.execPath, [path.resolve(process.argv[1])]);
@@ -1139,6 +1141,8 @@ app.whenReady().then(() => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
   });
 });
+
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
