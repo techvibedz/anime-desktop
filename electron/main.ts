@@ -124,12 +124,10 @@ function createMainWindow() {
   // set; CDP injection avoids that detection altogether.
   const IFRAME_AD_GUARD = `(function(){
 if (window === window.top) return;
-try {
-  Object.defineProperty(window,"open",{configurable:true,writable:true,value:function(){return null}});
-} catch(e) {}
-// Block <a target="_blank|_top|_parent"> clicks and form submissions
-// with target="_blank". Streamwish in particular triggers popups via
-// programmatic form submit + a.click() combos that bypass click handlers.
+// Block <a target="_blank|_top|_parent"> clicks and form submissions.
+// window.open nullification was removed — some players (streamwish)
+// check its return value and abort if null. setWindowOpenHandler
+// already denies all non-app popups globally.
 document.addEventListener("click",function(e){
   var t=e.target;
   while(t && t.nodeType===1) {
@@ -490,7 +488,7 @@ function registerVideoProxy() {
 
     // streamwish family: CDN host (vibuxer.com, audinifer.com) expects the
     // embed-page Referer (hgcloud.to, streamwish.to) not its own domain.
-    if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin/.test(target.hostname)) {
+    if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(target.hostname)) {
       return [
         { name: "embed", headers: embedHeaders },
         { name: "target-self", headers: targetHeaders },
@@ -1033,12 +1031,22 @@ app.whenReady().then(() => {
           ref = "https://www.dailymotion.com/";
           ori = "https://www.dailymotion.com";
         } else if (!AD_HOST_RE.test(host) && host.includes(".") && !/^\d+\.\d+/.test(host)) {
-          // Else fallback: any non-ad, credible-looking host gets a
-          // root-domain Referer. This catches streamwish's rotating CDN
-          // mirrors (cybervynx.com, ghbrisk.com, future mirrors).
-          const root = host.split(".").slice(-2).join(".");
-          ref = `https://${root}/`;
-          ori = `https://${root}`;
+          // Is this request originating from a streamwish embed iframe?
+          // If so, inject the canonical streamwish.to Referer regardless
+          // of the CDN mirror's actual hostname. This fixes black screens
+          // when streamwish rotates to new CDN mirrors like cybervynx.com
+          // or ghbrisk.com that aren't in any static regex.
+          let frameOrigin = "";
+          try { frameOrigin = ((details as any).frame?.origin || "").toLowerCase(); } catch {}
+          if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish/.test(frameOrigin)) {
+            ref = "https://streamwish.to/";
+            ori = "https://streamwish.to";
+          } else {
+            // Generic fallback: root-domain Referer for any non-ad host.
+            const root = host.split(".").slice(-2).join(".");
+            ref = `https://${root}/`;
+            ori = `https://${root}`;
+          }
         }
         if (ref) {
           hdrs["Referer"] = ref;

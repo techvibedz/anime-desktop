@@ -408,6 +408,9 @@ export function WatchPage() {
       const isBufferingMidStream = played && !v.paused && !v.ended && v.currentTime === lastTime;
 
       if (isInitialLoading && now - loadStartedAt > INITIAL_LOAD_DEADLINE_MS) {
+        // mp4upload's CDN on port 183 takes 10–30s to respond. The proxy
+        // gives 60s; the 22s stall watchdog kills it before the CDN answers.
+        if (/mp4upload/.test(resolved.embed)) return; // trust the proxy timeout
         advanced = true;
         console.warn(`[player] Initial load exceeded ${INITIAL_LOAD_DEADLINE_MS}ms — advancing`);
         advanceToNext();
