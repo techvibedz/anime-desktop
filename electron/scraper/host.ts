@@ -1,24 +1,11 @@
-// Hidden BrowserWindow pool that runs scrape jobs.
-//
-// Each slot is one off-screen BrowserWindow we can navigate to anime sites.
-// We process jobs serially per slot but multiple slots in parallel so home
-// (witanime + anime4up) and detail (primary + cross-source) loads finish in
-// the time of the slowest single fetch.
-//
-// CF challenges resolve naturally because each window IS a real Chromium
-// instance running with the user's residential IP.
-
 import { BrowserWindow, session } from "electron";
 
-// 3 parallel BrowserWindows. Two wasn't enough when home, wit-detail and
-// 4up-detail all want a slot at the same time. Three covers the worst case
-// without using too much RAM.
 const SLOT_COUNT = 3;
 
 export type ScrapeJob = {
   url: string;
   injectBefore?: string;
-  injectAfter: string; // a JS expression that resolves to the data
+  injectAfter: string;
   timeoutMs: number;
   isVideoJob?: boolean;
 };
@@ -29,191 +16,253 @@ type Pending = {
   reject: (e: Error) => void;
 };
 
-const queue: Pending[] = [];
-const slots: (Pending | null)[] = Array.from({ length: SLOT_COUNT }, () => null);
+type Slot = {
+  win: BrowserWindow;
+  busy: boolean;
+  cdpScriptId: string | null;
+};
 
-let started = false;
+const queue: Pending[] = [];
+const videoQueue: Pending[] = []; // prioritized — user-facing video extraction
+let slots: Slot[] | null = null;
+let slotsReady: Promise<void> | null = null;
 
 export function enqueue(job: ScrapeJob): Promise<any> {
   return new Promise((resolve, reject) => {
-    queue.push({ job, resolve, reject });
+    const entry = { job, resolve, reject };
+    if (job.isVideoJob) {
+      videoQueue.push(entry);
+    } else {
+      queue.push(entry);
+    }
     void drain();
   });
 }
 
-async function drain() {
-  for (let i = 0; i < slots.length; i++) {
-    if (slots[i] !== null) continue;
-    const next = queue.shift();
-    if (!next) return;
-    slots[i] = next;
-    void runJob(i, next);
-  }
-}
-
 function getBaseDomain(host: string): string {
   const parts = host.toLowerCase().split(".");
-  if (parts.length >= 2) {
-    return parts.slice(-2).join(".");
-  }
-  return host;
+  return parts.length >= 2 ? parts.slice(-2).join(".") : host;
 }
 
 function isWhitelistedVideoDomain(host: string): boolean {
   const h = host.toLowerCase();
-  return /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix|mp4upload|voe|doodstream|dood|uqload|share4max|megamax|videa|okru|vk|dailymotion|dai\.ly/.test(h);
+  return /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix|mp4upload|voe|doodstream|dood|uqload|share4max|megamax|videa|vidvaita|vidit|okru|vk|dailymotion|dai\.ly/.test(h);
 }
 
-let sessionInitialized = false;
-const activeJobs = new Map<number, { isVideoJob: boolean, url: string, onFastPath: (url: string) => void }>();
+const isKnownAd = /popads|popcash|propeller|trafficjunky|medixiru|playnixes|doubleclick|advert|banners|tracker|adservice|adnxs|taboola|outbrain|exoclick|adx/i;
 
-function initSessionIfNeeded() {
-  if (sessionInitialized) return;
-  sessionInitialized = true;
+const activeJobs = new Map<number, { resolve: (url: string) => void }>();
+const pendingBySlot: (Pending | null)[] = Array.from({ length: SLOT_COUNT }, () => null);
+const beltScripts: (string | null)[] = Array.from({ length: SLOT_COUNT }, () => null);
+
+function initSlots(): Slot[] {
   const ses = session.fromPartition("persist:scraper");
+
   ses.webRequest.onBeforeRequest((details, cb) => {
     const u = details.url.toLowerCase();
-
     if (details.webContentsId) {
-      const job = activeJobs.get(details.webContentsId);
-      if (job && job.isVideoJob && /\.m3u8(\?|$)/i.test(u) && !/test-videos\.co\.uk/.test(u)) {
-        console.info(`[scraper] Fast-path network intercept: ${details.url}`);
-        job.onFastPath(details.url);
-        return cb({ cancel: true });
+      const entry = activeJobs.get(details.webContentsId);
+      if (entry && /\.m3u8(\?|$)/i.test(u)) {
+        const decoy = /test-videos\.co\.uk|bigbuckbunny|sample[-_.]|placeholder/.test(u);
+        if (!decoy) {
+          try {
+            const host = new URL(details.url).hostname.toLowerCase();
+            if (!/test-videos|bigbuckbunny|sample|placeholder|google|facebook|doubleclick|popads|propeller|trafficjunky|popcash|disqus|googletag|analytics|pyppo/.test(host)) {
+              console.info(`[scraper] Fast-path intercept: ${details.url}`);
+              entry.resolve(details.url);
+              return cb({ cancel: true });
+            }
+          } catch {}
+        }
       }
     }
-
     if (/doubleclick|googletagmanager|google-analytics|facebook\.com\/tr|popads|propeller|trafficjunky|popcash/.test(u)) {
       return cb({ cancel: true });
     }
     cb({});
   });
-}
 
-async function runJob(slotIdx: number, p: Pending) {
-  let win: BrowserWindow | null = null;
-  let timer: NodeJS.Timeout | null = null;
-  let timedOut = false;
-  
-  try {
-    initSessionIfNeeded();
-
-    win = new BrowserWindow({
+  const result: Slot[] = [];
+  for (let i = 0; i < SLOT_COUNT; i++) {
+    const win = new BrowserWindow({
       show: false,
       width: 1280,
       height: 800,
+      skipTaskbar: true,
+      focusable: false,
       webPreferences: {
         offscreen: false,
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: false,
-        partition: "persist:scraper", // shares cookies between scrape jobs
+        partition: "persist:scraper",
         backgroundThrottling: false,
         webSecurity: true,
+        autoplayPolicy: "no-user-gesture-required",
       },
     });
 
-    activeJobs.set(win.webContents.id, {
-      isVideoJob: !!p.job.isVideoJob,
-      url: p.job.url,
-      onFastPath: (url: string) => {
-        if (!timedOut) {
-          timedOut = true;
-          if (timer) clearTimeout(timer);
-          p.resolve({ url });
-          setTimeout(() => { try { if (win && !win.isDestroyed()) win.destroy(); } catch {} }, 3000);
-        }
+    // Never show this window.
+    try { win.hide(); } catch {}
+    try { win.setOpacity(0); } catch {}
+    win.on("show", () => {
+      try { win.hide(); } catch {}
+      try { win.setOpacity(0); } catch {}
+    });
+    // Periodic sledgehammer — some embed pages (streamwish) call
+    // win.focus() / win.moveTop() / requestFullscreen() which Electron
+    // may honour despite show:false.
+    const hideInterval = setInterval(() => {
+      try { if (!win.isDestroyed()) win.hide(); } catch {}
+    }, 1000);
+    win.on("closed", () => clearInterval(hideInterval));
+
+    try {
+      if (!win.webContents.debugger.isAttached()) {
+        win.webContents.debugger.attach("1.3");
+      }
+      win.webContents.debugger.sendCommand("Page.enable").catch(() => {});
+    } catch {}
+
+    // Belt: executeJavaScript on every navigation start.
+    win.webContents.on("did-start-navigation", () => {
+      if (!win || win.isDestroyed()) return;
+      const script = beltScripts[i];
+      if (script) {
+        win.webContents.executeJavaScript(script, true).catch(() => {});
       }
     });
 
-    // Block popup windows created by ads when play buttons are clicked
     win.webContents.setWindowOpenHandler((details) => {
-      console.info(`[scraper] Blocked popup window: ${details.url}`);
+      const job = pendingBySlot[i];
+      if (job?.job.isVideoJob) return { action: "deny" };
       try {
-        const primaryHost = new URL(p.job.url).hostname;
+        const primaryHost = new URL(job?.job.url ?? "").hostname;
         const targetHost = new URL(details.url).hostname;
-        const primaryBase = getBaseDomain(primaryHost);
-        const targetBase = getBaseDomain(targetHost);
-        
-        // If the popup is to the same base domain or a whitelisted video domain,
-        // navigate the main window to it instead of letting a new window open.
-        if (primaryBase === targetBase || isWhitelistedVideoDomain(targetHost)) {
-          console.info(`[scraper] Redirecting main window to popup URL: ${details.url}`);
-          setTimeout(() => {
-            if (win && !win.isDestroyed()) {
-              win.loadURL(details.url, {
-                userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-              }).catch(() => {});
-            }
-          }, 0);
+        if (getBaseDomain(primaryHost) === getBaseDomain(targetHost) || isWhitelistedVideoDomain(targetHost)) {
+          setTimeout(() => { win.loadURL(details.url).catch(() => {}); }, 0);
         }
-      } catch (e) {
-        console.error(`[scraper] setWindowOpenHandler error:`, e);
-      }
+      } catch {}
       return { action: "deny" };
     });
 
-    // Block top-level ad redirects away from the video embed host domain
     win.webContents.on("will-navigate", (event, navigationUrl) => {
       try {
-        const primaryHost = new URL(p.job.url).hostname;
+        const job = pendingBySlot[i];
+        const primaryHost = new URL(job?.job.url ?? "").hostname;
         const targetHost = new URL(navigationUrl).hostname;
-        const primaryBase = getBaseDomain(primaryHost);
-        const targetBase = getBaseDomain(targetHost);
-
-        // 1. Same base domain is always allowed
-        if (primaryBase === targetBase) {
+        if (getBaseDomain(primaryHost) === getBaseDomain(targetHost)) return;
+        if (job?.job.isVideoJob) {
+          if (isKnownAd.test(targetHost)) {
+            console.info(`[scraper] Blocked ad: ${primaryHost} → ${targetHost}`);
+            event.preventDefault();
+            return;
+          }
           return;
         }
-
-        // 2. Legitimate transitions between whitelisted streaming/CDN domains are allowed
-        if (isWhitelistedVideoDomain(primaryHost) && isWhitelistedVideoDomain(targetHost)) {
-          console.info(`[scraper] Allowed legitimate video domain transition: ${primaryHost} -> ${targetHost}`);
-          return;
-        }
-
-        // Block everything else as an ad redirect
-        console.info(`[scraper] Blocked ad redirect navigation: ${primaryHost} -> ${targetHost}`);
+        if (isWhitelistedVideoDomain(primaryHost) && isWhitelistedVideoDomain(targetHost)) return;
+        console.info(`[scraper] Blocked: ${primaryHost} → ${targetHost}`);
         event.preventDefault();
-      } catch (e) {
-        event.preventDefault();
-      }
+      } catch { event.preventDefault(); }
     });
 
-    // Hard timeout — mark BEFORE destroying so awaiters can react.
-    timer = setTimeout(() => {
-      timedOut = true;
-      try { win?.destroy(); } catch {}
-    }, p.job.timeoutMs);
+    result.push({ win, busy: false, cdpScriptId: null });
+  }
+  return result;
+}
+
+async function drain() {
+  if (!slots) {
+    slots = initSlots();
+    slotsReady = new Promise((r) => setTimeout(r, 500));
+  }
+  if (slotsReady) {
+    await slotsReady;
+    slotsReady = null;
+  }
+
+  for (let i = 0; i < slots.length; i++) {
+    if (slots[i].busy) continue;
+    // Video extraction jobs jump the queue — user-facing play must never
+    // wait behind background home-page scraping.
+    const next = videoQueue.shift() ?? queue.shift();
+    if (!next) return;
+    slots[i].busy = true;
+    pendingBySlot[i] = next;
+    beltScripts[i] = next.job.injectBefore ?? null;
+    void runJob(i, next);
+  }
+}
+
+async function runJob(slotIdx: number, p: Pending) {
+  const slot = slots![slotIdx];
+  const { win } = slot;
+  let timer: NodeJS.Timeout | null = null;
+  let timedOut = false;
+  let fastPathResolved = false;
+
+  try {
+    // Reset the window between jobs — the previous page may have left
+    // cookies, service workers, cached scripts, or other state that
+    // interferes with the next extraction (ad gates, stale session data).
+    try {
+      await win.loadURL("about:blank");
+      await win.webContents.session.clearStorageData({ storages: ["serviceworkers", "cachestorage", "localstorage", "websql"] });
+    } catch {}
 
     if (p.job.injectBefore) {
-      // Inject before-load hooks at every navigation event
-      win.webContents.on("did-start-navigation", () => {
-        if (!win || win.isDestroyed()) return;
-        win.webContents.executeJavaScript(p.job.injectBefore!, true).catch(() => {});
-      });
+      try {
+        if (win.webContents.debugger.isAttached()) {
+          if (slot.cdpScriptId) {
+            await win.webContents.debugger.sendCommand(
+              "Page.removeScriptToEvaluateOnNewDocument",
+              { identifier: slot.cdpScriptId },
+            );
+            slot.cdpScriptId = null;
+          }
+          const resp = await win.webContents.debugger.sendCommand(
+            "Page.addScriptToEvaluateOnNewDocument",
+            { source: p.job.injectBefore },
+          ) as { identifier: string };
+          slot.cdpScriptId = resp.identifier;
+        }
+      } catch {}
     }
 
-    await win.loadURL(p.job.url, {
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    }).catch(() => { /* tolerate goto timeouts; the script handles waits */ });
+    activeJobs.set(win.webContents.id, {
+      resolve: (url: string) => {
+        if (!timedOut && !fastPathResolved) {
+          fastPathResolved = true;
+          if (timer) clearTimeout(timer);
+          p.resolve({ url });
+        }
+      },
+    });
 
-    // Guard against the timeout having destroyed the window already.
-    if (timedOut || !win || win.isDestroyed()) {
-      throw new Error(`scrape timeout after ${p.job.timeoutMs}ms: ${p.job.url}`);
+    timer = setTimeout(() => { timedOut = true; }, p.job.timeoutMs);
+
+    await win.loadURL(p.job.url, {
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    }).catch(() => {});
+
+    if (fastPathResolved) return;
+    if (timedOut || win.isDestroyed()) {
+      throw new Error(`scrape timeout: ${p.job.url}`);
+    }
+
+    if (p.job.injectBefore) {
+      win.webContents.executeJavaScript(p.job.injectBefore, true).catch(() => {});
     }
 
     let result: any = null;
-    while (!timedOut && win && !win.isDestroyed()) {
+    while (!timedOut && !win.isDestroyed()) {
       try {
         result = await win.webContents.executeJavaScript(p.job.injectAfter, true);
         break;
       } catch (e: any) {
-        if (timedOut) throw new Error(`scrape timeout after ${p.job.timeoutMs}ms: ${p.job.url}`);
+        if (timedOut || fastPathResolved) return;
         const msg = String(e?.message || e?.name || e);
         if (msg.includes("context was destroyed") || msg.includes("navigated") || msg.includes("Target closed")) {
-          console.info(`[scraper] Context destroyed (likely navigation). Re-injecting in 1s...`);
           await new Promise((r) => setTimeout(r, 1000));
           continue;
         }
@@ -221,15 +270,19 @@ async function runJob(slotIdx: number, p: Pending) {
       }
     }
 
+    if (fastPathResolved) return;
     if (timer) clearTimeout(timer);
     p.resolve(result);
   } catch (e: any) {
-    if (timer) clearTimeout(timer);
-    p.reject(e instanceof Error ? e : new Error(String(e)));
+    if (!fastPathResolved) {
+      if (timer) clearTimeout(timer);
+      p.reject(e instanceof Error ? e : new Error(String(e)));
+    }
   } finally {
-    if (win && !win.isDestroyed()) activeJobs.delete(win.webContents.id);
-    try { if (win && !win.isDestroyed()) win.destroy(); } catch {}
-    slots[slotIdx] = null;
+    activeJobs.delete(win.webContents.id);
+    slot.busy = false;
+    pendingBySlot[slotIdx] = null;
+    beltScripts[slotIdx] = null;
     setTimeout(drain, 0);
   }
 }

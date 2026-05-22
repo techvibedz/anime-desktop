@@ -62,6 +62,9 @@ function handleAuthCallbackUrl(url: string) {
   }
 }
 
+// Ad-network hosts blocked across all layers (single source of truth).
+const AD_HOST_RE = /doubleclick|googletagmanager|google-analytics|googleadservices|googlesyndication|adservice\.google|adnxs|facebook\.com\/tr|pixel\.facebook|popads|popcash|popmyads|popunder|propeller|propellerads|trafficjunky|adsterra|hilltopads|onclkds|onclickbid|onclickpredictiv|exoclick|magsrv|tsyndicate|clickadu|adcash|ad-maven|admaven|adsupply|servedbyadbutler|mgid|revcontent|adskeeper|trustedclicks|outbrain|taboola/i;
+
 function createMainWindow() {
   // Resolve the bundled icon — packaged app reads from resources/build/, dev reads from ../../build/.
   const iconExt = process.platform === "win32" ? "ico" : "png";
@@ -86,12 +89,86 @@ function createMainWindow() {
     },
   });
 
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith("http")) {
+  mainWindow.webContents.setWindowOpenHandler(({ url, referrer }) => {
+    // Only open external browser for links originating from our own
+    // renderer (witanime / anime4up pages). Everything else — empty
+    // referrer, video-CDN iframes, unknown origins — is denied.
+    // This prevents streamwish / videa / mp4upload popup ads from
+    // opening the user's default browser, while still allowing
+    // genuine external links from search results and anime pages.
+    const refHost = (() => {
+      try { return new URL(referrer?.url || "").hostname.toLowerCase(); } catch { return ""; }
+    })();
+    if (url.startsWith("http") && /witanime|anime4up/.test(refHost)) {
       void shell.openExternal(url);
-      return { action: "deny" };
     }
-    return { action: "allow" };
+    return { action: "deny" };
+  });
+
+  // Block in-iframe navigations to ad hosts only — legitimate CDN mirror
+  // rotations (streamwish → ghbrisk.com, new dood subdomains) must NOT be
+  // blocked.
+  mainWindow.webContents.on("will-frame-navigate", (evt) => {
+    if (evt.isMainFrame) return;
+    const host = (() => { try { return new URL(evt.url).hostname.toLowerCase(); } catch { return ""; } })();
+    if (AD_HOST_RE.test(host)) {
+      console.info(`[ad-block] blocked iframe nav → ${host}`);
+      evt.preventDefault();
+    }
+  });
+
+  // CDP-injected guard that runs inside every iframe document before page
+  // scripts. Neutralizes window.open (click-jack) and hides Videa's pre-roll
+  // ad containers — all invisible to the embed's sandbox-detection probes.
+  // Streamwish actively checks frameElement?.sandbox and blocks playback if
+  // set; CDP injection avoids that detection altogether.
+  const IFRAME_AD_GUARD = `(function(){
+if (window === window.top) return;
+try {
+  Object.defineProperty(window,"open",{configurable:true,writable:true,value:function(){return null}});
+} catch(e) {}
+// Block <a target="_blank|_top|_parent"> clicks and form submissions
+// with target="_blank". Streamwish in particular triggers popups via
+// programmatic form submit + a.click() combos that bypass click handlers.
+document.addEventListener("click",function(e){
+  var t=e.target;
+  while(t && t.nodeType===1) {
+    if (t.tagName==="A") {
+      var tg=t.getAttribute("target");
+      if (tg==="_blank"||tg==="_top"||tg==="_parent"){e.preventDefault();e.stopImmediatePropagation();return false;}
+    }
+    t=t.parentNode;
+  }
+},true);
+// Intercept form submit with target that would open in a new context.
+document.addEventListener("submit",function(e){
+  var f=e.target;
+  if (f&&f.nodeType===1&&f.tagName==="FORM"){
+    var tg=f.getAttribute("target");
+    if (tg&&tg!=="_self"){e.preventDefault();e.stopImmediatePropagation();return false;}
+  }
+},true);
+if (/videa|vidvaita|vidit/.test(location.hostname)) {
+  var s=document.createElement("style");
+  s.textContent=".videa-ad,.ad-container,[class*='advert'],[id*='advert'],[class*='ad-overlay'],[class*='adoverlay'],[id*='ad-overlay'],.pre-roll,.preroll,[class*='pre-roll'],[class*='popunder'],[class*='popup-ad'],div[style*='position: absolute'][style*='z-index: 99']{display:none !important;pointer-events:none !important}";
+  (document.head||document.documentElement).appendChild(s);
+}
+})();`;
+
+  async function installIframeAdGuard(win: BrowserWindow) {
+    try {
+      if (!win.webContents.debugger.isAttached()) win.webContents.debugger.attach("1.3");
+      await win.webContents.debugger.sendCommand("Page.enable");
+      await win.webContents.debugger.sendCommand("Page.addScriptToEvaluateOnNewDocument", {
+        source: IFRAME_AD_GUARD,
+      });
+    } catch (err) {
+      console.warn("[ad-block] CDP guard install failed:", err);
+    }
+  }
+
+  mainWindow.webContents.on("did-finish-load", () => {
+    void installIframeAdGuard(mainWindow!);
   });
 
   mainWindow.webContents.on("did-finish-load", () => {
@@ -183,49 +260,158 @@ function rewriteM3U8(text: string, baseUrl: string, referer: string): string {
   return rewritten.join("\n");
 }
 
+// URLs the proxy is currently fetching from defaultSession. The
+// renderer's capture listener checks this set so the proxy's own
+// outbound requests don't loop back as new "captured" URLs — which
+// would otherwise cause the just-expired URL to be re-published as
+// a fresh capture during a re-extract cycle.
+const inFlightProxyTargets = new Set<string>();
+
+/**
+ * Hit Dailymotion's public metadata endpoint and return the master HLS
+ * URL. Skipping the iframe means no ad break, no autoplay games, and
+ * no race between token mint time and proxy fetch.
+ *
+ * The metadata endpoint isn't documented but is what dailymotion.com
+ * itself calls — it's stable enough to rely on. Returns `null` when
+ * the video has DRM (Veedict) or geo-blocking we can't bypass.
+ */
+async function extractDailymotion(
+  iframeUrl: string,
+): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+  const m =
+    iframeUrl.match(/dailymotion\.com\/(?:embed\/)?video\/([a-zA-Z0-9]+)/) ||
+    iframeUrl.match(/dai\.ly\/([a-zA-Z0-9]+)/);
+  if (!m) return null;
+  const id = m[1];
+
+  const endpoint = `https://www.dailymotion.com/player/metadata/video/${id}`;
+  const uaHint =
+    BrowserWindow.getAllWindows()[0]?.webContents.getUserAgent() ||
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+  const resp = await session.defaultSession.fetch(endpoint, {
+    method: "GET",
+    headers: {
+      "User-Agent": uaHint,
+      "Accept": "application/json",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://www.dailymotion.com/",
+      "Origin": "https://www.dailymotion.com",
+      "X-Pantoufa-Proxy": "1",
+    },
+    redirect: "follow",
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!resp.ok) return null;
+
+  const data = (await resp.json()) as {
+    qualities?: Record<string, Array<{ type?: string; url?: string }>>;
+    error?: unknown;
+  };
+  if (data?.error) return null;
+  const qualities = data?.qualities || {};
+  // Preference order — auto (HLS) first, then 1080, etc.
+  const order = ["auto", "1080", "720", "480", "380", "240"];
+  for (const q of order) {
+    const arr = qualities[q];
+    if (!Array.isArray(arr)) continue;
+    const hls = arr.find((s) => s?.type === "application/x-mpegURL" && s.url);
+    if (hls?.url) return { url: hls.url, type: "hls" };
+    const mp4 = arr.find((s) => s?.type === "video/mp4" && s.url);
+    if (mp4?.url) return { url: mp4.url, type: "mp4" };
+  }
+  return null;
+}
+
 function registerVideoProxy() {
   const scraperSession = session.fromPartition("persist:scraper");
 
-  // Intercept ALL outgoing requests from the scraper session and inject
-  // default Referer + Origin for known video CDN domains. This is pre-emptive
-  // — happens before the request leaves, unlike the strategy race which is
-  // reactive. Essential for providers (mp4upload, streamwish) that reject
-  // requests with missing or wrong Referer. Also prevents the black-screen /
-  // infinite-loading issue where no strategy works because the CDN server
-  // already blocked the first request.
+  // Intercept outgoing requests and inject the correct Referer + Origin
+  // passport ONLY if they're missing. The video proxy handler sets its own
+  // headers via per-request strategy race — those must NOT be overridden.
+  // This interceptor is a fallback safety net for bare requests (embed page
+  // navigation, player JS fetches inside the scraper BrowserWindow).
   scraperSession.webRequest.onBeforeSendHeaders(
-    { urls: ["*://*.mp4upload.com/*", "*://*.streamwish.to/*", "*://*.hgcloud.cc/*", "*://*.hgcloud.to/*", "*://*.wishfast.com/*", "*://*.wishembed.pro/*", "*://*.jwembed.com/*", "*://*.hlswish.com/*", "*://*.vibuxer.com/*", "*://*.audinifer.com/*", "*://*.masukestin.com/*", "*://*.voe.sx/*", "*://*.dood.li/*", "*://*.doodstream.com/*", "*://*.uqload.io/*", "*://*.uqload.com/*", "*://*.share4max.com/*", "*://*.megamax.com/*", "*://*.videa.hu/*", "*://*.ok.ru/*"] },
+    {
+      urls: [
+        // mp4upload
+        "*://*.mp4upload.com/*",
+        // streamwish family — all known CDN subdomains
+        "*://*.streamwish.to/*", "*://*.hgcloud.cc/*", "*://*.hgcloud.to/*",
+        "*://*.wishfast.com/*", "*://*.wishembed.pro/*", "*://*.jwembed.com/*",
+        "*://*.hlswish.com/*", "*://*.vibuxer.com/*", "*://*.audinifer.com/*",
+        "*://*.masukestin.com/*", "*://*.hanerix.com/*",
+        // voe
+        "*://*.voe.sx/*",
+        // doodstream
+        "*://*.dood.li/*", "*://*.doodstream.com/*", "*://*.dood.watch/*",
+        "*://*.dood.to/*", "*://*.dood.sh/*", "*://*.dood.so/*",
+        "*://*.dood.cx/*", "*://*.dood.video/*",
+        // uqload
+        "*://*.uqload.io/*", "*://*.uqload.com/*", "*://*.uqload.net/*",
+        // share4max / megamax
+        "*://*.share4max.com/*", "*://*.megamax.com/*",
+        // videa
+        "*://*.videa.hu/*", "*://*.vidvaita.info/*", "*://*.vidit.info/*",
+        // okru
+        "*://*.ok.ru/*",
+        // dailymotion
+        "*://*.dailymotion.com/*", "*://*.dmcdn.net/*",
+      ],
+    },
     (details, callback) => {
-      const host = new URL(details.url).hostname.toLowerCase();
-      let ref = "";
-      let ori = "";
-      if (/mp4upload/.test(host)) {
-        ref = "https://www.mp4upload.com/";
-        ori = "https://www.mp4upload.com";
-      } else if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin/.test(host)) {
-        const root = host.split(".").slice(-2).join(".");
-        ref = `https://${root}/`;
-        ori = `https://${root}`;
-      } else if (/voe\./.test(host)) {
-        ref = "https://voe.sx/";
-        ori = "https://voe.sx";
-      } else if (/doodstream|dood\./.test(host)) {
-        ref = "https://dood.li/";
-        ori = "https://dood.li";
-      } else if (/uqload/.test(host)) {
-        ref = "https://uqload.io/";
-        ori = "https://uqload.io";
-      } else if (/share4max|megamax/.test(host)) {
-        ref = "https://share4max.com/";
-        ori = "https://share4max.com";
-      } else {
-        const root = host.split(".").slice(-2).join(".");
-        ref = `https://${root}/`;
-        ori = `https://${root}`;
+      try {
+        const hdrs = details.requestHeaders;
+
+        const hasReferer = Object.keys(hdrs).some(
+          (k) => k.toLowerCase() === "referer",
+        );
+
+        if (!hasReferer) {
+          const host = new URL(details.url).hostname.toLowerCase();
+        let ref = "";
+        let ori = "";
+        if (/mp4upload/.test(host)) {
+          ref = "https://www.mp4upload.com/";
+          ori = "https://www.mp4upload.com";
+        } else if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(host)) {
+          ref = "https://streamwish.to/";
+          ori = "https://streamwish.to";
+        } else if (/voe\./.test(host)) {
+          ref = "https://voe.sx/";
+          ori = "https://voe.sx";
+        } else if (/dood/.test(host)) {
+          ref = "https://dood.li/";
+          ori = "https://dood.li";
+        } else if (/uqload/.test(host)) {
+          ref = "https://uqload.io/";
+          ori = "https://uqload.io";
+        } else if (/share4max|megamax/.test(host)) {
+          ref = "https://share4max.com/";
+          ori = "https://share4max.com";
+        } else if (/videa|vidvaita|vidit/.test(host)) {
+          ref = "https://videa.hu/";
+          ori = "https://videa.hu";
+        } else if (/dailymotion|dmcdn/.test(host)) {
+          ref = "https://www.dailymotion.com/";
+          ori = "https://www.dailymotion.com";
+        } else {
+          const root = host.split(".").slice(-2).join(".");
+          ref = `https://${root}/`;
+          ori = `https://${root}`;
+        }
+        hdrs["Referer"] = ref;
+        hdrs["Origin"] = ori;
       }
-      details.requestHeaders["Referer"] = ref;
-      details.requestHeaders["Origin"] = ori;
-      callback({ requestHeaders: details.requestHeaders });
+
+      callback({ requestHeaders: hdrs });
+      } catch {
+        // Malformed URL or interceptor bug — let the request through
+        // unchanged rather than dropping it silently.
+        callback({ requestHeaders: details.requestHeaders });
+      }
     },
   );
 
@@ -237,20 +423,18 @@ function registerVideoProxy() {
   // which technically should work, but with port mismatches it sometimes
   // doesn't. Hard-coded canonical origins are what the mobile app uses
   // and they work reliably.
-  function canonicalReferer(videoUrl: URL, embedUrl: URL): { referer: string; origin: string } {
+  function canonicalReferer(videoUrl: URL, _embedUrl: URL): { referer: string; origin: string } {
     const host = videoUrl.hostname.toLowerCase();
     if (/mp4upload/.test(host)) {
       return { referer: "https://www.mp4upload.com/", origin: "https://www.mp4upload.com" };
     }
-    if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish/.test(host)) {
-      // streamwish family: strip subdomain to root (vibuxer.com, hgcloud.cc, etc.)
-      const root = host.split(".").slice(-2).join(".");
-      return { referer: `https://${root}/`, origin: `https://${root}` };
+    if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(host)) {
+      return { referer: "https://streamwish.to/", origin: "https://streamwish.to" };
     }
     if (/voe\./.test(host)) {
       return { referer: "https://voe.sx/", origin: "https://voe.sx" };
     }
-    if (/doodstream|dood\./.test(host)) {
+    if (/dood/.test(host)) {
       return { referer: "https://dood.li/", origin: "https://dood.li" };
     }
     if (/uqload/.test(host)) {
@@ -259,14 +443,14 @@ function registerVideoProxy() {
     if (/share4max|megamax/.test(host)) {
       return { referer: "https://share4max.com/", origin: "https://share4max.com" };
     }
-    // Default: use the embed page's origin.
-    try {
-      const embedOrigin = `${embedUrl.protocol}//${embedUrl.host}`;
-      return { referer: embedOrigin + "/", origin: embedOrigin };
-    } catch {
-      const root = host.split(".").slice(-2).join(".");
-      return { referer: `https://${root}/`, origin: `https://${root}` };
+    if (/videa|vidvaita|vidit/.test(host)) {
+      return { referer: "https://videa.hu/", origin: "https://videa.hu" };
     }
+    if (/dailymotion|dmcdn/.test(host)) {
+      return { referer: "https://www.dailymotion.com/", origin: "https://www.dailymotion.com" };
+    }
+    const root = host.split(".").slice(-2).join(".");
+    return { referer: `https://${root}/`, origin: `https://${root}` };
   }
 
   // Per-host cache of the Referer strategy that last worked — backup for
@@ -294,15 +478,13 @@ function registerVideoProxy() {
       { name: "no-referer", headers: noRefererHeaders },
     ];
 
-    // mp4upload CDN only accepts self-referencing; canonical www.mp4upload.com
-    // and embed-page origins are rejected. Skip the slow race and lead with
-    // target-self, then try embed + no-referer as fallbacks.
+    // mp4upload: only target-self Referer works. The other strategies
+    // always fail and the parallel race just overloads the CDN, causing
+    // it to throttle/reject all requests (including the winning one).
+    // Use target-self exclusively with no race.
     if (/mp4upload/.test(target.hostname)) {
       return [
         { name: "target-self", headers: targetHeaders },
-        { name: "embed", headers: embedHeaders },
-        { name: "no-referer", headers: noRefererHeaders },
-        { name: "canonical", headers: canonicalHeaders },
       ];
     }
 
@@ -336,22 +518,80 @@ function registerVideoProxy() {
     method: string,
     signal: AbortSignal,
   ) {
+    // Mirror the iframe's UA so CDNs that bind tokens to UA fingerprint
+    // (Cloudflare bot-fight + many video CDNs) accept proxy fetches with
+    // the same signed URLs the iframe just minted. Falls back to a plain
+    // Chrome desktop UA if we're called before the window is up.
+    const iframeUa =
+      mainWindow?.webContents.getUserAgent() ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
     const baseHeaders: Record<string, string> = {
-      "User-Agent": VIDEO_UA,
+      "User-Agent": iframeUa,
       "Accept": "*/*",
-      "Accept-Encoding": "identity",
+      "Accept-Language": "en-US,en;q=0.9",
+      // No "Accept-Encoding: identity" — let Chromium negotiate gzip/br
+      // like the iframe does. Some CDN bot-detection rules flag clients
+      // that disable compression.
+      "Sec-Fetch-Dest": /\.(m3u8|mpd)(\?|#|$)/i.test(target) ? "empty" : "video",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "cross-site",
     };
+
     if (range) baseHeaders["Range"] = range;
-    const upstream = await scraperSession.fetch(target, {
-      method,
-      headers: { ...baseHeaders, ...strat.headers() },
-      redirect: "follow",
-      credentials: "include",
-      bypassCustomProtocolHandlers: true,
-      signal,
-    });
-    if (!upstream.ok) throw new Error(`${strat.name} → ${upstream.status}`);
-    return { upstream, strategy: strat.name };
+
+    // CRITICAL: do NOT append `_p=` cache-buster to signed URLs. The
+    // signature is computed over the full query string by most providers
+    // (Cloudflare streamwish, voe, dailymotion, etc.). Adding any extra
+    // param invalidates the HMAC and the CDN responds 403 — which is
+    // exactly the "works briefly then fails" symptom. Instead, set
+    // cache: "no-store" on the fetch so Chromium doesn't cache responses
+    // and the strategy race can't be poisoned by a stale 403. Cache-
+    // buster is only used for fully bare URLs (no query string at all),
+    // which are rare with real provider CDNs.
+    const cachebusted =
+      target.includes("?") || target.includes("#")
+        ? target
+        : `${target}?_p=${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    // Use defaultSession (same as the renderer iframe). The iframe
+    // already passed Cloudflare challenges and stored clearance cookies
+    // in defaultSession. If the proxy used a different partition, the
+    // CDN's CF check would reject our requests even with the right
+    // Referer + token. The marker header tells the defaultSession's
+    // Referer interceptor not to override our strategy-specific value.
+    //
+    // Track the URL in inFlightProxyTargets so the renderer's capture
+    // listener (which also runs on defaultSession requests) doesn't
+    // echo our proxy fetches back as fresh "captured" URLs.
+    inFlightProxyTargets.add(cachebusted);
+    if (cachebusted !== target) inFlightProxyTargets.add(target);
+    try {
+      const upstream = await session.defaultSession.fetch(cachebusted, {
+        method,
+        headers: {
+          ...baseHeaders,
+          ...strat.headers(),
+          "X-Pantoufa-Proxy": "1",
+        },
+        redirect: "follow",
+        credentials: "include",
+        cache: "no-store",
+        bypassCustomProtocolHandlers: true,
+        signal,
+      });
+
+      if (!upstream.ok) throw new Error(`${strat.name} → ${upstream.status}`);
+      return { upstream, strategy: strat.name };
+    } finally {
+      // Keep entries for a brief moment so any onBeforeRequest still
+      // firing during request teardown (especially for aborted losers
+      // of the strategy race) hits the skip path. 2s is plenty.
+      setTimeout(() => {
+        inFlightProxyTargets.delete(cachebusted);
+        inFlightProxyTargets.delete(target);
+      }, 2000);
+    }
   }
 
   async function tryFetch(
@@ -365,9 +605,42 @@ function registerVideoProxy() {
     const embedUrl = (() => { try { return new URL(embedHref); } catch { return targetUrl; } })();
     const list = strategies(targetUrl, embedUrl);
 
-    // Fast path: cached working strategy. Try alone with 8s cap. If it
-    // succeeds we save all the parallel overhead. If it aborts (timeout),
-    // fall through to the parallel race which may have a working alt.
+    // mp4upload: the CDN on port 183 is slow (10–30s response times).
+    // The strategy race + 8s/15s watchdogs always kill requests before
+    // the CDN responds. Skip the race, use target-self exclusively, and
+    // give the CDN up to 60s to respond. The browser's own abort signal
+    // still propagates so user seeks/cancels work correctly.
+    if (/mp4upload/.test(targetUrl.hostname)) {
+      const strat = list[0]; // target-self
+      const ctrl = new AbortController();
+      if (signal) signal.addEventListener("abort", () => { try { ctrl.abort(); } catch {} }, { once: true });
+      // 60s safety net — mp4upload CDN can be very slow but rarely passes 30s.
+      const watchdog = setTimeout(() => { try { ctrl.abort(); } catch {} }, 60000);
+      try {
+        const r = await fetchWithStrategy(target, strat, range, method, ctrl.signal);
+        clearTimeout(watchdog);
+        return r;
+      } catch (e: any) {
+        clearTimeout(watchdog);
+        // Extract the real HTTP status from the strategy error message
+        // (`{name} → {status}`) so the outer handler can detect a 410
+        // and signal the renderer to re-extract. Without this, mp4upload
+        // expirations always look like generic 502s.
+        const msg = String(e?.message || e?.code || e?.name || e);
+        const m = msg.match(/→\s*(\d{3})/);
+        const code = m ? parseInt(m[1], 10) : 0;
+        const err = new Error(`all strategies failed for ${target} (statuses: ${code})`);
+        (err as any).statusCodes = code ? [code] : [];
+        (err as any).cause = e;
+        throw err;
+      }
+    }
+
+    // Fast path: cached working strategy. Try alone with a 20s cap.
+    // The previous 8s cap matched median segment latency on slow CDN
+    // edges (MENA → EU), so legitimate fetches were being killed and
+    // flushing the strategy cache — forcing a full 4-way race on the
+    // next call and triggering CDN rate limits.
     const cached = hostStrategyCache.get(targetUrl.host);
     if (cached) {
       const cachedStrat = list.find((s) => s.name === cached);
@@ -375,7 +648,7 @@ function registerVideoProxy() {
         const ctrl = new AbortController();
         const onOuter = () => ctrl.abort();
         if (signal) signal.addEventListener("abort", onOuter, { once: true });
-        const watchdog = setTimeout(() => ctrl.abort(), 8000);
+        const watchdog = setTimeout(() => ctrl.abort(), 20000);
         try {
           const r = await fetchWithStrategy(target, cachedStrat, range, method, ctrl.signal);
           clearTimeout(watchdog);
@@ -420,13 +693,21 @@ function registerVideoProxy() {
     } catch (e: any) {
       stratStates.forEach((s) => clearTimeout(s.watchdog));
       const errors: unknown[] = (e?.errors as unknown[]) || [e];
+      const statusCodes: number[] = [];
       for (let i = 0; i < errors.length; i++) {
         const err = errors[i] as any;
         const msg = err?.message || err?.code || err?.name || String(err);
+        // strategy errors look like "canonical → 403"; extract the number.
+        const sm = String(msg).match(/→\s*(\d{3})/);
+        if (sm) statusCodes.push(parseInt(sm[1], 10));
         console.warn(`[pantoufa-video] ${list[i]?.name || "?"}: ${msg}`);
       }
-      const wrap = new Error(`all strategies failed for ${target}`);
+      const wrap = new Error(
+        `all strategies failed for ${target}` +
+          (statusCodes.length ? ` (statuses: ${statusCodes.join(",")})` : ""),
+      );
       (wrap as any).cause = e;
+      (wrap as any).statusCodes = statusCodes;
       throw wrap;
     }
   }
@@ -492,11 +773,14 @@ function registerVideoProxy() {
       // Chunk open-ended Range requests so we never wait on a 100+MB
       // download before responding. For mp4 sources the browser sends
       // `Range: bytes=0-` which used to suck the whole file into RAM,
-      // causing the renderer to time out → black screen. We cap to a
-      // 4 MB window per request; the browser will issue more Range
-      // requests as it needs them.
-      const CHUNK_SIZE = 4 * 1024 * 1024;
-      const isLargeMedia = /\.(mp4|m4s|ts)(\?|$)/i.test(target);
+      // causing the renderer to time out → black screen. For HLS .ts /
+      // .m4s segments we use a larger cap; for direct .mp4 playback we
+      // use a small first-chunk so the moov atom + first frames arrive
+      // fast and the user sees the picture quickly.
+      const isMp4 = /\.mp4(\?|$)/i.test(target);
+      const isHlsSegment = /\.(m4s|ts)(\?|$)/i.test(target);
+      const isLargeMedia = isMp4 || isHlsSegment;
+      const CHUNK_SIZE = isMp4 ? 1 * 1024 * 1024 : 4 * 1024 * 1024;
       let range = request.headers.get("range");
       if (isLargeMedia) {
         if (!range) {
@@ -540,6 +824,7 @@ function registerVideoProxy() {
             "Content-Type": "application/vnd.apple.mpegurl",
             "Access-Control-Allow-Origin": "*",
             "Cache-Control": "no-store",
+            "Vary": "Origin",
           },
         });
       }
@@ -549,7 +834,7 @@ function registerVideoProxy() {
       // for large bodies — mp4upload + videa came back broken. Buffering via
       // arrayBuffer is slower at first byte but actually plays. Acceptable
       // tradeoff for now; revisit if the streaming bug is fixed upstream.
-      const buf = await upstream.arrayBuffer();
+      let buf = await upstream.arrayBuffer();
 
       const outHeaders = new Headers();
       const passthrough = ["content-type", "content-range", "etag", "last-modified"];
@@ -557,22 +842,30 @@ function registerVideoProxy() {
         const v = upstream.headers.get(k);
         if (v) outHeaders.set(k, v);
       }
-      outHeaders.set("content-length", String(buf.byteLength));
       outHeaders.set("accept-ranges", "bytes");
 
       // If we chunked the upstream request but it answered 200 with the
-      // full body (server ignored Range), synthesize a Content-Range so
-      // the browser still treats this as partial content and requests more.
+      // full body (server ignored Range), slice the buffer to the
+      // requested window AND synthesize a truthful Content-Range. The
+      // old code reported the full-body length as "partial" — the
+      // browser then expected CHUNK_SIZE bytes but received e.g. 200MB,
+      // OOMing the main process. Slice first, report second.
       let outStatus = upstream.status;
-      if (isLargeMedia && range && !outHeaders.get("content-range")) {
+      if (isLargeMedia && range && upstream.status === 200) {
         const m = range.match(/^bytes=(\d+)-(\d+)$/);
         if (m) {
           const start = parseInt(m[1], 10);
-          const total = parseInt(upstream.headers.get("content-length") || "0", 10) || (start + buf.byteLength);
-          outHeaders.set("content-range", `bytes ${start}-${start + buf.byteLength - 1}/${total}`);
-          outStatus = 206;
+          const end = parseInt(m[2], 10);
+          if (buf.byteLength > end - start + 1) {
+            const sliced = buf.slice(start, end + 1);
+            const total = buf.byteLength;
+            buf = sliced;
+            outHeaders.set("content-range", `bytes ${start}-${start + buf.byteLength - 1}/${total}`);
+            outStatus = 206;
+          }
         }
       }
+      outHeaders.set("content-length", String(buf.byteLength));
 
       // MIME fixups.
       const outCt = (outHeaders.get("content-type") || "").toLowerCase();
@@ -599,10 +892,16 @@ function registerVideoProxy() {
       // If every strategy returned 401/403/410, the URL's signed token is
       // dead — likely the page was idle long enough for it to expire. Tell
       // the renderer with a recognizable status so it can re-extract.
-      const m = msg.match(/last status:\s*(\d+)/i);
-      const lastStatus = m ? parseInt(m[1], 10) : 0;
-      if (lastStatus === 401 || lastStatus === 403 || lastStatus === 410) {
-        console.warn(`[pantoufa-video] URL EXPIRED (${lastStatus}) for ${target}`);
+      // tryFetch attaches `statusCodes` to the wrapping error when all
+      // strategies fail with HTTP responses (not network timeouts).
+      const statusCodes: number[] = Array.isArray(e?.statusCodes) ? e.statusCodes : [];
+      const expired =
+        statusCodes.length > 0 &&
+        statusCodes.every((s) => s === 401 || s === 403 || s === 410);
+      if (expired) {
+        console.warn(
+          `[pantoufa-video] URL EXPIRED (${statusCodes.join(",")}) for ${target}`,
+        );
         return new Response("url expired", {
           status: 410,
           headers: { "X-Pantoufa-Reextract": "1", "Access-Control-Allow-Origin": "*" },
@@ -639,10 +938,153 @@ app.whenReady().then(() => {
     cb({ responseHeaders: headers });
   });
 
+  // Capture video URLs the renderer's iframe-embed fetches. The
+  // renderer subscribes via IPC and uses the captured URL to swap
+  // playback into its own custom <video> element while still gaining
+  // the reliability of the provider's real player initializing
+  // everything (CF, autoplay, tokens). The renderer is responsible
+  // for ignoring captures that don't belong to its current viewing
+  // state — we just emit everything that looks like a real stream
+  // from a known CDN host.
+  function isDecoyStream(u: string) {
+    return /test-videos\.co\.uk|bigbuckbunny|sample[-_.]|placeholder|tos\.mp4|googleapis\.com\/.*oggtheora|\/lol\/file\.mp4/i.test(u);
+  }
+  function isKnownVideoCdn(host: string): boolean {
+    const h = host.toLowerCase();
+    // Reject known ad / tracking / decoy hosts. Accept everything else
+    // so yonaplay and any future provider work automatically without
+    // needing manual additions to every regex list in the codebase.
+    // AD_HOST_RE already cancels ad-network requests before they reach
+    // this check, and the renderer gates captures by captureForEmbed.
+    if (AD_HOST_RE.test(h)) return false;
+    if (/test-videos\.co\.uk|bigbuckbunny|sample[-_.]|placeholder/.test(h)) return false;
+    return h.includes(".") && !/^\d+\.\d+/.test(h);
+  }
+  session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
+    try {
+      const u = details.url;
+      // Skip if this URL is being fetched BY the proxy itself — the
+      // proxy operates on defaultSession too, and without this check
+      // its own outbound fetches would loop back as new captures.
+      if (inFlightProxyTargets.has(u)) return callback({});
+      if (AD_HOST_RE.test(u)) return callback({ cancel: true });
+      // Path-based: many providers serve pre-roll ads from /ads/ or /advert/
+      // paths on their OWN host. Block those without blocking the whole host.
+      if (/\/(ads?|advert|adserver|adsense|preroll|popunder)\//i.test(u)) {
+        return callback({ cancel: true });
+      }
+      if (/\.(m3u8|mp4)(\?|#|$)/i.test(u) && !isDecoyStream(u)) {
+        const host = new URL(u).hostname;
+        if (isKnownVideoCdn(host)) {
+          mainWindow?.webContents.send("pantoufa:video-captured", { url: u });
+        }
+      }
+    } catch {}
+    callback({});
+  });
+
+  // The provider's embed iframe makes its own fetches to its CDN for
+  // playlists and segments. Some CDNs (mp4upload, streamwish family)
+  // whitelist a specific canonical Referer that doesn't always match
+  // what the embed page's natural URL would produce. Force the right
+  // one so playback inside the iframe is reliable.
+  session.defaultSession.webRequest.onBeforeSendHeaders(
+    {
+      // Catch-all — streamwish rotates CDN mirrors (cybervynx.com,
+      // ghbrisk.com, etc.) that aren't in any static list. By matching
+      // EVERY request and routing headers based on hostname inside the
+      // callback, new mirrors get the correct Referer automatically.
+      urls: ["*://*/*"],
+    },
+    (details, callback) => {
+      const hdrs = details.requestHeaders;
+      const proxyMarker = Object.keys(hdrs).find((k) => k.toLowerCase() === "x-pantoufa-proxy");
+      if (proxyMarker) {
+        delete hdrs[proxyMarker];
+        callback({ requestHeaders: hdrs });
+        return;
+      }
+      try {
+        const host = new URL(details.url).hostname.toLowerCase();
+        let ref = "";
+        let ori = "";
+        if (/mp4upload/.test(host)) {
+          ref = "https://www.mp4upload.com/";
+          ori = "https://www.mp4upload.com";
+        } else if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(host)) {
+          ref = "https://streamwish.to/";
+          ori = "https://streamwish.to";
+        } else if (/voe\./.test(host)) {
+          ref = "https://voe.sx/";
+          ori = "https://voe.sx";
+        } else if (/dood/.test(host)) {
+          ref = "https://dood.li/";
+          ori = "https://dood.li";
+        } else if (/uqload/.test(host)) {
+          ref = "https://uqload.io/";
+          ori = "https://uqload.io";
+        } else if (/share4max|megamax/.test(host)) {
+          ref = "https://share4max.com/";
+          ori = "https://share4max.com";
+        } else if (/videa|vidvaita|vidit/.test(host)) {
+          ref = "https://videa.hu/";
+          ori = "https://videa.hu";
+        } else if (/dailymotion|dmcdn/.test(host)) {
+          ref = "https://www.dailymotion.com/";
+          ori = "https://www.dailymotion.com";
+        } else if (!AD_HOST_RE.test(host) && host.includes(".") && !/^\d+\.\d+/.test(host)) {
+          // Else fallback: any non-ad, credible-looking host gets a
+          // root-domain Referer. This catches streamwish's rotating CDN
+          // mirrors (cybervynx.com, ghbrisk.com, future mirrors).
+          const root = host.split(".").slice(-2).join(".");
+          ref = `https://${root}/`;
+          ori = `https://${root}`;
+        }
+        if (ref) {
+          hdrs["Referer"] = ref;
+          hdrs["Origin"] = ori;
+        }
+      } catch {}
+      callback({ requestHeaders: hdrs });
+    },
+  );
+
   registerVideoProxy();
 
   ipcMain.handle("pantoufa:scrape", async (_evt, job: ScrapeJob) => {
     return enqueue(job);
+  });
+
+  // Mute / unmute the main window's audio. The renderer calls this
+  // while the hidden iframe is bootstrapping a provider's player so the
+  // user doesn't hear ad audio during the brief URL-capture window. The
+  // iframe still plays (capturing requires audio context) — we just
+  // silence the speaker for the few seconds it takes to extract.
+  ipcMain.handle("pantoufa:set-muted", async (_evt, muted: boolean) => {
+    try {
+      mainWindow?.webContents.setAudioMuted(!!muted);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
+  // Direct provider extractors. Skip the iframe + capture cycle for
+  // providers that expose a public manifest API — we hit the endpoint
+  // from the main process and hand the resulting URL straight to the
+  // custom player. No ads ever load, no token race.
+  ipcMain.handle("pantoufa:direct-extract", async (
+    _evt,
+    opts: { provider: string; iframeUrl: string },
+  ): Promise<{ url: string; type: "hls" | "mp4" } | null> => {
+    try {
+      if (opts.provider === "dailymotion") {
+        return await extractDailymotion(opts.iframeUrl);
+      }
+    } catch (e) {
+      console.warn("[direct-extract] failed:", e);
+    }
+    return null;
   });
 
   ipcMain.handle("pantoufa:open-external", async (_evt, url: string) => {

@@ -208,91 +208,6 @@ if (episodes.length === 0) {
   episodes.sort(function (a, b) { return a.number - b.number; });
 }
 
-// Scrape related-anime cards. witanime's markup for this section varies
-// per template version. Strategy: find a heading whose text mentions
-// "ذات صلة" / "مشابهة" / "related" / "similar" / "أنميات أخرى" and walk
-// to the nearest sibling/parent that contains anime cards. Fall back to
-// scanning ALL anime cards on the page and filtering out the current anime
-// + anything in a "trending"/"latest" widget.
-var related = [];
-var relatedSeen = {};
-var pageHref = location.href.replace(/\\/+$/, '');
-
-function addRelatedCard(el) {
-  var hrefEl = el.querySelector('a[href*="/anime/"]');
-  var href = (hrefEl && hrefEl.getAttribute('href')) || '';
-  if (!href) return;
-  if (href.indexOf('/anime/') < 0) return;
-  var normHref = href.replace(/\\/+$/, '');
-  if (normHref === pageHref) return;  // skip current anime
-  if (relatedSeen[normHref]) return;
-  relatedSeen[normHref] = true;
-  var titleEl = el.querySelector('.anime-card-title h3 a, .anime-card-title a, h3 a, a[href*="/anime/"]');
-  var title = (titleEl && titleEl.textContent.trim()) || '';
-  if (!title) return;
-  related.push({
-    title: title,
-    href: href,
-    image: window.__pBestImg(el),
-    type: (el.querySelector('.anime-card-type a') && el.querySelector('.anime-card-type a').textContent.trim()) || null,
-  });
-}
-
-// Strategy A: look for any element with related-ish class names.
-document.querySelectorAll(
-  '.related-anime .anime-card-container, ' +
-  '[class*="related"] .anime-card-container, ' +
-  '[class*="similar"] .anime-card-container, ' +
-  '[id*="related"] .anime-card-container'
-).forEach(addRelatedCard);
-
-// Strategy B: find heading text mentioning related keywords and grab cards
-// after / inside it (works for templates that don't use a class name).
-if (related.length === 0) {
-  var headingPattern = /ذات[\\s\\-]*صلة|مشاب[هي]|مشابهة|related|similar|أنميات[\\s\\-]*أخرى|قد[\\s\\-]*يعجبك/i;
-  var headings = document.querySelectorAll('h1, h2, h3, h4, h5, .section-title, .widget-title, [class*="title"], [class*="header"]');
-  for (var hi = 0; hi < headings.length; hi++) {
-    var h = headings[hi];
-    var txt = (h.textContent || '').trim();
-    if (!headingPattern.test(txt)) continue;
-    // Look for anime-card-container inside the heading's parent / next siblings.
-    var container = h.parentElement;
-    if (container) {
-      container.querySelectorAll('.anime-card-container').forEach(addRelatedCard);
-    }
-    // Also check the next 3 siblings of the heading itself.
-    var sib = h.nextElementSibling;
-    var hops = 0;
-    while (sib && hops++ < 4) {
-      sib.querySelectorAll('.anime-card-container').forEach(addRelatedCard);
-      if (sib.classList && (sib.classList.contains('anime-card-container'))) addRelatedCard(sib);
-      sib = sib.nextElementSibling;
-    }
-  }
-}
-
-// Strategy C (fallback): the wit page sometimes shows "نفس السلسلة" links
-// as plain <a href="/anime/..."> inside the metadata table. Scrape those too.
-if (related.length === 0) {
-  document.querySelectorAll('a[href*="/anime/"]').forEach(function (a) {
-    var href = a.getAttribute('href') || '';
-    if (!href || href.indexOf('/anime/') < 0) return;
-    var normHref = href.replace(/\\/+$/, '');
-    if (normHref === pageHref) return;
-    if (relatedSeen[normHref]) return;
-    // Only count links inside paragraphs / list items / dedicated link rows.
-    var parent = a.closest('.anime-info, .anime-details, .anime-meta, .metadata, .meta, li, td');
-    if (!parent) return;
-    relatedSeen[normHref] = true;
-    related.push({
-      title: (a.textContent || '').trim() || href,
-      href: href,
-      image: null,
-      type: null,
-    });
-  });
-}
-
 return {
   title: (titleEl && titleEl.textContent.trim()) || '',
   poster: (posterImg && (posterImg.getAttribute('data-image') || posterImg.getAttribute('src'))) || '',
@@ -300,7 +215,6 @@ return {
   genres: genres,
   episodes: episodes,
   up4Url: up4Url,
-  related: related,
 };
 })();`;
 
@@ -493,13 +407,13 @@ function provider(url) {
   url = (url || '').toLowerCase();
   if (/mp4upload/.test(url)) return 'mp4upload';
   if (/dailymotion|dai\\.ly/.test(url)) return 'dailymotion';
-  if (/streamwish|hlswish|wishembed|wishfast|hgcloud|jwembed/.test(url)) return 'streamwish';
+  if (/streamwish|hlswish|wishembed|wishfast|hgcloud|jwembed|vibuxer|audinifer|masukestin|hanerix/.test(url)) return 'streamwish';
   if (/voe\\./.test(url)) return 'voe';
   if (/share4max|megamax/.test(url)) return 'share4max';
   if (/doodstream|dood\\./.test(url)) return 'doodstream';
   if (/uqload/.test(url)) return 'uqload';
   if (/ok\\.ru/.test(url)) return 'okru';
-  if (/videa\\./.test(url)) return 'videa';
+  if (/videa\\.|vidvaita|vidit/.test(url)) return 'videa';
   if (/vk\\.com/.test(url)) return 'vk';
   return 'generic';
 }
@@ -508,16 +422,14 @@ function badIframe(src) {
   if (/google|facebook|pyppo|popads|disqus/.test(src)) return true;
   return false;
 }
-var ok = await window.__pWaitFor(function () {
-  return !!document.querySelector('iframe, #episode-servers, .server-btn, .anime-page-link, .main-section');
-}, 25000);
-if (!ok) return null;
-await new Promise(function (r) { setTimeout(r, 1500); });
 
+// Fast lane: check for iframes immediately (most pages render them in the
+// initial HTML). Only fall back to the slow __pWaitFor path if nothing found.
 var ep = document.querySelector('.main-section h3') || document.querySelector('h1') || document.querySelector('.episode-title');
 var an = document.querySelector('.anime-page-link a') || document.querySelector('h1');
 var seen = {};
 var out = [];
+
 function collect() {
   document.querySelectorAll('iframe').forEach(function (f) {
     var src = (f.src || f.getAttribute('data-src') || '').trim();
@@ -526,21 +438,38 @@ function collect() {
     out.push({ id: String(out.length), name: 'Server ' + (out.length + 1), iframeUrl: src, provider: provider(src) });
   });
 }
+
+// 1st pass: grab whatever iframes are already in the DOM (fast).
 collect();
 
+// 2nd pass: wait briefly for JS to swap in server iframes, then collect again.
+// Only pull the heavy wait if we have zero servers so far.
+if (out.length === 0) {
+  var ok = await window.__pWaitFor(function () {
+    return !!document.querySelector('iframe, #episode-servers, .server-btn, .anime-page-link, .main-section');
+  }, 8000);
+} else {
+  // At least one iframe visible — short wait for JS to finish rendering tabs.
+  await new Promise(function (r) { setTimeout(r, 200); });
+}
+
+// Re-collect after JS has finished stitching the page.
+collect();
+
+// If we already have a solid set of servers, skip the slow tab-click loop.
 var tabs = document.querySelectorAll('#episode-servers .server-link, .server-btn, [data-server], .servers-list a, ul.servers li a, .episode-servers a, .server-tabs li, .servers-tabs a');
-// Cap tab iterations + use a shorter wait — most sites swap the iframe
-// synchronously after click. Was 25 tabs * 900ms = up to 22s; now 12 * 350ms = ~4s.
-var TAB_CAP = 12;
-var TAB_WAIT = 350;
-for (var i = 0; i < tabs.length && i < TAB_CAP; i++) {
-  var t = tabs[i];
-  var name = (t.textContent || '').trim() || ('Server ' + (i + 1));
-  try { t.click(); } catch (e) {}
-  await new Promise(function (r) { setTimeout(r, TAB_WAIT); });
-  var before = out.length;
-  collect();
-  for (var j = before; j < out.length; j++) out[j].name = name;
+if (out.length < 5 && tabs.length > 0) {
+  var TAB_CAP = 6;
+  var TAB_WAIT = 150;
+  for (var i = 0; i < tabs.length && i < TAB_CAP; i++) {
+    var t = tabs[i];
+    var name = (t.textContent || '').trim() || ('Server ' + (i + 1));
+    try { t.click(); } catch (e) {}
+    await new Promise(function (r) { setTimeout(r, TAB_WAIT); });
+    var before = out.length;
+    collect();
+    for (var j = before; j < out.length; j++) out[j].name = name;
+  }
 }
 
 return {
@@ -554,107 +483,250 @@ return {
 // Returns the first m3u8/mp4 the player tries to fetch. For tokenized
 // providers (mp4upload, streamwish, voe) we prefer the live URL from
 // fetch/XHR hooks since the packed-JS URL has stale tokens.
+// NOTE: Dailymotion is handled separately — we render its iframe directly
+// instead of extracting raw URLs (their tokens are too heavily encrypted).
+
+/**
+ * Hook installer — designed to run as `injectBefore` so the fetch / XHR
+ * interceptors are armed on every navigation BEFORE page scripts execute.
+ * Without this, ad-gate redirects swap the document and the
+ * later-injected hooks would have already missed the live stream URL.
+ *
+ * Safe to re-run; the `__vidHookInstalled` guard makes subsequent calls
+ * a no-op. Stores captured URLs on `window.__vidHooked` (array).
+ */
+export const VIDEO_HOOK_INSTALL = `(function () {
+  try {
+    if (window.__vidHookInstalled) return;
+    window.__vidHookInstalled = true;
+    window.__vidHooked = [];
+    function isVideo(u) { return typeof u === 'string' && /\\.(m3u8|mp4)(\\?|$|#)/i.test(u); }
+    function isDecoy(u) {
+      var lu = (u || '').toLowerCase();
+      return /test-videos\\.co\\.uk|bigbuckbunny|sample[-_.]|placeholder|tos\\.mp4|googleapis\\.com\\/.*oggtheora|\\/lol\\/file\\.mp4/.test(lu);
+    }
+    function maybe(u) {
+      if (!isVideo(u) || isDecoy(u)) return;
+      if (window.__vidHooked.indexOf(u) === -1) window.__vidHooked.push(u);
+    }
+    var oFetch = window.fetch;
+    if (oFetch) {
+      window.fetch = function (i, init) {
+        try { maybe(typeof i === 'string' ? i : (i && i.url)); } catch (e) {}
+        return oFetch.apply(this, arguments);
+      };
+    }
+    var oOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (m, u) {
+      try { maybe(u); } catch (e) {}
+      return oOpen.apply(this, arguments);
+    };
+    // Scan <video>/<source> tags every 100ms for src changes the player
+    // assigns directly (some players bypass fetch entirely).
+    setInterval(function () {
+      try {
+        document.querySelectorAll('video').forEach(function (v) {
+          if (v.src) maybe(v.src);
+          v.querySelectorAll('source').forEach(function (s) { if (s.src) maybe(s.src); });
+        });
+      } catch (e) {}
+    }, 100);
+  } catch (e) {}
+})();`;
 
 export const EXTRACT_VIDEO_URL = `(async function(){
-if (window.__vidHookInstalled) { /* already hooked from a previous call */ }
-else {
-  window.__vidHookInstalled = true;
-  window.__vidHooked = [];
-  function isVideo(u) { return typeof u === 'string' && /\\.(m3u8|mp4)(\\?|$)/i.test(u); }
-  function isDecoy(u) {
-    var lu = (u || '').toLowerCase();
-    return /test-videos\\.co\\.uk|bigbuckbunny|sample[-_.]|placeholder|tos\\.mp4|googleapis\\.com\\/.*oggtheora|\\/lol\\/file\\.mp4/.test(lu);
-  }
-  function maybe(u) { if (isVideo(u) && !isDecoy(u) && window.__vidHooked.indexOf(u) === -1) window.__vidHooked.push(u); }
-  var oFetch = window.fetch;
-  if (oFetch) window.fetch = function (i, init) { try { maybe(typeof i === 'string' ? i : (i && i.url)); } catch (e) {} return oFetch.apply(this, arguments); };
-  var oOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function (m, u) { try { maybe(u); } catch (e) {} return oOpen.apply(this, arguments); };
-  setInterval(function () {
-    document.querySelectorAll('video').forEach(function (v) {
-      if (v.src) maybe(v.src);
-      v.querySelectorAll('source').forEach(function (s) { if (s.src) maybe(s.src); });
-    });
-  }, 100);
+// Defensive: install hooks here too in case injectBefore didn't fire
+// (e.g. cached page navigation that skipped did-start-navigation).
+${VIDEO_HOOK_INSTALL}
+
+function isBadHost(h) {
+  h = (h || '').toLowerCase();
+  // Known decoy / ad / tracking hosts.
+  return /test-videos\\.co\\.uk|bigbuckbunny|sample[-_.]|placeholder|tos\\.mp4|google|facebook|doubleclick|popads|propeller|trafficjunky|popcash|disqus|googleapis|googletag|analytics/.test(h);
 }
 
-function pick(i) {
+function isSafeUrl(url) {
+  try {
+    var h = new URL(url).hostname.toLowerCase();
+    if (isBadHost(h)) return false;
+    // Accept: same host, subdomain match, or any credible video-looking URL
+    // from a reasonable hostname (at least one dot, not an IP-only host).
+    // This catches streamwish CDN subdomains that use random-sounding hosts
+    // (cybervynx.com, medixiru.com etc.) which were silently rejected by
+    // the old hardcoded whitelist.
+    return h.includes('.') && !/^\\d+\\.\\d+/.test(h);
+  } catch (err) { return false; }
+}
+
+function pickFromHooked() {
   var us = (window.__vidHooked || []).slice();
   if (!us.length) return null;
-  function isSafeMp4(url) {
-    try {
-      var h = new URL(url).hostname.toLowerCase();
-      var e = location.hostname.toLowerCase();
-      if (h === e || h.indexOf(e) !== -1 || e.indexOf(h) !== -1) return true;
-      return /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix|mp4upload|voe|doodstream|dood|uqload|share4max|megamax|videa|okru|vk|dailymotion|dai\\.ly/.test(h);
-    } catch(err) { return false; }
-  }
-
-  var m3 = us.find(function (u) { return /master\\.m3u8|playlist\\.m3u8|index\\.m3u8/i.test(u); }) || us.find(function (u) { return /\.m3u8/i.test(u); });
+  // Prefer named playlists (master/index/playlist) then any m3u8.
+  var m3 = us.find(function (u) { return /(master|playlist|index)\\.m3u8/i.test(u) && isSafeUrl(u); }) ||
+           us.find(function (u) { return /\\.m3u8/i.test(u) && isSafeUrl(u); });
   if (m3) return m3;
+  return us.find(function (u) { return /\\.mp4/i.test(u) && isSafeUrl(u); }) || null;
+}
 
-  // Wait 2.5s (25 iterations) to give .m3u8 a chance before settling for a safe .mp4
-  if (i >= 25) {
-    var mp4 = us.find(function (u) { return /\.mp4/i.test(u) && isSafeMp4(u); });
-    if (mp4) return mp4;
+// Wait until Cloudflare's "Just a moment" challenge has cleared. Some
+// providers (streamwish, voe) put their embed pages behind CF.
+// 8s max so we don't burn the whole job budget on CF alone.
+async function waitForCfChallenge() {
+  for (var i = 0; i < 32; i++) {
+    var title = (document.title || '').toLowerCase();
+    var hasChallenge = !!document.querySelector(
+      '#challenge-running, .cf-browser-verification, #challenge-stage, #cf-challenge-running, #cf-please-wait'
+    );
+    if (!hasChallenge && title.indexOf('just a moment') < 0 && title.indexOf('moment') < 0) {
+      return true;
+    }
+    await new Promise(function (r) { setTimeout(r, 250); });
   }
+  return false;
+}
 
-  // Last resort
-  if (i === 199) {
-    return us.find(function (u) { return /\.mp4/i.test(u); });
-  }
-
+// HTML / packed-JS regex pass. Most embeds inline the source URL in
+// the initial HTML; this short-circuits the play-button flow entirely
+// when the URL is already accessible.
+function scanInlineSources() {
+  try {
+    var html = document.documentElement ? document.documentElement.outerHTML : '';
+    // Try packed-player keys first, in priority order. master/index/playlist m3u8 is the strongest signal.
+    var patterns = [
+      /file\\s*:\\s*["']([^"']+\\.(?:m3u8|mp4)[^"']*)["']/i,
+      /source\\s*:\\s*["']([^"']+\\.(?:m3u8|mp4)[^"']*)["']/i,
+      /src\\s*:\\s*["']([^"']+\\.(?:m3u8|mp4)[^"']*)["']/i,
+      /sources\\s*:\\s*\\[\\s*\\{\\s*[^}]*?(?:file|src)\\s*:\\s*["']([^"']+\\.(?:m3u8|mp4)[^"']*)["']/i,
+    ];
+    for (var i = 0; i < patterns.length; i++) {
+      var m = html.match(patterns[i]);
+      if (m && isSafeUrl(m[1])) return m[1];
+    }
+    // Generic URL scan as a last resort — pick the first URL whose
+    // host looks like a real video CDN.
+    var rx = /https?:\\/\\/[^"'\\s<>\\\\]+\\.(?:m3u8|mp4)[^"'\\s<>\\\\]*/g;
+    var any;
+    while ((any = rx.exec(html))) {
+      if (isSafeUrl(any[0])) return any[0];
+    }
+  } catch (e) {}
   return null;
 }
-function trigger() {
-  ['.jw-icon-display', '.vjs-big-play-button', '.plyr__control--overlaid', 'button[aria-label*="lay" i]', '.play', 'button'].forEach(function (sel) {
-    var el = document.querySelector(sel); if (el) { try { el.click(); } catch (e) {} }
+
+function dismissOverlays() {
+  var sels = [
+    '.cc-window .cc-dismiss', '.cc-window .cc-allow', '.cc-window .cc-btn',
+    '#cookieconsent .cc-btn', '#cookieconsent button',
+    '.cookie-banner button', '.cookie-consent button',
+    '[id*="cookie"] button[class*="accept"]', '[id*="cookie"] button[class*="agree"]',
+    '.fc-cta-consent', '.fc-button-label',
+    '.ad-close', '.close-ad', '[class*="adClose"]', '[id*="adClose"]',
+    '#ad-overlay .close', '.popup-close', '[aria-label*="close" i]',
+  ];
+  sels.forEach(function (s) {
+    document.querySelectorAll(s).forEach(function (el) {
+      try { el.click(); } catch (e) {}
+    });
   });
-  document.querySelectorAll('video').forEach(function (v) { try { v.muted = true; v.play().catch(function () {}); } catch (e) {} });
 }
 
-// Dailymotion: hit the metadata API directly (works without play interaction).
-async function tryDailymotion() {
+function trigger() {
+  dismissOverlays();
+  var sels = [
+    '.jw-icon-display', '.jw-display-icon-container',
+    '.vjs-big-play-button', '.video-js .vjs-big-play-button',
+    '.plyr__control--overlaid', '.plyr--init .plyr__control',
+    'button[aria-label*="lay" i]', 'button[title*="lay" i]',
+    '[class*="play-btn"]', '[class*="playBtn"]', '[id*="play-button"]',
+    '#player .play', '.play-btn', '.play',
+    '#player', 'button',
+  ];
+  sels.forEach(function (sel) {
+    var els = document.querySelectorAll(sel);
+    for (var i = 0; i < Math.min(els.length, 3); i++) {
+      try { els[i].click(); } catch (e) {}
+    }
+  });
+  document.querySelectorAll('video').forEach(function (v) {
+    try {
+      v.muted = true;
+      if (v.paused) v.play().catch(function () {});
+      try { v.click(); } catch (e) {}
+    } catch (e) {}
+  });
+}
+
+// Videa-specific extractor: their player loads sources from a known
+// XML API.
+async function tryVidea() {
   try {
-    var m = location.href.match(/(?:dailymotion\\.com\\/(?:embed\\/)?video\\/|dai\\.ly\\/)([a-zA-Z0-9]+)/);
+    if (!/videa|vidvaita|vidit/i.test(location.hostname)) return null;
+    var m = location.href.match(/[?&]v=([a-zA-Z0-9]+)/) ||
+            location.href.match(/\\/player\\/v\\/([a-zA-Z0-9]+)/) ||
+            location.href.match(/\\/([a-zA-Z0-9]{8,})(?:\\?|$|\\/)/);
     if (!m) return null;
-    var r = await fetch('https://www.dailymotion.com/player/metadata/video/' + m[1], { credentials: 'omit' });
-    var d = await r.json();
-    if (!d || !d.qualities) return null;
-    var order = ['1080','720','480','380','240'];
-    for (var i = 0; i < order.length; i++) {
-      var arr = d.qualities[order[i]];
-      if (arr && arr.length) {
-        var mp4 = arr.find(function (v) { return v.type === 'video/mp4'; });
-        if (mp4 && mp4.url) return mp4.url;
-      }
+    var id = m[1];
+    var endpoints = [
+      location.origin + '/player/xml?platform=desktop&v=' + id,
+      location.origin + '/videaplayer_get_xml.php?v=' + id,
+    ];
+    for (var i = 0; i < endpoints.length; i++) {
+      try {
+        var ctrl = new AbortController();
+        var timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, 4000);
+        var r = await fetch(endpoints[i], { credentials: 'include', signal: ctrl.signal });
+        clearTimeout(timer);
+        if (!r.ok) continue;
+        var text = await r.text();
+        var src = text.match(/<video_source[^>]*>\\s*<!\\[CDATA\\[([^\\]]+)\\]\\]>/i) ||
+                  text.match(/<video_source[^>]*>([^<]+)</i) ||
+                  text.match(/https?:\\/\\/[^"<\\s]+\\.(?:m3u8|mp4)[^"<\\s]*/i);
+        if (src) return src[1] || src[0];
+      } catch (e) {}
     }
     return null;
   } catch (e) { return null; }
 }
 
-var dm = await tryDailymotion();
-if (dm) return { url: dm };
+// ── Run extraction ──
+await waitForCfChallenge();
 
-// Trigger play; poll the hook for up to 20 s. Re-trigger frequently
-// because some embeds need multiple nudges to bind the click handler
-// (cookie consent overlays, ad gating, late-loaded player JS, etc).
+// Fast path A: provider-specific direct extractors.
+var pre = await tryVidea();
+if (pre) return { url: pre };
+
+// Fast path B: inline-source regex on the loaded page.
+var inline = scanInlineSources();
+if (inline) return { url: inline };
+
+// Some pages already kicked off the player by autoplay — check hooks
+// before doing anything intrusive.
+var early = pickFromHooked();
+if (early) return { url: early };
+
+// Trigger play and poll for up to 14 s. Was 20 s before; in practice
+// any modern player reveals its URL within 5–8 s of click. Anything
+// longer than 14 s usually means the embed is permanently broken and
+// the user is better off advancing to the next server.
 trigger();
-await new Promise(function (r) { setTimeout(r, 100); });
+await new Promise(function (r) { setTimeout(r, 150); });
 trigger();
-for (var i = 0; i < 200; i++) {
-  var h = pick(i);
+for (var i = 0; i < 140; i++) {
+  var h = pickFromHooked();
   if (h) return { url: h };
-  if (i % 5 === 0) trigger();
+  // Re-trigger every 800 ms; some embeds bind their click handler late.
+  if (i > 0 && i % 8 === 0) trigger();
+  // Inline scan in case JS just injected the URL into the DOM.
+  if (i > 0 && i % 10 === 0) {
+    var lateInline = scanInlineSources();
+    if (lateInline) return { url: lateInline };
+  }
   await new Promise(function (r) { setTimeout(r, 100); });
 }
 
-// HTML fallback — scan for packed-JS file:/src: URLs
-var html = document.documentElement.outerHTML || '';
-var packed = html.match(/file\\s*:\\s*["']([^"']+\\.(?:m3u8|mp4)[^"']*)["']/i);
-if (packed) return { url: packed[1] };
-var generic = html.match(/https?:\\/\\/[^"'\\s<>]+\\.(?:m3u8|mp4)[^"'\\s<>]*/);
-if (generic) return { url: generic[0] };
+// One last inline pass.
+var finalInline = scanInlineSources();
+if (finalInline) return { url: finalInline };
 
 return null;
 })();`;

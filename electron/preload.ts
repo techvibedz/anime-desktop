@@ -37,4 +37,14 @@ contextBridge.exposeInMainWorld("pantoufa", {
     ipcRenderer.on("pantoufa:update-downloaded", listener);
     return () => ipcRenderer.removeListener("pantoufa:update-downloaded", listener);
   },
+  onVideoCaptured: (handler: (info: { url: string }) => void) => {
+    const listener = (_evt: unknown, info: { url: string }) => handler(info);
+    ipcRenderer.on("pantoufa:video-captured", listener);
+    return () => ipcRenderer.removeListener("pantoufa:video-captured", listener);
+  },
+  setMuted: (muted: boolean) => ipcRenderer.invoke("pantoufa:set-muted", muted),
+  directExtract: (provider: string, iframeUrl: string) =>
+    ipcRenderer.invoke("pantoufa:direct-extract", { provider, iframeUrl }) as Promise<
+      { url: string; type: "hls" | "mp4" } | null
+    >,
 });

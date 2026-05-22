@@ -80,6 +80,7 @@ export const ar = {
   resolving: (n: string) => `جاري تحضير ${n}…`,
   noVideo: "تعذّر تشغيل الفيديو",
   servers: "المصادر",
+  skipServer: "تخطّي هذا المصدر",
 
   // Sign out
   signOut: "تسجيل الخروج",

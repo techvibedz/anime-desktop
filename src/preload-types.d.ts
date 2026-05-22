@@ -24,6 +24,12 @@ declare global {
       onAuthCallback: (handler: (url: string) => void) => () => void;
       onUpdateAvailable: (handler: (info: UpdateInfo) => void) => () => void;
       onUpdateDownloaded: (handler: (info: UpdateInfo) => void) => () => void;
+      onVideoCaptured: (handler: (info: { url: string }) => void) => () => void;
+      setMuted: (muted: boolean) => Promise<boolean>;
+      directExtract: (
+        provider: string,
+        iframeUrl: string,
+      ) => Promise<{ url: string; type: "hls" | "mp4" } | null>;
     };
   }
 }

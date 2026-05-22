@@ -13,6 +13,7 @@ import {
   EXTRACT_TITLE_MATCH,
   EXTRACT_VIDEO_SERVERS,
   EXTRACT_VIDEO_URL,
+  VIDEO_HOOK_INSTALL,
 } from "./scripts";
 
 const WIT_BASE = "https://witanime.you";
@@ -60,8 +61,6 @@ export type RawDetail = {
   episodes: { title: string; number: number; type: string; screenshot: string; href: string | null }[];
   /** Direct anime4up link discovered on the wit page (when present). */
   up4Url?: string | null;
-  /** Other seasons / OVAs of the same series scraped from the page. */
-  related?: { title: string; href: string; image: string | null; type: string | null }[];
 };
 
 export async function scrapeEpisodesPage(animeUrl: string) {
@@ -127,12 +126,20 @@ export type RawServer = { id: string; name: string; iframeUrl: string; provider:
 
 export async function scrapeVideoServers(episodeUrl: string) {
   return enqueue<{ servers: RawServer[]; episodeTitle: string; animeTitle: string }>({
-    url: episodeUrl, injectAfter: EXTRACT_VIDEO_SERVERS, timeoutMs: 60000,
+    url: episodeUrl, injectAfter: EXTRACT_VIDEO_SERVERS, timeoutMs: 25000,
   });
 }
 
 export async function extractVideoUrl(embedUrl: string) {
   return enqueue<{ url: string } | null>({
-    url: embedUrl, injectAfter: EXTRACT_VIDEO_URL, timeoutMs: 55000, isVideoJob: true,
+    url: embedUrl,
+    // Install the fetch/XHR hooks BEFORE any page script runs — so the
+    // URL the player asks for is captured even if the embed page later
+    // redirects through an ad gate that would otherwise swap the
+    // document and lose the hook.
+    injectBefore: VIDEO_HOOK_INSTALL,
+    injectAfter: EXTRACT_VIDEO_URL,
+    timeoutMs: 30000,
+    isVideoJob: true,
   });
 }

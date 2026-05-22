@@ -4,6 +4,7 @@ import { fetchHome, type HomeSection, type FeaturedItem, type AnimeItem, type Ep
 import { AnimeCard, EpisodeCard } from "../components/AnimeCard";
 import { EpisodeActionModal } from "../components/EpisodeActionModal";
 import { Shimmer } from "../components/Shimmer";
+import { getHistory, type WatchEntry } from "../lib/history";
 import { t } from "../lib/i18n";
 
 export function HomePage() {
@@ -13,6 +14,7 @@ export function HomePage() {
   const [error, setError] = useState<string | null>(null);
   const [featuredIdx, setFeaturedIdx] = useState(0);
   const [episodePopup, setEpisodePopup] = useState<EpisodeItem | null>(null);
+  const [history, setHistory] = useState<WatchEntry[]>([]);
 
   useEffect(() => {
     setLoading(true);
@@ -23,6 +25,8 @@ export function HomePage() {
       })
       .catch((e) => setError(e?.message ?? t.failedToLoad))
       .finally(() => setLoading(false));
+
+    getHistory().then((h) => setHistory(h.filter((w) => !w.completed).slice(0, 10)));
   }, []);
 
   useEffect(() => {
@@ -101,6 +105,47 @@ export function HomePage() {
             </div>
           )}
         </div>
+      )}
+
+      {history.length > 0 && (
+        <section className="space-y-3">
+          <h2 className="font-display text-xl font-bold text-white">{t.continueWatching}</h2>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
+            {history.map((w) => (
+              <Link
+                key={w.episodeHref}
+                to={`/watch/${encodeURIComponent(w.episodeHref)}${w.animeHref ? `?anime=${encodeURIComponent(w.animeHref)}` : ""}${w.image && !w.animeHref ? `?img=${encodeURIComponent(w.image)}` : ""}${w.url4up ? `&up4=${encodeURIComponent(w.url4up)}` : ""}`}
+                className="group block"
+              >
+                <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface">
+                  {w.image ? (
+                    <img src={w.image} alt={w.animeTitle || w.episodeTitle} className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105" loading="lazy" />
+                  ) : (
+                    <div className="h-full w-full shimmer" />
+                  )}
+                  <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/90 to-transparent" />
+                  {/* Progress bar */}
+                  {w.durationMs > 0 && (
+                    <div className="absolute inset-x-0 bottom-0 h-1 bg-white/20">
+                      <div
+                        className="h-full bg-accent"
+                        style={{ width: `${Math.min(100, Math.round((w.positionMs / w.durationMs) * 100))}%` }}
+                      />
+                    </div>
+                  )}
+                  <div className="absolute inset-x-0 bottom-1 p-2.5">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-accent/90">
+                      {w.animeTitle || ""}
+                    </p>
+                    <h3 className="line-clamp-2 text-[13px] font-semibold leading-tight text-white">
+                      {w.episodeTitle}
+                    </h3>
+                  </div>
+                </div>
+              </Link>
+            ))}
+          </div>
+        </section>
       )}
 
       {sections.map((s) => (

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useParams, useSearchParams, Link, useNavigate } from "react-router-dom";
 import Hls from "hls.js";
 import {
-  fetchVideoServers, resolveVideo, fetchEpisodes,
+  fetchVideoServers, enrichServersFromUp4, resolveVideo, fetchEpisodes,
   type VideoServer, type Episode,
 } from "../lib/api";
 import { saveProgress, getProgress } from "../lib/history";
@@ -13,7 +13,8 @@ type ServerWithSource = VideoServer & { source?: string };
 
 const PROVIDER_RANK: Record<string, number> = {
   dailymotion: 0, mp4upload: 1, streamwish: 2, videa: 3, voe: 4,
-  share4max: 5, doodstream: 6, uqload: 7, okru: 8, generic: 10, vk: 11,
+  share4max: 5, doodstream: 6, uqload: 7, okru: 8, yonaplay: 9,
+  generic: 10, vk: 11,
 };
 function rank(p: string) { return PROVIDER_RANK[p] ?? 50; }
 
@@ -61,7 +62,7 @@ export function WatchPage() {
   const [servers, setServers] = useState<ServerWithSource[]>([]);
   const [meta, setMeta] = useState<{ episodeTitle: string; animeTitle: string }>({ episodeTitle: "", animeTitle: "" });
   const [activeIdx, setActiveIdx] = useState<number | null>(null);
-  const [resolved, setResolved] = useState<{ url: string; type: "hls" | "mp4"; embed: string } | null>(null);
+  const [resolved, setResolved] = useState<{ url: string; type: "hls" | "mp4" | "dailymotion" | "iframe"; embed: string } | null>(null);
   const [status, setStatus] = useState<"idle" | "resolving" | "playing" | "failed">("idle");
   const [loadingServers, setLoadingServers] = useState(true);
   const [serverError, setServerError] = useState(false);
@@ -69,6 +70,27 @@ export function WatchPage() {
   const [brokenIds, setBrokenIds] = useState<Set<string>>(new Set());
   const [retryNonce, setRetryNonce] = useState(0);
   const [userActivated, setUserActivated] = useState(false);
+
+  // Hybrid playback: the iframe loads first so the provider's own
+  // player initializes (CF, tokens, autoplay). The main process
+  // watches the renderer session for video URLs and emits them via
+  // IPC. Once we have one, we swap to the custom <video> player using
+  // that URL (proxied for cross-origin + Referer correctness). The
+  // iframe is reachable to the embed during this brief capture window;
+  // we hide it behind the player chrome with opacity-0.
+  const [capturedStream, setCapturedStream] = useState<{ url: string; type: "hls" | "mp4" } | null>(null);
+  // Track the embed we're currently capturing FOR so cross-server
+  // captures don't poison each other.
+  const captureForEmbed = useRef<string | null>(null);
+  const captureTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [captureMode, setCaptureMode] = useState<"capturing" | "captured" | "iframe-fallback">("capturing");
+  // How many times have we cycled iframe → capture → custom player
+  // → failure on the current server. After a small budget we give up
+  // on the custom player and keep the iframe visible — the user gets
+  // uninterrupted playback (iframe handles its own token refresh)
+  // even if they lose custom controls.
+  const reextractCount = useRef(0);
+  const MAX_REEXTRACTS_BEFORE_FALLBACK = 1;
 
   // Sibling episode navigation
   const [siblings, setSiblings] = useState<Episode[]>([]);
@@ -92,6 +114,7 @@ export function WatchPage() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reextractUsedRef = useRef(false);
 
   const sortedServers = useMemo(
     () => [...servers].sort((a, b) => rank(a.provider) - rank(b.provider)),
@@ -109,13 +132,21 @@ export function WatchPage() {
         if (cancelled) return;
         setServers(r.data.servers);
         setMeta({ episodeTitle: r.data.episodeTitle, animeTitle: r.data.animeTitle });
+        setLoadingServers(false);
+
+        // Background enrichment from anime4up — non-blocking.
+        if (up4Param && !/anime4up/i.test(episodeUrl)) {
+          enrichServersFromUp4(r.data.servers, up4Param)
+            .then((enriched) => { if (!cancelled) setServers(enriched); })
+            .catch(() => {});
+        }
       })
       .catch((err) => {
         if (cancelled) return;
         console.error("[player] failed to fetch video servers", err);
         setServerError(true);
-      })
-      .finally(() => { if (!cancelled) setLoadingServers(false); });
+        setLoadingServers(false);
+      });
     return () => { cancelled = true; };
   }, [episodeUrl, up4Param, retryServersNonce]);
 
@@ -159,6 +190,15 @@ export function WatchPage() {
     setResolved(null);
     setStatus("resolving");
     setRetryNonce((n) => n + 1);
+    // Reset hybrid capture for the new server.
+    setCapturedStream(null);
+    setCaptureMode("capturing");
+    captureForEmbed.current = null;
+    reextractCount.current = 0;
+    if (captureTimer.current) {
+      clearTimeout(captureTimer.current);
+      captureTimer.current = null;
+    }
   }, []);
 
   const advanceToNext = useCallback(() => {
@@ -178,7 +218,11 @@ export function WatchPage() {
     setResolved(null);
     setStatus("resolving");
 
-    async function attempt(attemptNum: number): Promise<void> {
+    // Single attempt per server. The scraper's own poll loop already
+    // retries internally; a second renderer-side attempt mostly just
+    // burns time the user sees as "stuck loading". If the first one
+    // can't get a URL, advance.
+    (async () => {
       try {
         const r = await resolveVideo(srv.iframeUrl, srv.provider);
         if (cancelled) return;
@@ -186,52 +230,189 @@ export function WatchPage() {
           console.info(`[player] ${srv.provider}: ${r.data.type} → ${r.data.videoUrl}`);
           setResolved({
             url: r.data.videoUrl,
-            type: r.data.type as "hls" | "mp4",
+            type: r.data.type as "hls" | "mp4" | "dailymotion" | "iframe",
             embed: srv.iframeUrl,
           });
           setStatus("playing");
           return;
         }
-        if (attemptNum < 2) {
-          console.warn(`[player] ${srv.provider}: extraction empty, retrying`);
-          await new Promise((r) => setTimeout(r, 800));
-          if (!cancelled) return attempt(attemptNum + 1);
-        } else {
-          advanceToNext();
-        }
+        console.warn(`[player] ${srv.provider}: extraction empty, advancing`);
+        advanceToNext();
       } catch (e) {
         if (cancelled) return;
-        if (attemptNum < 2) {
-          console.warn(`[player] ${srv.provider}: resolve threw, retrying`, e);
-          await new Promise((r) => setTimeout(r, 800));
-          if (!cancelled) return attempt(attemptNum + 1);
-        } else {
-          advanceToNext();
-        }
+        console.warn(`[player] ${srv.provider}: resolve threw, advancing`, e);
+        advanceToNext();
       }
-    }
-    void attempt(1);
+    })();
 
     return () => { cancelled = true; };
   }, [activeIdx, sortedServers, advanceToNext, retryNonce]);
 
-  // Wire HLS / direct mp4 + stall watchdog
+  // Mark the embed we're capturing for once the iframe is rendering.
+  // The captured-URL listener uses this to ignore stale captures from
+  // a previous server / page. Also mute the window so the user doesn't
+  // hear ad audio from the hidden iframe while it bootstraps the
+  // provider's player.
+  useEffect(() => {
+    if (resolved?.type !== "iframe") return;
+    captureForEmbed.current = resolved.embed;
+    // If we've already committed to iframe-fallback for this server
+    // (re-extract budget exhausted), don't restart the capture cycle.
+    // The iframe stays visible as the user's actual playback surface
+    // and we leave audio enabled (it's the user's intentional viewing).
+    if (captureMode === "iframe-fallback") {
+      window.pantoufa.setMuted?.(false).catch(() => {});
+      return;
+    }
+    // Capturing phase — silence the speaker. The iframe still plays
+    // and our network hooks still capture the stream URL.
+    window.pantoufa.setMuted?.(true).catch(() => {});
+    setCaptureMode("capturing");
+    setCapturedStream(null);
+    // After 12s of iframe playback without capturing a stream URL,
+    // give up on the custom-player swap and keep the iframe visible.
+    if (captureTimer.current) clearTimeout(captureTimer.current);
+    captureTimer.current = setTimeout(() => {
+      setCaptureMode((m) => (m === "capturing" ? "iframe-fallback" : m));
+    }, 20000);
+    return () => {
+      if (captureTimer.current) {
+        clearTimeout(captureTimer.current);
+        captureTimer.current = null;
+      }
+    };
+  }, [resolved, captureMode]);
+
+  // Unmute the window when we swap from iframe → custom player so the
+  // user hears their show, and when the component unmounts so leaving
+  // the page doesn't leave the system muted.
+  useEffect(() => {
+    if (resolved && resolved.type !== "iframe") {
+      window.pantoufa.setMuted?.(false).catch(() => {});
+    }
+  }, [resolved]);
+  useEffect(() => {
+    return () => {
+      window.pantoufa.setMuted?.(false).catch(() => {});
+    };
+  }, []);
+
+  // Listen for the main process emitting captured stream URLs.
+  // First valid one wins: prefer m3u8 over mp4, ignore captures
+  // arriving when we're not currently expecting one (e.g. between
+  // server switches, or after we've already swapped).
+  useEffect(() => {
+    const off = window.pantoufa.onVideoCaptured(({ url }) => {
+      if (!captureForEmbed.current) return;        // not capturing
+      if (capturedStream) return;                  // already captured
+      const isM3u8 = /\.m3u8(\?|#|$)/i.test(url);
+      const isMp4 = /\.mp4(\?|#|$)/i.test(url);
+      if (!isM3u8 && !isMp4) return;
+      console.info(`[hybrid] captured ${isM3u8 ? "hls" : "mp4"} URL: ${url}`);
+      setCapturedStream({ url, type: isM3u8 ? "hls" : "mp4" });
+      setCaptureMode("captured");
+      if (captureTimer.current) {
+        clearTimeout(captureTimer.current);
+        captureTimer.current = null;
+      }
+    });
+    return () => { off(); };
+  }, [capturedStream]);
+
+  // Mirror `resolved` into a ref so the swap effect can read it
+  // without re-firing on every resolved change. Without this, a
+  // re-extract that flips resolved back to iframe causes the swap
+  // effect to immediately re-fire with the OLD capturedStream — the
+  // stale URL whose token just expired — and the player goes right
+  // back into the failure loop.
+  const resolvedRef = useRef(resolved);
+  useEffect(() => { resolvedRef.current = resolved; }, [resolved]);
+
+  // Centralized re-extract trigger. Every error path that wants a
+  // fresh stream URL routes through here so they all consistently:
+  //  - clear stale captured URL (so the swap effect doesn't replay it)
+  //  - count attempts (so we don't loop forever on a doomed server)
+  //  - fall back to iframe-only when the budget is spent (so the user
+  //    keeps seeing the video instead of an infinite loading spinner)
+  const triggerReextract = useCallback((reason: string) => {
+    if (reextractUsedRef.current) return;
+    reextractUsedRef.current = true;
+    reextractCount.current += 1;
+
+    setCapturedStream(null);
+    captureForEmbed.current = null;
+
+    const embed = resolvedRef.current?.embed;
+
+    if (reextractCount.current > MAX_REEXTRACTS_BEFORE_FALLBACK) {
+      console.warn(
+        `[player] ${reason}: re-extract budget exhausted (${reextractCount.current}), falling back to iframe`,
+      );
+      if (embed) {
+        setCaptureMode("iframe-fallback");
+        setResolved({ url: embed, type: "iframe", embed });
+      } else {
+        advanceToNext();
+      }
+      return;
+    }
+
+    console.warn(`[player] ${reason}: re-extracting (attempt ${reextractCount.current})`);
+    import("../lib/api").then(({ invalidateResolveCache }) => {
+      if (embed) invalidateResolveCache?.(embed);
+      setRetryNonce((n) => n + 1);
+    });
+  }, [advanceToNext]);
+
+  // When a NEW capture arrives, swap into the custom player. Depends
+  // only on capturedStream — resolved changes alone don't trigger.
+  useEffect(() => {
+    if (!capturedStream) return;
+    const r = resolvedRef.current;
+    if (!r || r.type !== "iframe") return;
+    console.info(`[hybrid] swapping iframe → custom player (${capturedStream.type})`);
+    setResolved({
+      url: capturedStream.url,
+      type: capturedStream.type,
+      embed: r.embed,
+    });
+  }, [capturedStream]);
+
+  // Wire HLS / direct mp4 + stall watchdog. Skip when an iframe is
+  // rendering — the provider's own player handles itself.
   useEffect(() => {
     if (!resolved || !videoRef.current) return;
+    if (resolved.type === "dailymotion" || resolved.type === "iframe") return;
     const v = videoRef.current;
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
     const proxied = proxify(resolved.url, resolved.embed);
-    
+    // Reset re-extract gate for the new stream — covers both HLS and
+    // mp4 paths so the second error path also has a recovery shot.
+    reextractUsedRef.current = false;
+
     let played = false;
     let advanced = false;
     let lastTime = 0;
     let lastTimeUpdate = Date.now();
+    // Absolute wall clock for initial load. Even if `progress` events
+    // keep firing (slow CDN dripping bytes), we still hard-advance once
+    // this elapses without `playing` firing. Without this the player
+    // could buffer forever on a half-working stream.
+    const loadStartedAt = Date.now();
+    const INITIAL_LOAD_DEADLINE_MS = 22000;
 
     const checkStall = () => {
       if (advanced) return;
       const now = Date.now();
       const isInitialLoading = !played && !v.paused;
       const isBufferingMidStream = played && !v.paused && !v.ended && v.currentTime === lastTime;
+
+      if (isInitialLoading && now - loadStartedAt > INITIAL_LOAD_DEADLINE_MS) {
+        advanced = true;
+        console.warn(`[player] Initial load exceeded ${INITIAL_LOAD_DEADLINE_MS}ms — advancing`);
+        advanceToNext();
+        return;
+      }
 
       if (isInitialLoading || isBufferingMidStream) {
         const elapsed = now - lastTimeUpdate;
@@ -307,51 +488,85 @@ export function WatchPage() {
         xhrSetup: (xhr) => { xhr.withCredentials = false; },
       });
       let recoveryUsed = false;
-      let reextractUsed = false;
-      let recoveryCount = 0;
+      let mediaRecoveryCount = 0;
+      let networkRecoveryCount = 0;
       hls.loadSource(proxied);
       hls.attachMedia(v);
       hls.on(Hls.Events.FRAG_LOADED, () => { if (!played) lastTimeUpdate = Date.now(); });
       hls.on(Hls.Events.LEVEL_LOADED, () => { if (!played) lastTimeUpdate = Date.now(); });
       hls.on(Hls.Events.MANIFEST_PARSED, () => { if (!played) lastTimeUpdate = Date.now(); });
       hls.on(Hls.Events.ERROR, (_e, data) => {
-        if (!data.fatal) return;
-        // Proxy returned 410 → upstream signed URL expired. Re-extract
-        // a fresh URL from the embed instead of jumping to the next server.
-        const status = (data.response as any)?.code;
-        if (!reextractUsed && (status === 410 || status === 403 || status === 401)) {
-          reextractUsed = true;
-          console.warn(`[player] HLS auth error (${status}), re-extracting fresh URL`);
-          import("../lib/api").then(({ invalidateResolveCache }) => {
-            try { invalidateResolveCache?.(resolved.embed); } catch {}
-            setRetryNonce((n) => n + 1);
-          });
+        // Non-fatal network errors — chunk drop, buffer stall, slow CDN.
+        // Auto-run startLoad() to kick the stream back to life. When the
+        // 8x limit is reached, do a hard reset: detach media, bust the URL
+        // cache with a fresh timestamp, and re-attach. This forces
+        // Chromium and hls.js to treat it as a completely new stream.
+        if (!data.fatal) {
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            networkRecoveryCount++;
+            if (networkRecoveryCount <= 8) {
+              console.warn(`[player] non-fatal network ${data.details}, startLoad #${networkRecoveryCount}`);
+              try { hls.startLoad(); } catch {}
+            } else if (networkRecoveryCount <= 11) {
+              console.warn(`[player] hard-resetting HLS engine (retry #${networkRecoveryCount})`);
+              try { hls.detachMedia(); } catch {}
+              const fresh = proxied.replace(
+                /([?&])_p=\d+_[a-z0-9]+/,
+                `$1_p=${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+              );
+              const freshUrl = fresh.includes("?") ? fresh : `${fresh}?_p=${Date.now()}`;
+              try { hls.loadSource(freshUrl); } catch {}
+              try { hls.attachMedia(v); } catch {}
+            } else {
+              triggerReextract("hard recovery exhausted");
+            }
+          }
           return;
         }
-        // Fragment parsing errors — try network recovery before advancing
-        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && data.details === "fragParsingError") {
-          recoveryCount++;
-          if (recoveryCount <= 3) {
-            console.warn(`[player] frag parsing error, media recovery attempt ${recoveryCount}`);
+
+        // Fatal from here on.
+
+        // Proxy returned 410/403/401 → signed URL expired or rejected.
+        const status = (data.response as any)?.code;
+        if (status === 410 || status === 403 || status === 401) {
+          triggerReextract(`HLS auth error ${status}`);
+          return;
+        }
+
+        // Media errors — fragment parsing, decode failures. Recover up to 3x.
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          mediaRecoveryCount++;
+          if (mediaRecoveryCount <= 3) {
+            console.warn(`[player] media error (${data.details}), recoverMediaError #${mediaRecoveryCount}`);
             hls.recoverMediaError();
             return;
           }
         }
-        if (!recoveryUsed) {
-          recoveryUsed = true;
-          console.warn("[player] HLS fatal, attempting recovery", data);
-          try {
-            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-            else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-            else { advanced = true; advanceToNext(); }
-          } catch { advanced = true; advanceToNext(); }
-          return;
+
+        // Network errors — manifest/level load timeouts. Recover up to 2x.
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          if (!recoveryUsed) {
+            recoveryUsed = true;
+            console.warn("[player] HLS fatal network, startLoad attempt", data.details);
+            try { hls.startLoad(); } catch { advanced = true; advanceToNext(); }
+            return;
+          }
         }
-        advanced = true; advanceToNext();
+
+        // All recoveries exhausted. Re-extract once before advancing.
+        if (!reextractUsedRef.current) {
+          triggerReextract("HLS all recoveries exhausted");
+        } else {
+          advanced = true; advanceToNext();
+        }
       });
       hlsRef.current = hls;
     } else {
-      v.src = proxied;
+      // mp4upload: its CDN on port 183 is too slow for the proxy's
+      // timeout/waitdog machinery. Load the signed HTTPS URL directly
+      // — the browser's native networking handles slow CDNs fine.
+      const isMp4upload = /mp4upload/.test(resolved.url);
+      v.src = isMp4upload ? resolved.url : proxied;
     }
 
     return () => {
@@ -364,14 +579,41 @@ export function WatchPage() {
     };
   }, [resolved, advanceToNext]);
 
-  // Resume position
+  // Resume position — wait for metadata before seeking.
   useEffect(() => {
     if (!episodeUrl || !videoRef.current || !resolved) return;
-    getProgress(episodeUrl).then((p) => {
-      if (p && p.positionMs > 5000 && videoRef.current) {
-        videoRef.current.currentTime = p.positionMs / 1000;
-      }
-    });
+    const v = videoRef.current;
+    let cancelled = false;
+
+    const doSeek = () => {
+      if (cancelled) return;
+      getProgress(episodeUrl).then((p) => {
+        if (cancelled || !v) return;
+        if (!p || p.positionMs < 5000) return;
+        const target = p.positionMs / 1000;
+        // Only seek if metadata is available and the target is valid.
+        if (v.duration > 0 && target < v.duration) {
+          try { v.currentTime = target; } catch {}
+        } else {
+          // Retry after metadata loads.
+          const onMeta = () => {
+            try {
+              if (v.duration > 0 && target < v.duration) v.currentTime = target;
+            } catch {}
+            v.removeEventListener("loadedmetadata", onMeta);
+          };
+          v.addEventListener("loadedmetadata", onMeta, { once: true });
+        }
+      }).catch(() => {});
+    };
+
+    if (v.duration > 0) {
+      doSeek();
+    } else {
+      v.addEventListener("loadedmetadata", doSeek, { once: true });
+    }
+
+    return () => { cancelled = true; };
   }, [episodeUrl, resolved]);
 
   // Wire video element ↔ custom-player React state
@@ -582,6 +824,44 @@ export function WatchPage() {
         onMouseLeave={() => { if (isPlaying) setControlsVisible(false); }}
       >
         {status === "playing" && resolved ? (
+          resolved.type === "iframe" || resolved.type === "dailymotion" ? (
+            /* Iframe playback path.
+             *
+             * In "capturing" mode the iframe is rendered but visually
+             * hidden — its only job is to bootstrap the provider's
+             * player so we can intercept the real stream URL. While it
+             * runs, the user sees a loading state on top.
+             *
+             * If we capture a URL, this branch disappears entirely
+             * (resolved.type flips to "hls"/"mp4") and the <video>
+             * branch below takes over.
+             *
+             * If 12s pass without a capture, captureMode flips to
+             * "iframe-fallback" and the iframe becomes the user's
+             * actual playback surface. Dailymotion is always rendered
+             * as fallback — we never attempt the swap for it.
+             */
+            <>
+              <iframe
+                src={resolved.url}
+                allowFullScreen
+                allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+                className={`h-full w-full border-0 bg-black ${
+                  resolved.type === "iframe" && captureMode === "capturing"
+                    ? "pointer-events-none opacity-0"
+                    : ""
+                }`}
+                referrerPolicy="no-referrer-when-downgrade"
+                title={`${active ? displayName(active) : "Video"} player`}
+              />
+              {resolved.type === "iframe" && captureMode === "capturing" && (
+                <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/95 text-text-muted">
+                  <div className="h-8 w-8 animate-spin rounded-full border-2 border-accent border-t-transparent" />
+                  <p className="text-sm">{active ? t.resolving(displayName(active)) : t.loading}</p>
+                </div>
+              )}
+            </>
+          ) : (
           <>
             <video
               ref={videoRef}
@@ -596,13 +876,15 @@ export function WatchPage() {
               onClick={togglePlay}
               onDoubleClick={toggleFs}
               onError={(e) => {
-                // MediaError.code: 1=ABORTED, 2=NETWORK, 3=DECODE, 4=SRC_UNSUPPORTED.
-                // ABORTED is normal (we triggered it). NETWORK is often transient
-                // and hls.js handles its own recovery. Only DECODE / UNSUPPORTED
-                // should hard-advance.
                 const err = (e.target as HTMLVideoElement).error;
                 const code = err?.code;
                 console.warn(`[player] <video> error code=${code} message=${err?.message || ""}`);
+                // Code 2 (MEDIA_ERR_NETWORK): proxy returned 410/403 → signed
+                // URL expired. Re-extract a fresh URL instead of advancing.
+                if (code === 2 && resolved.url) {
+                  triggerReextract(`mp4 network error code=${code}`);
+                  return;
+                }
                 if (code === 3 || code === 4) advanceToNext();
               }}
             />
@@ -738,6 +1020,7 @@ export function WatchPage() {
               </div>
             </div>
           </>
+          )
         ) : (
           <div className="flex h-full w-full flex-col items-center justify-center gap-3 text-text-muted">
             {serverError ? (
@@ -767,6 +1050,14 @@ export function WatchPage() {
                     : status === "resolving" && active ? t.resolving(displayName(active))
                     : t.noVideo}
                 </p>
+                {status === "resolving" && active && !allBroken && (
+                  <button
+                    onClick={advanceToNext}
+                    className="mt-1 rounded-full border border-white/20 bg-white/5 px-4 py-1.5 text-xs font-semibold text-white hover:border-white/40 hover:bg-white/10"
+                  >
+                    {t.skipServer}
+                  </button>
+                )}
               </>
             )}
           </div>
