@@ -84,13 +84,15 @@ export function WatchPage() {
   const captureForEmbed = useRef<string | null>(null);
   const captureTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [captureMode, setCaptureMode] = useState<"capturing" | "captured" | "iframe-fallback">("capturing");
+  const [fallbackReload, setFallbackReload] = useState(0);
   // How many times have we cycled iframe → capture → custom player
   // → failure on the current server. After a small budget we give up
   // on the custom player and keep the iframe visible — the user gets
   // uninterrupted playback (iframe handles its own token refresh)
   // even if they lose custom controls.
   const reextractCount = useRef(0);
-  const MAX_REEXTRACTS_BEFORE_FALLBACK = 1;
+  const MAX_REEXTRACTS_BEFORE_FALLBACK = 2;
+  const iframeFailedRef = useRef(false);
 
   // Sibling episode navigation
   const [siblings, setSiblings] = useState<Episode[]>([]);
@@ -195,6 +197,7 @@ export function WatchPage() {
     setCaptureMode("capturing");
     captureForEmbed.current = null;
     reextractCount.current = 0;
+    iframeFailedRef.current = false;
     if (captureTimer.current) {
       clearTimeout(captureTimer.current);
       captureTimer.current = null;
@@ -262,6 +265,16 @@ export function WatchPage() {
     // and we leave audio enabled (it's the user's intentional viewing).
     if (captureMode === "iframe-fallback") {
       window.pantoufa.setMuted?.(false).catch(() => {});
+      // If the embed iframe already timed out (ERR_CONNECTION_TIMED_OUT),
+      // force-reloading the same URL won't help. Advance to next server.
+      if (iframeFailedRef.current) {
+        advanceToNext();
+        return;
+      }
+      // Force-reload the iframe so the provider's player freshly
+      // initializes. The previous capture cycle may have left the
+      // player in a broken/expired state (token exhaustion).
+      setFallbackReload((n) => n + 1);
       return;
     }
     // Capturing phase — silence the speaker. The iframe still plays
@@ -505,6 +518,14 @@ export function WatchPage() {
         // cache with a fresh timestamp, and re-attach. This forces
         // Chromium and hls.js to treat it as a completely new stream.
         if (!data.fatal) {
+          // If the response carries a 401/403/410 status, the token is
+          // expired regardless of whether hls.js considers it fatal.
+          // Skip the recovery loop — retrying a dead URL wastes ~22s.
+          const nfStatus = (data.response as any)?.code;
+          if (nfStatus === 410 || nfStatus === 403 || nfStatus === 401) {
+            triggerReextract(`HLS auth error ${nfStatus} (non-fatal)`);
+            return;
+          }
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
             networkRecoveryCount++;
             if (networkRecoveryCount <= 8) {
@@ -846,9 +867,15 @@ export function WatchPage() {
              */
             <>
               <iframe
+                key={`${resolved.url}-${fallbackReload}`}
                 src={resolved.url}
                 allowFullScreen
                 allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+                onError={() => {
+                  console.warn(`[player] iframe failed to load: ${resolved.url}`);
+                  iframeFailedRef.current = true;
+                  advanceToNext();
+                }}
                 className={`h-full w-full border-0 bg-black ${
                   resolved.type === "iframe" && captureMode === "capturing"
                     ? "pointer-events-none opacity-0"

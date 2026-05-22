@@ -921,6 +921,8 @@ app.whenReady().then(() => {
   if (coldStartUrl) handleAuthCallbackUrl(coldStartUrl);
 
   // Relax response headers on the renderer for images / iframes.
+  // Also fix Supabase auth CORS — in dev mode (localhost:5173) the
+  // origin doesn't match the Supabase dashboard's allowed list.
   session.defaultSession.webRequest.onHeadersReceived((details, cb) => {
     const headers: Record<string, any> = { ...details.responseHeaders };
     for (const k of Object.keys(headers)) {
@@ -934,6 +936,17 @@ app.whenReady().then(() => {
       ) {
         delete headers[k];
       }
+    }
+    // Replace restrictive Supabase CORS with the requesting origin so
+    // auth cookies + Authorization headers work from any origin (local
+    // dev, packaged app, custom domains). Wildcard * breaks credentials.
+    const urlStr = details.url || "";
+    if (urlStr.includes("supabase.co")) {
+      const origin = (() => {
+        try { return new URL(details.referrer || "").origin; } catch { return "*"; }
+      })();
+      headers["access-control-allow-origin"] = [origin || "*"];
+      headers["access-control-allow-credentials"] = ["true"];
     }
     cb({ responseHeaders: headers });
   });
