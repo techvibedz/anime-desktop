@@ -11,6 +11,15 @@ import { t } from "../lib/i18n";
 
 type ServerWithSource = VideoServer & { source?: string };
 
+// Fire-and-forget mute toggle. The IPC handler in main.ts wraps
+// mainWindow.webContents.setAudioMuted(), which can transiently fail
+// while the window is initializing or being destroyed. We don't track
+// the system mute state in React — every call site simply asserts the
+// state it wants and we trust the IPC to converge.
+function setMutedSafe(muted: boolean) {
+  window.pantoufa.setMuted?.(muted).catch(() => {});
+}
+
 const PROVIDER_RANK: Record<string, number> = {
   dailymotion: 0, mp4upload: 1, streamwish: 2, videa: 3, voe: 4,
   share4max: 5, doodstream: 6, uqload: 7, okru: 8, yonaplay: 9,
@@ -71,25 +80,19 @@ export function WatchPage() {
   const [retryNonce, setRetryNonce] = useState(0);
   const [userActivated, setUserActivated] = useState(false);
 
-  // Hybrid playback: the iframe loads first so the provider's own
-  // player initializes (CF, tokens, autoplay). The main process
-  // watches the renderer session for video URLs and emits them via
-  // IPC. Once we have one, we swap to the custom <video> player using
-  // that URL (proxied for cross-origin + Referer correctness). The
-  // iframe is reachable to the embed during this brief capture window;
-  // we hide it behind the player chrome with opacity-0.
-  const [capturedStream, setCapturedStream] = useState<{ url: string; type: "hls" | "mp4" } | null>(null);
-  // Track the embed we're currently capturing FOR so cross-server
-  // captures don't poison each other.
-  const captureForEmbed = useRef<string | null>(null);
-  const captureTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [captureMode, setCaptureMode] = useState<"capturing" | "captured" | "iframe-fallback">("iframe-fallback");
+  // Iframe-direct playback. We render the provider's embed page and
+  // let the user click play inside it — the iframe is the source of
+  // truth for the picture. Audio is muted via the system mute IPC for
+  // a brief window so ad noise during embed initialization doesn't
+  // hit the speaker; once `iframe.onLoad` fires we unmute.
+  //
+  // `fallbackReload` is bumped by `triggerReextract` so a same-URL
+  // re-mount (Dailymotion HLS-extract → iframe budget exhaustion)
+  // forces a fresh iframe — React would otherwise reuse the element.
   const [fallbackReload, setFallbackReload] = useState(0);
-  // How many times have we cycled iframe → capture → custom player
-  // → failure on the current server. After a small budget we give up
-  // on the custom player and keep the iframe visible — the user gets
-  // uninterrupted playback (iframe handles its own token refresh)
-  // even if they lose custom controls.
+  const [iframeLoaded, setIframeLoaded] = useState(false);
+  // How many HLS/MP4 re-extract cycles we've attempted on the current
+  // server before giving up and falling back to the iframe.
   const reextractCount = useRef(0);
   const MAX_REEXTRACTS_BEFORE_FALLBACK = 2;
   const iframeFailedRef = useRef(false);
@@ -192,16 +195,9 @@ export function WatchPage() {
     setResolved(null);
     setStatus("resolving");
     setRetryNonce((n) => n + 1);
-    // Reset hybrid capture for the new server.
-    setCapturedStream(null);
-    setCaptureMode("capturing");
-    captureForEmbed.current = null;
     reextractCount.current = 0;
     iframeFailedRef.current = false;
-    if (captureTimer.current) {
-      clearTimeout(captureTimer.current);
-      captureTimer.current = null;
-    }
+    setIframeLoaded(false);
   }, []);
 
   const advanceToNext = useCallback(() => {
@@ -210,6 +206,17 @@ export function WatchPage() {
     if (failedId) setBrokenIds((prev) => new Set(prev).add(failedId));
     setStatus("failed");
   }, [activeIdx, sortedServers]);
+
+  // Fast advance when iframe fails to load (did-fail-load in main process).
+  // Fires within ~1s vs the iframe onError which takes ~5s on some platforms.
+  useEffect(() => {
+    const off = window.pantoufa.onIframeFailed(({ url }) => {
+      console.info(`[player] main process reports iframe failure, advancing: ${url}`);
+      iframeFailedRef.current = true;
+      advanceToNext();
+    });
+    return () => { off(); };
+  }, [advanceToNext]);
 
   // Resolve the active server only after user clicks (lazy-load to prevent
   // tokenized stream URLs from expiring while the user is reading the page).
@@ -255,82 +262,32 @@ export function WatchPage() {
   // The captured-URL listener uses this to ignore stale captures from
   // a previous server / page. Also mute the window so the user doesn't
   // hear ad audio from the hidden iframe while it bootstraps the
-  // provider's player.
+  // Iframe-mount lifecycle. Advances to the next server if the embed
+  // failed to load (set by iframe.onError → iframeFailedRef). Audio is
+  // unmuted on mount so the user hears the embed's playback.
   useEffect(() => {
     if (resolved?.type !== "iframe") return;
-    captureForEmbed.current = resolved.embed;
-    // If we've already committed to iframe-fallback for this server
-    // (re-extract budget exhausted), don't restart the capture cycle.
-    // The iframe stays visible as the user's actual playback surface
-    // and we leave audio enabled (it's the user's intentional viewing).
-    if (captureMode === "iframe-fallback") {
-      window.pantoufa.setMuted?.(false).catch(() => {});
-      // If the embed iframe already timed out (ERR_CONNECTION_TIMED_OUT),
-      // force-reloading the same URL won't help. Advance to next server.
-      if (iframeFailedRef.current) {
-        advanceToNext();
-        return;
-      }
-      // Force-reload the iframe so the provider's player freshly
-      // initializes. The previous capture cycle may have left the
-      // player in a broken/expired state (token exhaustion).
-      setFallbackReload((n) => n + 1);
-      return;
-    }
-    // Capturing phase — silence the speaker. The iframe still plays
-    // and our network hooks still capture the stream URL.
-    window.pantoufa.setMuted?.(true).catch(() => {});
-    setCaptureMode("capturing");
-    setCapturedStream(null);
-    // After 12s of iframe playback without capturing a stream URL,
-    // give up on the custom-player swap and keep the iframe visible.
-    if (captureTimer.current) clearTimeout(captureTimer.current);
-    captureTimer.current = setTimeout(() => {
-      setCaptureMode((m) => (m === "capturing" ? "iframe-fallback" : m));
-    }, 6000);
-    return () => {
-      if (captureTimer.current) {
-        clearTimeout(captureTimer.current);
-        captureTimer.current = null;
-      }
-    };
-  }, [resolved, captureMode]);
+    setMutedSafe(false);
+    if (iframeFailedRef.current) advanceToNext();
+  }, [resolved, advanceToNext]);
+
+  // Some embed pages keep ad iframes loading forever, so `iframe.onLoad`
+  // never fires and the "Loading embed player…" spinner gets stuck on
+  // top of an already-usable player. Force-clear the spinner after a
+  // grace period — the iframe is the source of truth from that point.
+  useEffect(() => {
+    if (resolved?.type !== "iframe") return;
+    const t = setTimeout(() => setIframeLoaded(true), 8000);
+    return () => clearTimeout(t);
+  }, [resolved]);
 
   // Unmute the window when we swap from iframe → custom player so the
-  // user hears their show, and when the component unmounts so leaving
-  // the page doesn't leave the system muted.
+  // user hears their show, and on unmount so leaving the page doesn't
+  // leave the system muted.
   useEffect(() => {
-    if (resolved && resolved.type !== "iframe") {
-      window.pantoufa.setMuted?.(false).catch(() => {});
-    }
+    if (resolved && resolved.type !== "iframe") setMutedSafe(false);
   }, [resolved]);
-  useEffect(() => {
-    return () => {
-      window.pantoufa.setMuted?.(false).catch(() => {});
-    };
-  }, []);
-
-  // Listen for the main process emitting captured stream URLs.
-  // First valid one wins: prefer m3u8 over mp4, ignore captures
-  // arriving when we're not currently expecting one (e.g. between
-  // server switches, or after we've already swapped).
-  useEffect(() => {
-    const off = window.pantoufa.onVideoCaptured(({ url }) => {
-      if (!captureForEmbed.current) return;        // not capturing
-      if (capturedStream) return;                  // already captured
-      const isM3u8 = /\.m3u8(\?|#|$)/i.test(url);
-      const isMp4 = /\.mp4(\?|#|$)/i.test(url);
-      if (!isM3u8 && !isMp4) return;
-      console.info(`[hybrid] captured ${isM3u8 ? "hls" : "mp4"} URL: ${url}`);
-      setCapturedStream({ url, type: isM3u8 ? "hls" : "mp4" });
-      setCaptureMode("captured");
-      if (captureTimer.current) {
-        clearTimeout(captureTimer.current);
-        captureTimer.current = null;
-      }
-    });
-    return () => { off(); };
-  }, [capturedStream]);
+  useEffect(() => () => setMutedSafe(false), []);
 
   // Mirror `resolved` into a ref so the swap effect can read it
   // without re-firing on every resolved change. Without this, a
@@ -341,19 +298,17 @@ export function WatchPage() {
   const resolvedRef = useRef(resolved);
   useEffect(() => { resolvedRef.current = resolved; }, [resolved]);
 
-  // Centralized re-extract trigger. Every error path that wants a
-  // fresh stream URL routes through here so they all consistently:
-  //  - clear stale captured URL (so the swap effect doesn't replay it)
-  //  - count attempts (so we don't loop forever on a doomed server)
-  //  - fall back to iframe-only when the budget is spent (so the user
-  //    keeps seeing the video instead of an infinite loading spinner)
+  // Centralized re-extract trigger. Counts attempts so we don't loop
+  // forever on a doomed server; once the budget is spent we fall back
+  // to the iframe so the user keeps seeing video instead of a stuck
+  // loading spinner. The `fallbackReload` bump forces the iframe to
+  // remount even when `resolved.url` happens to equal the embed URL
+  // already (same-URL React reconciliation would otherwise reuse the
+  // old element with its expired player state).
   const triggerReextract = useCallback((reason: string) => {
     if (reextractUsedRef.current) return;
     reextractUsedRef.current = true;
     reextractCount.current += 1;
-
-    setCapturedStream(null);
-    captureForEmbed.current = null;
 
     const embed = resolvedRef.current?.embed;
 
@@ -362,7 +317,7 @@ export function WatchPage() {
         `[player] ${reason}: re-extract budget exhausted (${reextractCount.current}), falling back to iframe`,
       );
       if (embed) {
-        setCaptureMode("iframe-fallback");
+        setFallbackReload((n) => n + 1);
         setResolved({ url: embed, type: "iframe", embed });
       } else {
         advanceToNext();
@@ -376,20 +331,6 @@ export function WatchPage() {
       setRetryNonce((n) => n + 1);
     });
   }, [advanceToNext]);
-
-  // When a NEW capture arrives, swap into the custom player. Depends
-  // only on capturedStream — resolved changes alone don't trigger.
-  useEffect(() => {
-    if (!capturedStream) return;
-    const r = resolvedRef.current;
-    if (!r || r.type !== "iframe") return;
-    console.info(`[hybrid] swapping iframe → custom player (${capturedStream.type})`);
-    setResolved({
-      url: capturedStream.url,
-      type: capturedStream.type,
-      embed: r.embed,
-    });
-  }, [capturedStream]);
 
   // Wire HLS / direct mp4 + stall watchdog. Skip when an iframe is
   // rendering — the provider's own player handles itself.
@@ -861,29 +802,28 @@ export function WatchPage() {
              * actual playback surface. Dailymotion is always rendered
              * as fallback — we never attempt the swap for it.
              */
-            <>
-              <iframe
-                key={`${resolved.url}-${fallbackReload}`}
-                src={resolved.url}
-                allowFullScreen
-                allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
-                onError={() => {
-                  console.warn(`[player] iframe failed to load: ${resolved.url}`);
-                  iframeFailedRef.current = true;
-                  advanceToNext();
-                }}
-                className={`h-full w-full border-0 bg-black ${
-                  resolved.type === "iframe" && captureMode === "capturing"
-                    ? "pointer-events-none opacity-0"
-                    : ""
-                }`}
-                referrerPolicy="no-referrer-when-downgrade"
-                title={`${active ? displayName(active) : "Video"} player`}
+             <>
+               <iframe
+                 key={`${resolved.url}-${fallbackReload}`}
+                 src={resolved.url}
+                 allowFullScreen
+                 allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+                 onLoad={() => {
+                   console.info(`[player] iframe loaded: ${resolved.url}`);
+                   setIframeLoaded(true);
+                 }}
+                 onError={() => {
+                   console.warn(`[player] iframe failed to load: ${resolved.url}`);
+                   iframeFailedRef.current = true;
+                   advanceToNext();
+                 }}
+                 className="h-full w-full border-0 bg-black"
+                 title={`${active ? displayName(active) : "Video"} player`}
               />
-              {resolved.type === "iframe" && captureMode === "capturing" && (
+              {!iframeLoaded && resolved.type === "iframe" && (
                 <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/95 text-text-muted">
                   <div className="h-8 w-8 animate-spin rounded-full border-2 border-accent border-t-transparent" />
-                  <p className="text-sm">{active ? t.resolving(displayName(active)) : t.loading}</p>
+                  <p className="text-sm">Loading embed player…</p>
                 </div>
               )}
             </>
@@ -1076,6 +1016,9 @@ export function WatchPage() {
                     : status === "resolving" && active ? t.resolving(displayName(active))
                     : t.noVideo}
                 </p>
+                {allBroken && !loadingServers && (
+                  <p className="text-xs text-red-400">CDN servers may be blocked by your ISP. Try a VPN.</p>
+                )}
                 {status === "resolving" && active && !allBroken && (
                   <button
                     onClick={advanceToNext}

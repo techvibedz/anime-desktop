@@ -221,9 +221,9 @@ async function doResolveVideo(iframeUrl: string, provider: string) {
     } catch {}
     return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
   }
-  // Everything else: render the embed in a hidden iframe inside the
-  // renderer, mute the window, let the provider's own player initialize
-  // (user click = autoplay OK), capture the stream URL via webRequest,
-  // swap into the custom <video>.
+  // Every other provider: render the embed in a visible iframe. The user
+  // clicks play inside it, the capture listener catches the stream URL,
+  // and we swap to the custom <video> player. Extraction via hidden
+  // BrowserWindow is NOT attempted — mp4upload times out on this network.
   return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
 }

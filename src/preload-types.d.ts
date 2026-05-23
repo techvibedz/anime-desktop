@@ -26,6 +26,7 @@ declare global {
       onUpdateDownloaded: (handler: (info: UpdateInfo) => void) => () => void;
       onVideoCaptured: (handler: (info: { url: string }) => void) => () => void;
       setMuted: (muted: boolean) => Promise<boolean>;
+      onIframeFailed: (handler: (info: { url: string }) => void) => () => void;
       directExtract: (
         provider: string,
         iframeUrl: string,

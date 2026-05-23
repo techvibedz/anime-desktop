@@ -95,7 +95,8 @@ function initSlots(): Slot[] {
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: false,
-        partition: "persist:scraper",
+          // No partition → uses default session, same as the iframe.
+          // The persist:scraper session couldn't reach mp4upload at all.
         backgroundThrottling: false,
         webSecurity: true,
         autoplayPolicy: "no-user-gesture-required",
@@ -202,13 +203,10 @@ async function runJob(slotIdx: number, p: Pending) {
   let fastPathResolved = false;
 
   try {
-    // Reset the window between jobs — the previous page may have left
-    // cookies, service workers, cached scripts, or other state that
-    // interferes with the next extraction (ad gates, stale session data).
-    try {
-      await win.loadURL("about:blank");
-      await win.webContents.session.clearStorageData({ storages: ["serviceworkers", "cachestorage", "localstorage", "websql"] });
-    } catch {}
+    // Navigate directly to the job URL. No `about:blank` prefix or
+    // clearStorageData between jobs — those were introduced to prevent
+    // cross-job state pollution but actually break network connectivity
+    // for subsequent loads (stale DNS, corrupted session state).
 
     if (p.job.injectBefore) {
       try {

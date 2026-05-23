@@ -139,7 +139,7 @@ export async function extractVideoUrl(embedUrl: string) {
     // document and lose the hook.
     injectBefore: VIDEO_HOOK_INSTALL,
     injectAfter: EXTRACT_VIDEO_URL,
-    timeoutMs: 30000,
+    timeoutMs: 35000,
     isVideoJob: true,
   });
 }

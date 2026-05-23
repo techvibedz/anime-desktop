@@ -5,6 +5,13 @@
 
 import { app, BrowserWindow, ipcMain, protocol, session, shell } from "electron";
 import path from "node:path";
+
+// Disable QUIC so Chromium falls back to TCP/HTTP2. Restrictive ISPs
+// often block or mangle QUIC (UDP/443), causing ERR_QUIC_PROTOCOL_ERROR
+// and ERR_CONNECTION_TIMED_OUT. TCP fallback succeeds even on blocked ISPs.
+app.commandLine.appendSwitch("disable-quic");
+app.commandLine.appendSwitch("enable-quic", "false");
+
 import { autoUpdater } from "electron-updater";
 import { enqueue, type ScrapeJob } from "./scraper/host";
 
@@ -91,6 +98,15 @@ function createMainWindow() {
     },
   });
 
+  // Override the UA so the iframe-embed pages don't see "Electron" or
+  // our app name in the string. Some providers (streamwish in
+  // particular) refuse to play in user agents they don't recognize as
+  // a real browser; presenting a plain desktop Chrome string sidesteps
+  // those detection rules.
+  mainWindow.webContents.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  );
+
   mainWindow.webContents.setWindowOpenHandler(({ url, referrer }) => {
     // Only open external browser for links originating from our own
     // renderer (witanime / anime4up pages). Everything else — empty
@@ -119,56 +135,16 @@ function createMainWindow() {
     }
   });
 
-  // CDP-injected guard that runs inside every iframe document before page
-  // scripts. Neutralizes window.open (click-jack) and hides Videa's pre-roll
-  // ad containers — all invisible to the embed's sandbox-detection probes.
-  // Streamwish actively checks frameElement?.sandbox and blocks playback if
-  // set; CDP injection avoids that detection altogether.
-  const IFRAME_AD_GUARD = `(function(){
-if (window === window.top) return;
-// Block <a target="_blank|_top|_parent"> clicks and form submissions.
-// window.open nullification was removed — some players (streamwish)
-// check its return value and abort if null. setWindowOpenHandler
-// already denies all non-app popups globally.
-document.addEventListener("click",function(e){
-  var t=e.target;
-  while(t && t.nodeType===1) {
-    if (t.tagName==="A") {
-      var tg=t.getAttribute("target");
-      if (tg==="_blank"||tg==="_top"||tg==="_parent"){e.preventDefault();e.stopImmediatePropagation();return false;}
-    }
-    t=t.parentNode;
-  }
-},true);
-// Intercept form submit with target that would open in a new context.
-document.addEventListener("submit",function(e){
-  var f=e.target;
-  if (f&&f.nodeType===1&&f.tagName==="FORM"){
-    var tg=f.getAttribute("target");
-    if (tg&&tg!=="_self"){e.preventDefault();e.stopImmediatePropagation();return false;}
-  }
-},true);
-if (/videa|vidvaita|vidit/.test(location.hostname)) {
-  var s=document.createElement("style");
-  s.textContent=".videa-ad,.ad-container,[class*='advert'],[id*='advert'],[class*='ad-overlay'],[class*='adoverlay'],[id*='ad-overlay'],.pre-roll,.preroll,[class*='pre-roll'],[class*='popunder'],[class*='popup-ad'],div[style*='position: absolute'][style*='z-index: 99']{display:none !important;pointer-events:none !important}";
-  (document.head||document.documentElement).appendChild(s);
-}
-})();`;
-
-  async function installIframeAdGuard(win: BrowserWindow) {
-    try {
-      if (!win.webContents.debugger.isAttached()) win.webContents.debugger.attach("1.3");
-      await win.webContents.debugger.sendCommand("Page.enable");
-      await win.webContents.debugger.sendCommand("Page.addScriptToEvaluateOnNewDocument", {
-        source: IFRAME_AD_GUARD,
-      });
-    } catch (err) {
-      console.warn("[ad-block] CDP guard install failed:", err);
-    }
-  }
-
-  mainWindow.webContents.on("did-finish-load", () => {
-    void installIframeAdGuard(mainWindow!);
+  // When an embed iframe fails to load (ERR_CONNECTION_TIMED_OUT on
+  // blocked CDNs, ERR_QUIC_PROTOCOL_ERROR, etc.), tell the renderer
+  // to advance immediately instead of waiting for the iframe onError
+  // (which fires ~5s later on some platforms).
+  mainWindow.webContents.on("did-fail-load", (_evt, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (isMainFrame) return;
+    const url = validatedURL || "";
+    if (!/mp4upload|streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix|voe\.|dood|uqload|share4max|megamax|videa/.test(url)) return;
+    console.info(`[player] iframe load failed (${errorDescription}), advancing`);
+    mainWindow?.webContents.send("pantoufa:iframe-failed", { url });
   });
 
   mainWindow.webContents.on("did-finish-load", () => {
@@ -423,12 +399,17 @@ function registerVideoProxy() {
   // which technically should work, but with port mismatches it sometimes
   // doesn't. Hard-coded canonical origins are what the mobile app uses
   // and they work reliably.
-  function canonicalReferer(videoUrl: URL, _embedUrl: URL): { referer: string; origin: string } {
+  function canonicalReferer(videoUrl: URL, embedUrl: URL): { referer: string; origin: string } {
     const host = videoUrl.hostname.toLowerCase();
+    const eHost = embedUrl.hostname.toLowerCase();
     if (/mp4upload/.test(host)) {
       return { referer: "https://www.mp4upload.com/", origin: "https://www.mp4upload.com" };
     }
-    if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(host)) {
+    // Check both the CDN host AND the embed host so rotating streamwish
+    // mirrors (cybervynx.com) whose CDN domain doesn't match any static
+    // regex still get the mandatory streamwish.to Referer.
+    if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish/.test(host)
+        || /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish/.test(eHost)) {
       return { referer: "https://streamwish.to/", origin: "https://streamwish.to" };
     }
     if (/voe\./.test(host)) {
@@ -478,10 +459,7 @@ function registerVideoProxy() {
       { name: "no-referer", headers: noRefererHeaders },
     ];
 
-    // mp4upload: only target-self Referer works. The other strategies
-    // always fail and the parallel race just overloads the CDN, causing
-    // it to throttle/reject all requests (including the winning one).
-    // Use target-self exclusively with no race.
+    // mp4upload CDN requires the canonical www.mp4upload.com Referer.
     if (/mp4upload/.test(target.hostname) || /mp4upload/.test(embed.hostname)) {
       return [
         { name: "canonical", headers: canonicalHeaders },
@@ -908,15 +886,21 @@ app.whenReady().then(() => {
         delete headers[k];
       }
     }
-    // Replace restrictive Supabase CORS with the requesting origin so
-    // auth cookies + Authorization headers work from any origin (local
-    // dev, packaged app, custom domains). Wildcard * breaks credentials.
-    const urlStr = details.url || "";
-    if (urlStr.includes("supabase.co")) {
+    // Inject permissive CORS for video CDN hosts so the proxy's
+    // credentials:"include" fetches don't hit Chromium's
+    // net::ERR_FAILED when the CDN doesn't return
+    // Access-Control-Allow-Credentials (streamwish CDNs like
+    // premilkyway.com, cybervynx.com etc. never do). Scope to
+    // video CDN hosts only — universal injection breaks Google
+    // Fonts, analytics, and other third-party assets.
+    const host = (() => { try { return new URL(details.url).hostname.toLowerCase(); } catch { return ""; } })();
+    const isVideoCdn = /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix|mp4upload|voe|dood|uqload|share4max|megamax|videa|vidvaita|vidit|dailymotion|dmcdn/.test(host);
+    const isSupabase = host.includes("supabase.co");
+    if (isVideoCdn || isSupabase) {
       const origin = (() => {
         try { return new URL(details.referrer || "").origin; } catch { return "*"; }
       })();
-      headers["access-control-allow-origin"] = [origin || "*"];
+      headers["access-control-allow-origin"] = [origin];
       headers["access-control-allow-credentials"] = ["true"];
     }
     cb({ responseHeaders: headers });
@@ -951,10 +935,20 @@ app.whenReady().then(() => {
       // proxy operates on defaultSession too, and without this check
       // its own outbound fetches would loop back as new captures.
       if (inFlightProxyTargets.has(u)) return callback({});
-      if (AD_HOST_RE.test(u)) return callback({ cancel: true });
+      // CRITICAL: match AD_HOST_RE against the HOSTNAME only, not the
+      // full URL. The regex contains substrings like "mgid", "popunder",
+      // "adcash", "tsyndicate" — testing against a full URL means any
+      // CDN path or query token that happens to contain one of those
+      // substrings gets cancelled, breaking the embed silently (iframe
+      // loads but its player JS / token request returns blocked, page
+      // renders black). Hostname-only avoids the false positives.
+      const host = (() => { try { return new URL(u).hostname.toLowerCase(); } catch { return ""; } })();
+      if (host && AD_HOST_RE.test(host)) {
+        console.info(`[ad-block] cancelled request to ${host}`);
+        return callback({ cancel: true });
+      }
       if (/\.(m3u8|mp4)(\?|#|$)/i.test(u) && !isDecoyStream(u)) {
-        const host = new URL(u).hostname;
-        if (isKnownVideoCdn(host)) {
+        if (host && isKnownVideoCdn(host)) {
           mainWindow?.webContents.send("pantoufa:video-captured", { url: u });
         }
       }
@@ -976,6 +970,14 @@ app.whenReady().then(() => {
       urls: ["*://*/*"],
     },
     (details, callback) => {
+      // Only inject Referer for sub-resource requests (xhr, fetch, script,
+      // media). Never touch mainFrame/subFrame navigations — the iframe
+      // needs to load the embed page with its native Referer chain.
+      const rt = (details as any).resourceType;
+      if (rt === "mainFrame" || rt === "subFrame") {
+        callback({ requestHeaders: details.requestHeaders });
+        return;
+      }
       const hdrs = details.requestHeaders;
       const proxyMarker = Object.keys(hdrs).find((k) => k.toLowerCase() === "x-pantoufa-proxy");
       if (proxyMarker) {
