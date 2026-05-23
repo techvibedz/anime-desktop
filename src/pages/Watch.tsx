@@ -83,7 +83,7 @@ export function WatchPage() {
   // captures don't poison each other.
   const captureForEmbed = useRef<string | null>(null);
   const captureTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [captureMode, setCaptureMode] = useState<"capturing" | "captured" | "iframe-fallback">("capturing");
+  const [captureMode, setCaptureMode] = useState<"capturing" | "captured" | "iframe-fallback">("iframe-fallback");
   const [fallbackReload, setFallbackReload] = useState(0);
   // How many times have we cycled iframe → capture → custom player
   // → failure on the current server. After a small budget we give up
@@ -287,7 +287,7 @@ export function WatchPage() {
     if (captureTimer.current) clearTimeout(captureTimer.current);
     captureTimer.current = setTimeout(() => {
       setCaptureMode((m) => (m === "capturing" ? "iframe-fallback" : m));
-    }, 20000);
+    }, 6000);
     return () => {
       if (captureTimer.current) {
         clearTimeout(captureTimer.current);

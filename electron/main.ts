@@ -981,11 +981,6 @@ app.whenReady().then(() => {
       // its own outbound fetches would loop back as new captures.
       if (inFlightProxyTargets.has(u)) return callback({});
       if (AD_HOST_RE.test(u)) return callback({ cancel: true });
-      // Path-based: many providers serve pre-roll ads from /ads/ or /advert/
-      // paths on their OWN host. Block those without blocking the whole host.
-      if (/\/(ads?|advert|adserver|adsense|preroll|popunder)\//i.test(u)) {
-        return callback({ cancel: true });
-      }
       if (/\.(m3u8|mp4)(\?|#|$)/i.test(u) && !isDecoyStream(u)) {
         const host = new URL(u).hostname;
         if (isKnownVideoCdn(host)) {
