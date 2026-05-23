@@ -482,20 +482,22 @@ function registerVideoProxy() {
     // always fail and the parallel race just overloads the CDN, causing
     // it to throttle/reject all requests (including the winning one).
     // Use target-self exclusively with no race.
-    if (/mp4upload/.test(target.hostname)) {
+    if (/mp4upload/.test(target.hostname) || /mp4upload/.test(embed.hostname)) {
       return [
-        { name: "target-self", headers: targetHeaders },
+        { name: "canonical", headers: canonicalHeaders },
       ];
     }
 
     // streamwish family: CDN host (vibuxer.com, audinifer.com) expects the
     // embed-page Referer (hgcloud.to, streamwish.to) not its own domain.
-    if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(target.hostname)) {
+    // Also check embed.hostname so rotating CDN mirrors (cybervynx.com,
+    // ghbrisk.com) that don't match any static regex still get the single
+    // canonical strategy instead of a 4-way parallel race that overloads
+    // the CDN and triggers 403 rate-limiting.
+    if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(target.hostname)
+        || /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish/.test(embed.hostname)) {
       return [
-        { name: "embed", headers: embedHeaders },
-        { name: "target-self", headers: targetHeaders },
         { name: "canonical", headers: canonicalHeaders },
-        { name: "no-referer", headers: noRefererHeaders },
       ];
     }
 
@@ -604,37 +606,6 @@ function registerVideoProxy() {
     const targetUrl = new URL(target);
     const embedUrl = (() => { try { return new URL(embedHref); } catch { return targetUrl; } })();
     const list = strategies(targetUrl, embedUrl);
-
-    // mp4upload: the CDN on port 183 is slow (10–30s response times).
-    // The strategy race + 8s/15s watchdogs always kill requests before
-    // the CDN responds. Skip the race, use target-self exclusively, and
-    // give the CDN up to 60s to respond. The browser's own abort signal
-    // still propagates so user seeks/cancels work correctly.
-    if (/mp4upload/.test(targetUrl.hostname)) {
-      const strat = list[0]; // target-self
-      const ctrl = new AbortController();
-      if (signal) signal.addEventListener("abort", () => { try { ctrl.abort(); } catch {} }, { once: true });
-      // 60s safety net — mp4upload CDN can be very slow but rarely passes 30s.
-      const watchdog = setTimeout(() => { try { ctrl.abort(); } catch {} }, 60000);
-      try {
-        const r = await fetchWithStrategy(target, strat, range, method, ctrl.signal);
-        clearTimeout(watchdog);
-        return r;
-      } catch (e: any) {
-        clearTimeout(watchdog);
-        // Extract the real HTTP status from the strategy error message
-        // (`{name} → {status}`) so the outer handler can detect a 410
-        // and signal the renderer to re-extract. Without this, mp4upload
-        // expirations always look like generic 502s.
-        const msg = String(e?.message || e?.code || e?.name || e);
-        const m = msg.match(/→\s*(\d{3})/);
-        const code = m ? parseInt(m[1], 10) : 0;
-        const err = new Error(`all strategies failed for ${target} (statuses: ${code})`);
-        (err as any).statusCodes = code ? [code] : [];
-        (err as any).cause = e;
-        throw err;
-      }
-    }
 
     // Fast path: cached working strategy. Try alone with a 20s cap.
     // The previous 8s cap matched median segment latency on slow CDN

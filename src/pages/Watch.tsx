@@ -421,9 +421,6 @@ export function WatchPage() {
       const isBufferingMidStream = played && !v.paused && !v.ended && v.currentTime === lastTime;
 
       if (isInitialLoading && now - loadStartedAt > INITIAL_LOAD_DEADLINE_MS) {
-        // mp4upload's CDN on port 183 takes 10–30s to respond. The proxy
-        // gives 60s; the 22s stall watchdog kills it before the CDN answers.
-        if (/mp4upload/.test(resolved.embed)) return; // trust the proxy timeout
         advanced = true;
         console.warn(`[player] Initial load exceeded ${INITIAL_LOAD_DEADLINE_MS}ms — advancing`);
         advanceToNext();
@@ -589,8 +586,7 @@ export function WatchPage() {
       // mp4upload: its CDN on port 183 is too slow for the proxy's
       // timeout/waitdog machinery. Load the signed HTTPS URL directly
       // — the browser's native networking handles slow CDNs fine.
-      const isMp4upload = /mp4upload/.test(resolved.url);
-      v.src = isMp4upload ? resolved.url : proxied;
+      v.src = proxied;
     }
 
     return () => {
