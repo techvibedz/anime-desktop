@@ -155,6 +155,20 @@ function createMainWindow() {
     }
   });
 
+  // Let iframes (streamwish, mp4upload, etc.) request fullscreen so their
+  // native player fullscreen button works. Electron doesn't auto-propagate
+  // HTML5 fullscreen requests from cross-origin iframes to the parent
+  // document's fullscreenElement, so we use IPC to tell the renderer to
+  // make the iframe container a fixed fullscreen overlay.
+  mainWindow.webContents.on("enter-html-full-screen", () => {
+    mainWindow?.setFullScreen(true);
+    mainWindow?.webContents.send("pantoufa:fullscreen-changed", true);
+  });
+  mainWindow.webContents.on("leave-html-full-screen", () => {
+    mainWindow?.setFullScreen(false);
+    mainWindow?.webContents.send("pantoufa:fullscreen-changed", false);
+  });
+
   if (isDev) {
     // Attach debugger BEFORE loading page and opening DevTools so
     // we can suppress the anti-adblock `debugger;` statements that
@@ -1167,5 +1181,16 @@ app.whenReady().then(() => {
 }
 
 app.on("window-all-closed", () => {
+  // Destroy all remaining BrowserWindows (scraper pool) so the
+  // process can exit cleanly instead of lingering.
+  for (const w of BrowserWindow.getAllWindows()) {
+    try { w.destroy(); } catch {}
+  }
   if (process.platform !== "darwin") app.quit();
+});
+
+// Force the Node process to exit so concurrently -k can kill Vite
+// on Windows where the child-process tracking is unreliable.
+app.on("will-quit", () => {
+  process.exit(0);
 });

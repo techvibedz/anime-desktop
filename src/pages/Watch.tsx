@@ -646,11 +646,18 @@ export function WatchPage() {
   }, [scheduleHide]);
   useEffect(() => { scheduleHide(); return () => { if (hideTimer.current) clearTimeout(hideTimer.current); }; }, [scheduleHide]);
 
-  // Fullscreen tracking
+  // Fullscreen tracking — DOM event for our custom video player,
+  // IPC for iframe-embed players (streamwish, mp4upload, etc.) where
+  // the fullscreen request originates from a cross-origin iframe
+  // that the parent document can't observe directly.
   useEffect(() => {
     const onFs = () => setIsFullscreen(!!document.fullscreenElement);
     document.addEventListener("fullscreenchange", onFs);
-    return () => document.removeEventListener("fullscreenchange", onFs);
+    const unsub = window.pantoufa.onFullscreenChanged((fs) => setIsFullscreen(fs));
+    return () => {
+      document.removeEventListener("fullscreenchange", onFs);
+      unsub();
+    };
   }, []);
 
   // Prev/next episode derivation — match by normalized href OR episode
@@ -779,6 +786,10 @@ export function WatchPage() {
         ref={playerRef}
         dir="ltr"
         className={`group relative aspect-video w-full overflow-hidden rounded-xl border border-white/10 bg-black shadow-card ${
+          isFullscreen && resolved?.type === "iframe"
+            ? "!fixed !inset-0 !z-[9999] !h-screen !w-screen !rounded-none !border-none !aspect-auto"
+            : ""
+        } ${
           isPlaying && !controlsVisible ? "cursor-none" : "cursor-default"
         }`}
         onMouseMove={showControls}
@@ -820,13 +831,26 @@ export function WatchPage() {
                  className="h-full w-full border-0 bg-black"
                  title={`${active ? displayName(active) : "Video"} player`}
               />
-              {!iframeLoaded && resolved.type === "iframe" && (
-                <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/95 text-text-muted">
-                  <div className="h-8 w-8 animate-spin rounded-full border-2 border-accent border-t-transparent" />
-                  <p className="text-sm">Loading embed player…</p>
-                </div>
-              )}
-            </>
+               {!iframeLoaded && resolved.type === "iframe" && (
+                 <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/95 text-text-muted">
+                   <div className="h-8 w-8 animate-spin rounded-full border-2 border-accent border-t-transparent" />
+                   <p className="text-sm">Loading embed player…</p>
+                 </div>
+               )}
+               {/* Fullscreen overlay button for iframe embeds — cross-origin
+                   fullscreen requests from inside the iframe can't be detected
+                   by the parent document, so we provide our own fullscreen
+                   toggle that reliably fills the entire screen. */}
+               {iframeLoaded && !isFullscreen && (
+                 <button
+                   onClick={(e) => { e.stopPropagation(); toggleFs(); }}
+                   className="absolute bottom-3 right-3 z-30 rounded-lg bg-black/70 p-2 text-white/80 backdrop-blur-sm transition hover:bg-black/90 hover:text-white border border-white/10"
+                   title="Fullscreen"
+                 >
+                   <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" /></svg>
+                 </button>
+               )}
+             </>
           ) : (
           <>
             <video

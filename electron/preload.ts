@@ -48,6 +48,11 @@ contextBridge.exposeInMainWorld("pantoufa", {
     ipcRenderer.on("pantoufa:iframe-failed", listener);
     return () => ipcRenderer.removeListener("pantoufa:iframe-failed", listener);
   },
+  onFullscreenChanged: (handler: (fullscreen: boolean) => void) => {
+    const listener = (_evt: unknown, fullscreen: boolean) => handler(fullscreen);
+    ipcRenderer.on("pantoufa:fullscreen-changed", listener);
+    return () => ipcRenderer.removeListener("pantoufa:fullscreen-changed", listener);
+  },
   directExtract: (provider: string, iframeUrl: string) =>
     ipcRenderer.invoke("pantoufa:direct-extract", { provider, iframeUrl }) as Promise<
       { url: string; type: "hls" | "mp4" } | null

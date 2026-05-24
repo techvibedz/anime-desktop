@@ -27,6 +27,7 @@ declare global {
       onVideoCaptured: (handler: (info: { url: string }) => void) => () => void;
       setMuted: (muted: boolean) => Promise<boolean>;
       onIframeFailed: (handler: (info: { url: string }) => void) => () => void;
+      onFullscreenChanged: (handler: (fullscreen: boolean) => void) => () => void;
       directExtract: (
         provider: string,
         iframeUrl: string,
