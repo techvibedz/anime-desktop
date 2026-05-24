@@ -27,6 +27,7 @@ const VIDEO_UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, lik
 
 let mainWindow: BrowserWindow | null = null;
 let pendingAuthCallback: string | null = null;
+let updateCheckInterval: ReturnType<typeof setInterval> | null = null;
 
 // Single-instance lock so the OS routes pantoufa:// URLs to our running app.
 const gotLock = app.requestSingleInstanceLock();
@@ -167,6 +168,15 @@ function createMainWindow() {
   mainWindow.webContents.on("leave-html-full-screen", () => {
     mainWindow?.setFullScreen(false);
     mainWindow?.webContents.send("pantoufa:fullscreen-changed", false);
+  });
+
+  // When the main window is about to close, destroy all hidden scraper
+  // BrowserWindows so window-all-closed can fire. Without this the scraper
+  // pool keeps the app alive indefinitely.
+  mainWindow.on("close", () => {
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (w !== mainWindow) try { w.destroy(); } catch {}
+    }
   });
 
   if (isDev) {
@@ -1170,7 +1180,7 @@ app.whenReady().then(() => {
       console.warn("[updater] error:", err?.message || err);
     });
     setTimeout(() => { autoUpdater.checkForUpdates().catch(() => {}); }, 5000);
-    setInterval(() => { autoUpdater.checkForUpdates().catch(() => {}); }, 60 * 60 * 1000);
+    updateCheckInterval = setInterval(() => { autoUpdater.checkForUpdates().catch(() => {}); }, 60 * 60 * 1000);
   }
 
   app.on("activate", () => {
@@ -1181,16 +1191,16 @@ app.whenReady().then(() => {
 }
 
 app.on("window-all-closed", () => {
-  // Destroy all remaining BrowserWindows (scraper pool) so the
-  // process can exit cleanly instead of lingering.
-  for (const w of BrowserWindow.getAllWindows()) {
-    try { w.destroy(); } catch {}
+  if (updateCheckInterval) { clearInterval(updateCheckInterval); updateCheckInterval = null; }
+  if (process.platform !== "darwin") {
+    if (isDev) {
+      // Dev mode: exit immediately so concurrently -k detects it
+      // and kills the Vite dev server. app.exit() skips the event
+      // loop, terminates all child processes instantly.
+      app.exit(0);
+    } else {
+      // Production: normal quit so autoInstaller can apply updates.
+      app.quit();
+    }
   }
-  if (process.platform !== "darwin") app.quit();
-});
-
-// Force the Node process to exit so concurrently -k can kill Vite
-// on Windows where the child-process tracking is unreliable.
-app.on("will-quit", () => {
-  process.exit(0);
 });
