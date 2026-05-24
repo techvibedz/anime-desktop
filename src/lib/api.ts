@@ -214,7 +214,7 @@ export function resolveVideo(iframeUrl: string, provider: string): Promise<Resol
 export function invalidateResolveCache(iframeUrl: string) { resolveCache.delete(iframeUrl); }
 
 async function doResolveVideo(iframeUrl: string, provider: string) {
-  if (provider === "dailymotion") {
+  if (provider === "dailymotion" || provider === "videa") {
     try {
       const direct = await window.pantoufa.directExtract?.(provider, iframeUrl);
       if (direct?.url) return { success: true as const, data: { videoUrl: direct.url, type: direct.type } };

@@ -14,6 +14,7 @@ app.commandLine.appendSwitch("enable-quic", "false");
 
 import { autoUpdater } from "electron-updater";
 import { enqueue, type ScrapeJob } from "./scraper/host";
+import { EXTRACT_VIDEO_URL, VIDEO_HOOK_INSTALL } from "../shared/scrape-scripts";
 
 const isDev = !app.isPackaged;
 const DEV_URL = "http://localhost:5173";
@@ -155,6 +156,19 @@ function createMainWindow() {
   });
 
   if (isDev) {
+    // Attach debugger BEFORE loading page and opening DevTools so
+    // we can suppress the anti-adblock `debugger;` statements that
+    // pirate-site embed pages inject. setSkipAllPauses + auto-resume
+    // listener together ensure no "Paused in debugger" overlays.
+    try { mainWindow.webContents.debugger.attach("1.3"); } catch { /* already attached */ }
+    mainWindow.webContents.debugger.sendCommand("Debugger.enable").catch(() => {});
+    mainWindow.webContents.debugger.sendCommand("Debugger.setSkipAllPauses", { skip: true }).catch(() => {});
+    mainWindow.webContents.debugger.sendCommand("Debugger.setPauseOnExceptions", { state: "none" }).catch(() => {});
+    mainWindow.webContents.debugger.on("message", (_event, method) => {
+      if (method === "Debugger.paused") {
+        mainWindow?.webContents.debugger.sendCommand("Debugger.resume").catch(() => {});
+      }
+    });
     void mainWindow.loadURL(DEV_URL);
     mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
@@ -299,6 +313,27 @@ async function extractDailymotion(
     if (mp4?.url) return { url: mp4.url, type: "mp4" };
   }
   return null;
+}
+
+async function extractVidea(
+  iframeUrl: string,
+): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+  try {
+    const result = await enqueue({
+      url: iframeUrl,
+      injectBefore: VIDEO_HOOK_INSTALL,
+      injectAfter: EXTRACT_VIDEO_URL,
+      timeoutMs: 25000,
+      isVideoJob: true,
+    });
+    if (result?.url) {
+      return { url: result.url, type: result.url.includes(".m3u8") ? "hls" : "mp4" };
+    }
+    return null;
+  } catch (e) {
+    console.warn("[extractVidea] scraper failed:", e);
+    return null;
+  }
 }
 
 function registerVideoProxy() {
@@ -894,7 +929,7 @@ app.whenReady().then(() => {
     // video CDN hosts only — universal injection breaks Google
     // Fonts, analytics, and other third-party assets.
     const host = (() => { try { return new URL(details.url).hostname.toLowerCase(); } catch { return ""; } })();
-    const isVideoCdn = /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix|mp4upload|voe|dood|uqload|share4max|megamax|videa|vidvaita|vidit|dailymotion|dmcdn/.test(host);
+    const isVideoCdn = /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix|mp4upload|voe|dood|uqload|share4max|megamax|dailymotion|dmcdn/.test(host);
     const isSupabase = host.includes("supabase.co");
     if (isVideoCdn || isSupabase) {
       const origin = (() => {
@@ -987,6 +1022,9 @@ app.whenReady().then(() => {
       }
       try {
         const host = new URL(details.url).hostname.toLowerCase();
+        const hasReferer = Object.keys(hdrs).some(
+          (k) => k.toLowerCase() === "referer",
+        );
         let ref = "";
         let ori = "";
         if (/mp4upload/.test(host)) {
@@ -1031,7 +1069,7 @@ app.whenReady().then(() => {
             ori = `https://${root}`;
           }
         }
-        if (ref) {
+        if (!hasReferer && ref) {
           hdrs["Referer"] = ref;
           hdrs["Origin"] = ori;
         }
@@ -1071,6 +1109,9 @@ app.whenReady().then(() => {
     try {
       if (opts.provider === "dailymotion") {
         return await extractDailymotion(opts.iframeUrl);
+      }
+      if (opts.provider === "videa") {
+        return await extractVidea(opts.iframeUrl);
       }
     } catch (e) {
       console.warn("[direct-extract] failed:", e);
