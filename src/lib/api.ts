@@ -14,7 +14,7 @@ const HOME_CACHE_KEY = "@home_cache_v1";
 const HOME_CACHE_TTL = 30 * 60 * 1000;
 const DETAIL_CACHE_PREFIX = "@detail_v4:";
 const DETAIL_CACHE_TTL = 30 * 60 * 1000;
-const UP4_CACHE_PREFIX = "@up4_eps_v1:";
+const UP4_CACHE_PREFIX = "@up4_eps_v2:";
 const UP4_CACHE_TTL = 24 * 60 * 60 * 1000;
 
 async function readCache<T>(key: string, ttlMs: number): Promise<T | null> {
@@ -95,9 +95,19 @@ async function getCrossSourceUrl(title: string, primary: "witanime" | "anime4up"
   const hit = xsourceCache.get(key);
   if (hit && Date.now() - hit.ts < XSOURCE_TTL) return hit.url;
   let url: string | null = null;
-  for (const v of searchVariants(title)) { url = await findCrossSourceUrl(v, primary).catch(() => null); if (url) break; }
+  for (const v of searchVariants(title)) {
+    // Retry once on network failure — anime4up is intermittently
+    // unreachable so a single timeout shouldn't kill the lookup.
+    url = await findCrossSourceUrl(v, primary).catch(async () =>
+      new Promise<string | null>((resolve) => setTimeout(resolve, 2000))
+        .then(() => findCrossSourceUrl(v, primary).catch(() => null)),
+    );
+    if (url) break;
+  }
   if (!url) console.warn(`[cross-source] no match for "${title}" on ${primary === "witanime" ? "anime4up" : "witanime"}`);
-  xsourceCache.set(key, { url, ts: Date.now() });
+  // Only cache successful hits — null entries poison the cache and
+  // prevent retries when anime4up comes back online.
+  if (url) xsourceCache.set(key, { url, ts: Date.now() });
   return url;
 }
 
@@ -131,7 +141,7 @@ export async function fetchEpisodesUp4(animeUrl: string, title: string | null, u
   if (cached) return cached;
   let crossUrl: string | null = up4Hint ?? null;
   if (!crossUrl) { const lookupTitle = title || titleFromSlug(animeUrl); if (lookupTitle) crossUrl = await getCrossSourceUrl(lookupTitle, "witanime").catch(() => null); }
-  if (!crossUrl) { const empty = { merged: null, episodes4up: [] }; void writeCache(cacheKey, empty); return empty; }
+  if (!crossUrl) return { merged: null, episodes4up: [] };
   let episodes4up: Episode[] = [];
   try { episodes4up = (await scrapeEpisodesPage(crossUrl)).episodes; } catch {}
   const result = { merged: { anime4up: crossUrl }, episodes4up };

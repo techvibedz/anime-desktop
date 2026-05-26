@@ -134,7 +134,7 @@ export function SeeAllPage() {
           {Array.from({ length: 18 }).map((_, i) => <Shimmer key={i} className="aspect-[2/3]" />)}
         </div>
       ) : kind === "episode" ? (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
           {(items as EpisodeItem[]).map((it) => (
             <EpisodeCard key={it.href + it.animeHref} episode={it} onOpen={setEpisodePopup} />
           ))}

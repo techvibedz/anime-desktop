@@ -456,10 +456,12 @@ if (out.length === 0) {
 // Re-collect after JS has finished stitching the page.
 collect();
 
-// If we already have a solid set of servers, skip the slow tab-click loop.
+// Click every server tab so we discover all iframes hidden behind
+// tabs that weren't initially visible. The 150 ms wait between clicks
+// gives each tab's iframe time to render before we scan.
 var tabs = document.querySelectorAll('#episode-servers .server-link, .server-btn, [data-server], .servers-list a, ul.servers li a, .episode-servers a, .server-tabs li, .servers-tabs a');
-if (out.length < 5 && tabs.length > 0) {
-  var TAB_CAP = 6;
+if (tabs.length > 0) {
+  var TAB_CAP = 10;
   var TAB_WAIT = 150;
   for (var i = 0; i < tabs.length && i < TAB_CAP; i++) {
     var t = tabs[i];

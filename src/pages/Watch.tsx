@@ -21,9 +21,9 @@ function setMutedSafe(muted: boolean) {
 }
 
 const PROVIDER_RANK: Record<string, number> = {
-  dailymotion: 0, mp4upload: 1, streamwish: 2, videa: 3, voe: 4,
-  share4max: 5, doodstream: 6, uqload: 7, okru: 8, yonaplay: 9,
-  generic: 10, vk: 11,
+  dailymotion: 0, streamwish: 1, videa: 2, voe: 3,
+  share4max: 4, mp4upload: 5, doodstream: 6, uqload: 7,
+  okru: 8, yonaplay: 9, vk: 10,
 };
 function rank(p: string) { return PROVIDER_RANK[p] ?? 50; }
 
@@ -122,7 +122,9 @@ export function WatchPage() {
   const reextractUsedRef = useRef(false);
 
   const sortedServers = useMemo(
-    () => [...servers].sort((a, b) => rank(a.provider) - rank(b.provider)),
+    () => [...servers]
+      .filter((s) => s.provider !== "generic")
+      .sort((a, b) => rank(a.provider) - rank(b.provider)),
     [servers],
   );
 
@@ -130,7 +132,10 @@ export function WatchPage() {
   useEffect(() => {
     if (!episodeUrl) return;
     let cancelled = false;
-    setLoadingServers(true);
+    // Only show the spinner on initial load (no servers yet). For
+    // prev/next navigation, keep the old server list visible while
+    // fetching in the background so the transition feels instant.
+    if (servers.length === 0) setLoadingServers(true);
     setServerError(false);
     fetchVideoServers(episodeUrl, up4Param || undefined)
       .then((r) => {
@@ -218,6 +223,14 @@ export function WatchPage() {
     return () => { off(); };
   }, [advanceToNext]);
 
+  // Tell the main process which iframe URL is currently active so
+  // did-fail-load can ignore sub-resource failures (ad iframes inside
+  // embed pages) and only fast-advance for the actual embed iframe.
+  useEffect(() => {
+    const url = resolved?.type === "iframe" ? resolved.url : null;
+    window.pantoufa.setActiveIframe(url);
+  }, [resolved?.url, resolved?.type]);
+
   // Resolve the active server only after user clicks (lazy-load to prevent
   // tokenized stream URLs from expiring while the user is reading the page).
   useEffect(() => {
@@ -280,6 +293,27 @@ export function WatchPage() {
     const t = setTimeout(() => setIframeLoaded(true), 8000);
     return () => clearTimeout(t);
   }, [resolved]);
+
+  // Streamwish Cloudflare auto-reload: the first iframe load hits
+  // Cloudflare's JS challenge which blocks the player. Wait 10 s then
+  // reload the iframe — the CF token will be cached and the player
+  // loads instantly on the second attempt.
+  const streamwishReloaded = useRef(false);
+  useEffect(() => {
+    if (resolved?.type !== "iframe" || !iframeLoaded) return;
+    if (resolved.embed && !/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish/.test(resolved.embed)) return;
+    if (streamwishReloaded.current) return;
+    const reload = setTimeout(() => {
+      console.info("[player] streamwish auto-reload for Cloudflare");
+      streamwishReloaded.current = true;
+      setFallbackReload((n) => n + 1);
+    }, 10000);
+    return () => clearTimeout(reload);
+  }, [resolved?.url, iframeLoaded]);
+  useEffect(() => {
+    // Reset the reload flag when the embed URL changes (new server selected).
+    streamwishReloaded.current = false;
+  }, [resolved?.embed]);
 
   // Unmute the window when we swap from iframe → custom player so the
   // user hears their show, and on unmount so leaving the page doesn't
@@ -688,14 +722,32 @@ export function WatchPage() {
 
   const navTo = useCallback((ep: Episode) => {
     if (!ep.href) return;
-    const matching4 = up4Siblings.find((u) => u.number === ep.number)?.href ?? null;
+    // Try to find the matching anime4up URL from the pre-loaded siblings.
+    let matching4 = up4Siblings.find((u) => u.number === ep.number)?.href ?? null;
+    // Fallback: if we're currently watching an anime4up-sourced episode,
+    // derive the target up4 URL by swapping the episode path in the
+    // current up4Param — this works when anime4up was unreachable during
+    // the initial detail-page load but we have the current episode's URL.
+    if (!matching4 && up4Param) {
+      try {
+        const curUp4 = new URL(decodeURIComponent(up4Param));
+        const segments = curUp4.pathname.replace(/\/+$/, "").split("/");
+        if (segments.length >= 2) {
+          segments.pop();
+          const target = new URL(decodeURIComponent(ep.href));
+          const targetSeg = target.pathname.replace(/\/+$/, "").split("/").pop() || "";
+          segments.push(targetSeg);
+          matching4 = `${curUp4.origin}${segments.join("/")}`;
+        }
+      } catch {}
+    }
     const p = new URLSearchParams();
     if (matching4) p.set("up4", matching4);
     if (ep.screenshot) p.set("img", ep.screenshot);
     if (animeParam) p.set("anime", animeParam);
     const qs = p.toString();
     navigate(`/watch/${encodeURIComponent(ep.href)}${qs ? `?${qs}` : ""}`);
-  }, [up4Siblings, animeParam, navigate]);
+  }, [up4Siblings, up4Param, animeParam, navigate]);
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current; if (!v) return;
@@ -748,6 +800,12 @@ export function WatchPage() {
         }
         case "m": toggleMute(); showControls(); break;
         case "f": toggleFs(); break;
+        case "Escape":
+          if (isFullscreen && resolved?.type === "iframe") {
+            e.preventDefault();
+            toggleFs();
+          }
+          break;
       }
     }
     window.addEventListener("keydown", onKey);

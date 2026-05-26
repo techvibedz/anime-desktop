@@ -28,6 +28,7 @@ declare global {
       setMuted: (muted: boolean) => Promise<boolean>;
       onIframeFailed: (handler: (info: { url: string }) => void) => () => void;
       onFullscreenChanged: (handler: (fullscreen: boolean) => void) => () => void;
+      setActiveIframe: (url: string | null) => Promise<void>;
       directExtract: (
         provider: string,
         iframeUrl: string,

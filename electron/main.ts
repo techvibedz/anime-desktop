@@ -12,12 +12,34 @@ import path from "node:path";
 app.commandLine.appendSwitch("disable-quic");
 app.commandLine.appendSwitch("enable-quic", "false");
 
+// Suppress Chromium-level warnings in dev mode — the scraper and iframe
+// embeds generate ERR_CONNECTION_TIMED_OUT for ISP-blocked hosts, and
+// Electron logs them as "Failed to load URL..." which is noise. Setting
+// the log level to ERROR hides these warnings while keeping our own
+// console.info / console.warn calls visible.
+if (!app.isPackaged) {
+  app.commandLine.appendSwitch("log-level", "3"); // LOG_ERROR only
+  process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = "true";
+}
+
+// Suppress Node.js process warnings ("electron: Failed to load URL...")
+// that Electron emits on navigation failures. These happen every time
+// the scraper or an iframe hits an ISP-blocked host. The errors are
+// already handled by our own did-fail-load / fast-advance logic.
+process.removeAllListeners("warning");
+process.on("warning", (warning: { name?: string; message?: string }) => {
+  const msg = warning?.message || "";
+  if (msg.includes("Failed to load URL") && msg.includes("ERR_CONNECTION")) return;
+  console.warn(msg || warning);
+});
+
 import { autoUpdater } from "electron-updater";
 import { enqueue, type ScrapeJob } from "./scraper/host";
 import { EXTRACT_VIDEO_URL, VIDEO_HOOK_INSTALL } from "../shared/scrape-scripts";
 
 const isDev = !app.isPackaged;
 const DEV_URL = "http://localhost:5173";
+let activeIframeUrl: string | null = null;
 const PROTOCOL = "pantoufa";
 const VIDEO_PROTOCOL = "pantoufa-video";
 // Mobile UA for video CDNs — matches what the mobile app uses and what
@@ -74,7 +96,14 @@ function handleAuthCallbackUrl(url: string) {
 }
 
 // Ad-network hosts blocked across all layers (single source of truth).
-const AD_HOST_RE = /doubleclick|googletagmanager|google-analytics|googleadservices|googlesyndication|adservice\.google|adnxs|facebook\.com\/tr|pixel\.facebook|popads|popcash|popmyads|popunder|propeller|propellerads|trafficjunky|adsterra|hilltopads|onclkds|onclickbid|onclickpredictiv|exoclick|magsrv|tsyndicate|clickadu|adcash|ad-maven|admaven|adsupply|servedbyadbutler|mgid|revcontent|adskeeper|trustedclicks|outbrain|taboola/i;
+// Ad-block hostname regex. Used across onBeforeRequest, will-frame-navigate,
+// and the capture filter. Keep patterns hostname-centric (e.g. "doubleclick" not
+// "//doubleclick.net/path") so they match anywhere in the hostname string.
+//
+// TLD group: cheap / free TLDs that are almost never used by legitimate
+// video CDNs but are heavily abused by popup ad networks. Match them only
+// when preceded by a dot (they're the top-level domain).
+const AD_HOST_RE = /doubleclick|googletagmanager|google-analytics|googleadservices|googlesyndication|adservice\.google|adnxs|facebook\.com\/tr|pixel\.facebook|popads|popcash|popmyads|popunder|propeller|propellerads|trafficjunky|adsterra|hilltopads|onclkds|onclickbid|onclickpredictiv|exoclick|magsrv|tsyndicate|clickadu|adcash|ad-maven|admaven|adsupply|servedbyadbutler|mgid|revcontent|adskeeper|trustedclicks|outbrain|taboola|etymonstheine|savorsaveragereaudit|offletsoroche|horizonungyve|visageagar|protrafficinspector|spendsdetachment|\.(?:cfd|cyou|life|shop|sbs|quest|buzz|top|ooo|live|today|icu|site|click|link|bid|trade|webcam|date|download|party|review|science|stream|racing|accountant|win|men|loan|faith|gdn)$/i;
 
 function createMainWindow() {
   // Resolve the bundled icon — packaged app reads from resources/build/, dev reads from ../../build/.
@@ -125,6 +154,18 @@ function createMainWindow() {
     return { action: "deny" };
   });
 
+  // Suppress web push notification prompts. Streamwish, mp4upload, and
+  // other embed sites request notification permission to push spam.
+  // Deny all permission requests from sub-frames (iframes / embeds)
+  // while letting the main frame keep default behavior.
+  mainWindow.webContents.session.setPermissionRequestHandler(
+    (_webContents, permission, callback, details) => {
+      if (details.isMainFrame) return callback(true);
+      // Deny everything from embed iframes: notifications, midi, etc.
+      return callback(false);
+    },
+  );
+
   // Block in-iframe navigations to ad hosts only — legitimate CDN mirror
   // rotations (streamwish → ghbrisk.com, new dood subdomains) must NOT be
   // blocked.
@@ -140,12 +181,16 @@ function createMainWindow() {
   // When an embed iframe fails to load (ERR_CONNECTION_TIMED_OUT on
   // blocked CDNs, ERR_QUIC_PROTOCOL_ERROR, etc.), tell the renderer
   // to advance immediately instead of waiting for the iframe onError
-  // (which fires ~5s later on some platforms).
-  mainWindow.webContents.on("did-fail-load", (_evt, errorCode, errorDescription, validatedURL, isMainFrame) => {
+  // (which fires ~5s later on some platforms). Only trigger for the
+  // ACTIVE iframe URL — ad sub-frames inside the embed page also fire
+  // did-fail-load and would cause false-positive fast-advances.
+  mainWindow.webContents.on("did-fail-load", (_evt, _errorCode, errorDescription, validatedURL, isMainFrame) => {
     if (isMainFrame) return;
-    const url = validatedURL || "";
-    if (!/mp4upload|streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix|voe\.|dood|uqload|share4max|megamax|videa/.test(url)) return;
+    const url = (validatedURL || "").split("?")[0].split("#")[0];
+    const active = (activeIframeUrl || "").split("?")[0].split("#")[0];
+    if (!active || url !== active) return;
     console.info(`[player] iframe load failed (${errorDescription}), advancing`);
+    activeIframeUrl = null;
     mainWindow?.webContents.send("pantoufa:iframe-failed", { url });
   });
 
@@ -154,6 +199,33 @@ function createMainWindow() {
       mainWindow.webContents.send("pantoufa:auth-callback", pendingAuthCallback);
       pendingAuthCallback = null;
     }
+  });
+
+  // Inject ad-hiding CSS into ALL video-embed sub-frames. The selector
+  // sheet targets common ad container class/id patterns without touching
+  // the actual video player controls. Skip the main frame to avoid
+  // breaking our own app's UI.
+  mainWindow.webContents.on("did-frame-navigate", async (_evt, url, _httpResponseCode, _httpStatusText, isMainFrame, frameProcessId, frameRoutingId) => {
+    if (isMainFrame) return;
+    try {
+      const host = new URL(url).hostname.toLowerCase();
+      // Only inject into video embed hosts, not analytics/tracker frames
+      if (!host || /google|facebook|doubleclick|googletagmanager|supabase/.test(host)) return;
+      const frames = mainWindow?.webContents.mainFrame?.framesInSubtree ?? [];
+      const frame = frames.find((f) =>
+        f.processId === frameProcessId && f.routingId === frameRoutingId,
+      );
+      if (!frame || frame.isDestroyed()) return;
+      await frame.executeJavaScript(`
+        (function(){
+          if (document.getElementById('__pa_ad_block')) return;
+          var s = document.createElement('style');
+          s.id = '__pa_ad_block';
+          s.textContent = 'div[class*="ad-"],div[id*="-ad"],div[class*="ads-"],div[id*="banner"],div[class*="popup"],div[class*="popunder"],[class*="adsby"],[class*="adsence"],[class*="ajax-ad"],[class*="sponsored"],[class*="native-ad"],[class*="promoted"],[id*="google_ads"],[id*="div-gpt-ad"],[class*="outbrain"],[class*="taboola"],[class*="mgid"],[class*="revcontent"]{display:none!important}';
+          document.head.appendChild(s);
+        })();
+      `).catch(() => {});
+    } catch {}
   });
 
   // Let iframes (streamwish, mp4upload, etc.) request fullscreen so their
@@ -356,6 +428,27 @@ async function extractVidea(
     return null;
   } catch (e) {
     console.warn("[extractVidea] scraper failed:", e);
+    return null;
+  }
+}
+
+async function extractStreamwish(
+  iframeUrl: string,
+): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+  try {
+    const result = await enqueue({
+      url: iframeUrl,
+      injectBefore: VIDEO_HOOK_INSTALL,
+      injectAfter: EXTRACT_VIDEO_URL,
+      timeoutMs: 35000, // Cloudflare challenge can take longer
+      isVideoJob: true,
+    });
+    if (result?.url) {
+      return { url: result.url, type: result.url.includes(".m3u8") ? "hls" : "mp4" };
+    }
+    return null;
+  } catch (e) {
+    console.warn("[extractStreamwish] scraper failed:", e);
     return null;
   }
 }
@@ -1006,6 +1099,13 @@ app.whenReady().then(() => {
         console.info(`[ad-block] cancelled request to ${host}`);
         return callback({ cancel: true });
       }
+      // Block well-known ad script filenames / paths that escape the
+      // hostname-based AD_HOST_RE (e.g. a CDN mirror hosting both the
+      // video player and ad scripts on the same domain).
+      if (/[\/.](?:popunder|popads|popmyads|adscripts?|advertisement|bannerads?|overlay|interstitial|prebid|vast|vpaid|adserver|admob|adx|ad[sv]?\d*)\.(?:js|php|html?)/i.test(u)) {
+        console.info(`[ad-block] cancelled ad script ${u.split("/").pop()}`);
+        return callback({ cancel: true });
+      }
       if (/\.(m3u8|mp4)(\?|#|$)/i.test(u) && !isDecoyStream(u)) {
         if (host && isKnownVideoCdn(host)) {
           mainWindow?.webContents.send("pantoufa:video-captured", { url: u });
@@ -1105,7 +1205,15 @@ app.whenReady().then(() => {
   registerVideoProxy();
 
   ipcMain.handle("pantoufa:scrape", async (_evt, job: ScrapeJob) => {
-    return enqueue(job);
+    try {
+      return await enqueue(job);
+    } catch (e: any) {
+      // Silently handle scraper timeouts (blocked sites, network issues).
+      // The renderer already has .catch(() => null) on every scrape call;
+      // we just prevent Electron from logging a noisy "Error occurred in
+      // handler" every time an ISP blocks anime4up or a CDN mirror.
+      return null;
+    }
   });
 
   // Mute / unmute the main window's audio. The renderer calls this
@@ -1137,6 +1245,9 @@ app.whenReady().then(() => {
       if (opts.provider === "videa") {
         return await extractVidea(opts.iframeUrl);
       }
+      if (opts.provider === "streamwish") {
+        return await extractStreamwish(opts.iframeUrl);
+      }
     } catch (e) {
       console.warn("[direct-extract] failed:", e);
     }
@@ -1151,6 +1262,13 @@ app.whenReady().then(() => {
 
   // Kept for backwards compatibility; no-op now that we proxy.
   ipcMain.handle("pantoufa:set-video-referer", () => true);
+
+  // Track which iframe the renderer is currently watching so did-fail-load
+  // can ignore sub-resource failures (ad iframes inside embed pages) and
+  // only fast-advance when the actual embed iframe fails.
+  ipcMain.handle("pantoufa:set-active-iframe", (_evt, url: string | null) => {
+    activeIframeUrl = url;
+  });
 
   ipcMain.handle("pantoufa:install-update", () => {
     try { autoUpdater.quitAndInstall(); return true; } catch { return false; }

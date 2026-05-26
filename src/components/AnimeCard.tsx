@@ -58,7 +58,7 @@ export function EpisodeCard({
       onClick={() => onOpen(episode)}
       className="group block w-full text-start"
     >
-      <div className="relative aspect-video overflow-hidden rounded-lg bg-surface">
+      <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface">
         {episode.image ? (
           <img
             src={episode.image}

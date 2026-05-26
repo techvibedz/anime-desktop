@@ -4,7 +4,7 @@ import { fetchHome, type HomeSection, type FeaturedItem, type AnimeItem, type Ep
 import { AnimeCard, EpisodeCard } from "../components/AnimeCard";
 import { EpisodeActionModal } from "../components/EpisodeActionModal";
 import { Shimmer } from "../components/Shimmer";
-import { getHistory, type WatchEntry } from "../lib/history";
+import { getHistory, removeFromHistory, type WatchEntry } from "../lib/history";
 import { t } from "../lib/i18n";
 
 export function HomePage() {
@@ -21,7 +21,7 @@ export function HomePage() {
     fetchHome()
       .then((r) => {
         setFeatured(r.data.featured);
-        setSections(r.data.sections);
+        setSections(r.data.sections.filter((s) => s.id !== "tv_series"));
       })
       .catch((e) => setError(e?.message ?? t.failedToLoad))
       .finally(() => setLoading(false));
@@ -118,6 +118,20 @@ export function HomePage() {
                 className="group block"
               >
                 <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface">
+                  <button
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      removeFromHistory(w.episodeHref);
+                      setHistory((prev) => prev.filter((h) => h.episodeHref !== w.episodeHref));
+                    }}
+                    className="absolute end-1 top-1 z-10 flex h-6 w-6 items-center justify-center rounded-full bg-black/60 text-white/70 backdrop-blur-sm transition hover:bg-red-600 hover:text-white"
+                    title="Remove"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                      <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                    </svg>
+                  </button>
                   {w.image ? (
                     <img src={w.image} alt={w.animeTitle || w.episodeTitle} className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105" loading="lazy" />
                   ) : (
@@ -192,8 +206,8 @@ function Section({
           ))}
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
-          {(section.items as EpisodeItem[]).slice(0, 8).map((it) => (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
+          {(section.items as EpisodeItem[]).slice(0, 12).map((it) => (
             <EpisodeCard key={it.href} episode={it} onOpen={onOpenEpisode} />
           ))}
         </div>
