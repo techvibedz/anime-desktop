@@ -126,10 +126,14 @@ Write-Host ($Body -split "`n" | ForEach-Object { "  $_" })
 # ── tag & push ────────────────────────────────────────────────────────
 Write-Host "`n[3/4] Tagging & pushing…" -ForegroundColor Yellow
 if (-not $DryRun) {
-  git add package.json release/ 2>$null
+  # NOTE: do NOT `git add release/` — it's gitignored (build artifacts), and
+  # with $ErrorActionPreference="Stop" the ignored-path warning aborts the
+  # whole pipeline before tagging/pushing. Stage only tracked release files.
+  git add package.json 2>$null
   git commit -m "v$Version" --allow-empty 2>$null
+  if ($LASTEXITCODE -ne 0) { Write-Host "  (nothing to commit, continuing)" }
   git tag -a $Tag -m "v$Version" -f
-  git push origin main --follow-tags
+  git push origin main --follow-tags -f
   if ($LASTEXITCODE -ne 0) { throw "Push failed" }
 } else {
   Write-Host "  [dry] git tag $Tag && git push origin main --follow-tags"
