@@ -310,20 +310,30 @@ export async function searchAnime4upDirect(title: string): Promise<string | null
   return best.score >= 34 ? best.url : null;
 }
 
-function up4EpisodeNumber(href: string): number | null {
+// Episode number for an anime4up link. The URL slug is NOT reliable: anime4up
+// uses random hash slugs (…-الحلقة-wtgjd/), so the number must come from the
+// anchor's title attribute ("… الحلقة 20"). Falls back to the slug only when a
+// title number is unavailable (older pages embed the number in the URL).
+function up4EpisodeNumber(href: string, title?: string): number | null {
+  // Prefer the human-readable episode number from the title attribute.
+  if (title) {
+    const tm = title.match(/الحلقة\s*(\d+)/) || title.match(/\bepisode\s*(\d+)/i) || title.match(/\bep\s*(\d+)/i);
+    if (tm) return parseInt(tm[1], 10);
+  }
   if (!href) return null;
   try {
     const d = decodeURIComponent(href);
-    const m = d.match(/الحلقة[\s-]*(\d+)/);
+    // Only trust a URL number when it directly follows الحلقة (…-الحلقة-21-…).
+    // A bare trailing -\d+ would wrongly match hash slugs, so don't use it.
+    const m = d.match(/الحلقة[\s-]+(\d+)\b/);
     if (m) return parseInt(m[1], 10);
-    const slug = d.replace(/\/$/, "").split("/").pop() || "";
-    const tail = slug.match(/-(\d+)(?:[-/].*)?$/);
-    if (tail) return parseInt(tail[1], 10);
   } catch {}
   return null;
 }
 
 // Parse an anime4up anime page's episode list straight from static HTML.
+// Captures the full <a> tag so we can read the episode number from its title
+// attribute (the URL hash slug carries no reliable number).
 export async function scrapeAnime4upEpisodesDirect(
   animeUrl: string,
 ): Promise<{ title: string; number: number; type: string; screenshot: string; href: string }[]> {
@@ -331,14 +341,21 @@ export async function scrapeAnime4upEpisodesDirect(
   if (!html) return [];
   const out: { title: string; number: number; type: string; screenshot: string; href: string }[] = [];
   const seen = new Set<string>();
-  const re = /<a[^>]*href=["']([^"']*\/episode\/[^"']+)["']/gi;
+  // Match an episode anchor and grab the whole opening tag so title= (which may
+  // appear before OR after href=) is in scope.
+  const re = /<a\b([^>]*\bhref=["'][^"']*\/episode\/[^"']+["'][^>]*)>/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(html))) {
-    let href = (m[1] || "").trim();
+    const tag = m[1] || "";
+    const hrefM = tag.match(/\bhref=["']([^"']+)["']/i);
+    if (!hrefM) continue;
+    let href = (hrefM[1] || "").trim();
     if (!href) continue;
     if (href.indexOf("http") !== 0) href = href.indexOf("//") === 0 ? "https:" + href : UP4_BASE + (href.charAt(0) === "/" ? "" : "/") + href;
     if (seen.has(href)) continue;
-    const num = up4EpisodeNumber(href);
+    const titleM = tag.match(/\btitle=["']([^"']*)["']/i);
+    const title = titleM ? titleM[1] : undefined;
+    const num = up4EpisodeNumber(href, title);
     if (num == null) continue;
     seen.add(href);
     out.push({ title: "الحلقة " + num, number: num, type: "", screenshot: "", href });
