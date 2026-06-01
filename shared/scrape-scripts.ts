@@ -356,48 +356,77 @@ return { episodes: episodes };
 /* ── TITLE MATCH (cross-source) ───────────────── */
 
 export const EXTRACT_TITLE_MATCH = (want: string) => `(async function(){${HELPERS}
-function norm(s) {
-  // Keep Arabic characters too — they often carry the discriminating
-  // information (e.g. "كيمي نو نا وا" vs "كيمي نو نا" partial matches).
+var WANT = ${JSON.stringify(want)};
+// Season number from a title — handles latin (season/s/part/cour) and
+// arabic (الموسم/الجزء) with arabic-indic digits. Defaults to 1.
+function seasonNum(s) {
+  s = (s || '').toLowerCase();
+  var m = s.match(/\\b(?:season|s|part|cour)\\s*(\\d+)\\b/) || s.match(/الموسم\\s*([\\u0660-\\u0669\\d]+)/) || s.match(/الجزء\\s*([\\u0660-\\u0669\\d]+)/);
+  if (!m) return 1;
+  var n = m[1].replace(/[\\u0660-\\u0669]/g, function (d) { return String(d.charCodeAt(0) - 0x0660); });
+  var v = parseInt(n, 10);
+  return isNaN(v) ? 1 : v;
+}
+// Latin normalization: drop season noise + filler particles so the
+// discriminating franchise words dominate the overlap score.
+function normLatin(s) {
   return String(s || '').toLowerCase()
-    .replace(/\\b(season|s|part|cour|الموسم|الجزء)\\s*\\d+\\b/g, '')
-    .replace(/[\\(\\[][^\\)\\]]*[\\)\\]]/g, '')
-    .replace(/[^a-z0-9\\u0600-\\u06FF ]+/g, ' ')
+    .replace(/\\b(?:season|s|part|cour)\\s*\\d+\\b/g, ' ')
+    .replace(/\\b(?:the|a|an|of|to|wa|no|wo|ga|ni)\\b/g, ' ')
+    .replace(/[^a-z0-9 ]+/g, ' ')
     .replace(/\\s+/g, ' ').trim();
 }
-function tokens(s, minLen) {
-  return s.split(' ').filter(function (w) { return w.length >= (minLen || 2); });
+// Arabic normalization: strip tashkeel, unify alef/teh-marbuta/alef-maqsura,
+// keep only arabic letters.
+function normArabic(s) {
+  return String(s || '')
+    .replace(/[\\u064B-\\u065F\\u0670]/g, '')
+    .replace(/[\\u0622\\u0623\\u0625]/g, '\\u0627')
+    .replace(/\\u0629/g, '\\u0647')
+    .replace(/\\u0649/g, '\\u064A')
+    .replace(/[^\\u0600-\\u06FF ]+/g, ' ')
+    .replace(/\\s+/g, ' ').trim();
+}
+function toks(s) { return s ? s.split(' ').filter(function (w) { return w.length >= 2; }) : []; }
+// Shared-token ratio against the SMALLER token set (0..1) so a short query
+// fully contained in a longer title still scores high.
+function overlap(a, b) {
+  var A = toks(a), B = toks(b);
+  if (!A.length || !B.length) return 0;
+  var setB = {}; B.forEach(function (w) { setB[w] = true; });
+  var common = 0; A.forEach(function (w) { if (setB[w]) common++; });
+  return common / Math.min(A.length, B.length);
+}
+function score(title) {
+  var latinWant = normLatin(WANT), latinGot = normLatin(title);
+  var arWant = normArabic(WANT), arGot = normArabic(title);
+  var latinOverlap = overlap(latinWant, latinGot);
+  var arabicOverlap = overlap(arWant, arGot);
+  var s = 0;
+  if (latinWant && latinGot === latinWant) s = 100;
+  else if (latinWant && latinGot.indexOf(latinWant) === 0) s = 85;
+  else if (arWant && arGot === arWant) s = 95;
+  else s = Math.round(Math.max(latinOverlap, arabicOverlap) * 75);
+  // Season agreement tie-breaker.
+  var sw = seasonNum(WANT), sg = seasonNum(title);
+  if (sw === sg) s += 8; else s -= 12;
+  return s;
 }
 var ok = await window.__pWaitFor(function () {
   return !!document.querySelector('.anime-card-container, .no-results, .search-empty');
 }, 15000);
-var want = norm(${JSON.stringify(want)});
-var wantWords = tokens(want, 2);
 var best = { url: null, score: 0 };
 document.querySelectorAll('.anime-card-container').forEach(function (el) {
-  var raw = (el.querySelector('.anime-card-title h3 a') && el.querySelector('.anime-card-title h3 a').textContent) || '';
-  var t = norm(raw);
-  var h = el.querySelector('.anime-card-poster a.overlay') && el.querySelector('.anime-card-poster a.overlay').getAttribute('href');
-  if (!h || !t) return;
-  var score = 0;
-  if (t === want) score = 100;
-  else if (t.indexOf(want) === 0 || want.indexOf(t) === 0) score = 80;
-  else {
-    var gotWords = tokens(t, 2);
-    var set = {};
-    wantWords.forEach(function (w) { set[w] = true; });
-    var common = 0;
-    gotWords.forEach(function (w) { if (set[w]) common++; });
-    // Coverage-based score: how many of the search-term words show up.
-    var coverage = wantWords.length > 0 ? (common / wantWords.length) : 0;
-    score = Math.round(coverage * 70);
-    // First-word match gets a boost (titles usually start with the franchise).
-    if (wantWords[0] && gotWords[0] === wantWords[0]) score += 15;
-  }
-  if (score > best.score) best = { url: h, score: score };
+  var titleEl = el.querySelector('.anime-card-title h3 a');
+  var hrefEl = el.querySelector('.anime-card-poster a.overlay');
+  var title = (titleEl && titleEl.textContent.trim()) || '';
+  var h = hrefEl && hrefEl.getAttribute('href');
+  if (!h || !title) return;
+  var s = score(title);
+  if (s > best.score) best = { url: h, score: s };
 });
-// Loosened threshold from 30 to 20 — better to over-match than miss entirely.
-return { url: best.score >= 20 ? best.url : null, score: best.score };
+// ~0.5 token-overlap ratio (≈37 raw) is enough to accept a cross-source match.
+return { url: best.score >= 34 ? best.url : null, score: best.score };
 })();`;
 
 /* ── VIDEO SERVERS (episode page) ─────────────── */
@@ -410,7 +439,8 @@ function provider(url) {
   if (/streamwish|hlswish|wishembed|wishfast|hgcloud|jwembed|vibuxer|audinifer|masukestin|hanerix/.test(url)) return 'streamwish';
   if (/voe\\./.test(url)) return 'voe';
   if (/share4max|megamax/.test(url)) return 'share4max';
-  if (/doodstream|dood\\./.test(url)) return 'doodstream';
+  if (/rubyvidhub|streamruby|rubystm|ruby/.test(url)) return 'streamruby';
+  if (/doodstream|dood\\.|dsvplay|d-s\\.io|vidply/.test(url)) return 'doodstream';
   if (/uqload/.test(url)) return 'uqload';
   if (/ok\\.ru/.test(url)) return 'okru';
   if (/videa\\.|vidvaita|vidit/.test(url)) return 'videa';
@@ -420,7 +450,31 @@ function provider(url) {
 function badIframe(src) {
   if (!src || src.indexOf('http') !== 0) return true;
   if (/google|facebook|pyppo|popads|disqus/.test(src)) return true;
+  // Reject malformed hosts. witanime's loadIframe() decode occasionally
+  // fails and points the iframe at "https://undefined/<encoded>", which
+  // then dies at playback with ERR_NAME_NOT_RESOLVED. A real provider host
+  // always URL-parses and contains a dot.
+  try {
+    var h = new URL(src).hostname.toLowerCase();
+    if (!h || h === 'undefined' || h === 'null' || h.indexOf('.') < 0) return true;
+  } catch (e) { return true; }
   return false;
+}
+// Normalize provider URLs to their EMBED form so they autoplay inside an
+// iframe. anime4up often stores the mp4upload WATCH-page URL
+// (https://www.mp4upload.com/CODE) in data-watch, which renders the download
+// page instead of the player — so mp4upload "doesn't work" from anime4up
+// while it works from witanime (which supplies the embed URL directly).
+function normalizeEmbed(src) {
+  try {
+    var u = new URL(src);
+    if (/mp4upload/.test(u.hostname)) {
+      if (/\\/embed-/.test(u.pathname)) return src; // already embed form
+      var m = u.pathname.match(/^\\/([a-z0-9]{8,})/i);
+      if (m) return 'https://www.mp4upload.com/embed-' + m[1] + '.html';
+    }
+  } catch (e) {}
+  return src;
 }
 
 // Fast lane: check for iframes immediately (most pages render them in the
@@ -431,8 +485,34 @@ var seen = {};
 var out = [];
 
 function collect() {
+  // anime4up servers: the embed URL lives in a data-watch attribute on
+  // each tab <li>; the live iframe is only injected by JS on click and
+  // the markup also hides copies inside inert <noscript> tags. Read the
+  // attribute directly so we capture every server without depending on
+  // click handlers firing inside the headless window. Run before the
+  // iframe pass so the default-active server keeps its real label.
+  document.querySelectorAll('#episode-servers li[data-watch], #watch-servers li[data-watch], li[data-watch]').forEach(function (li) {
+    var src = normalizeEmbed((li.getAttribute('data-watch') || '').trim());
+    if (badIframe(src) || seen[src]) return;
+    seen[src] = true;
+    // The label sits in the <a> alongside a <noscript><iframe></noscript>
+    // copy of the embed; with JS enabled the browser exposes that noscript
+    // markup as inert text, so reading textContent directly drags the whole
+    // iframe URL into the name. Strip those nodes off a clone first.
+    var a = li.querySelector('a');
+    var name = '';
+    if (a) {
+      var labelEl = a.cloneNode(true);
+      labelEl.querySelectorAll('noscript, iframe, script').forEach(function (n) {
+        if (n.parentNode) n.parentNode.removeChild(n);
+      });
+      name = (labelEl.textContent || '').replace(/\\s+/g, ' ').trim();
+    }
+    if (!name) name = 'Server ' + (out.length + 1);
+    out.push({ id: String(out.length), name: name, iframeUrl: src, provider: provider(src) });
+  });
   document.querySelectorAll('iframe').forEach(function (f) {
-    var src = (f.src || f.getAttribute('data-src') || '').trim();
+    var src = normalizeEmbed((f.src || f.getAttribute('data-src') || '').trim());
     if (badIframe(src) || seen[src]) return;
     seen[src] = true;
     out.push({ id: String(out.length), name: 'Server ' + (out.length + 1), iframeUrl: src, provider: provider(src) });
@@ -474,10 +554,26 @@ if (tabs.length > 0) {
   }
 }
 
+// Harvest a DIRECT anime4up link straight off the witanime episode page.
+// witanime often embeds the matching anime4up episode (or anime) URL in
+// the markup. Using it skips the slow cross-source title-search +
+// sibling-number-match chain entirely, so anime4up servers appear fast.
+var up4EpisodeUrl = null, up4AnimeUrl = null;
+document.querySelectorAll('a[href*="anime4up"]').forEach(function (a) {
+  var h = (a.getAttribute('href') || '').trim();
+  if (!h) return;
+  if (h.indexOf('http') !== 0) h = (h.indexOf('//') === 0 ? 'https:' : 'https://') + h.replace(/^\\/+/, '');
+  var dh = h; try { dh = decodeURIComponent(h); } catch (e) {}
+  if (/\\/episode\\/|الحلقة/.test(dh)) { if (!up4EpisodeUrl) up4EpisodeUrl = h; }
+  else if (/anime4up/.test(h) && !up4AnimeUrl) up4AnimeUrl = h;
+});
+
 return {
   servers: out,
   episodeTitle: (ep && ep.textContent.trim()) || '',
   animeTitle: (an && an.textContent.trim()) || '',
+  up4EpisodeUrl: up4EpisodeUrl,
+  up4AnimeUrl: up4AnimeUrl,
 };
 })();`;
 

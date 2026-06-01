@@ -289,6 +289,13 @@ function titleFromSlug(href: string): string {
 
 function pickUp4ForEpisode(ep: Episode, up4: Episode[]): string | null {
   if (!up4.length) return null;
+  console.info(`[anime-detail] matching witanime ep ${ep.number} (${ep.title}) against ${up4.length} anime4up episodes`);
   const match = up4.find((u) => u.number === ep.number);
+  if (match) {
+    console.info(`[anime-detail] matched to anime4up ep ${match.number} (${match.title}) → ${match.href}`);
+  } else {
+    console.warn(`[anime-detail] no match found for episode ${ep.number}`);
+    console.info(`[anime-detail] available anime4up episodes:`, up4.map(u => ({ num: u.number, title: u.title })));
+  }
   return match?.href ?? null;
 }

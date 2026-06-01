@@ -60,6 +60,18 @@ function initSlots(): Slot[] {
 
   ses.webRequest.onBeforeRequest((details, cb) => {
     const u = details.url.toLowerCase();
+    // Kill loads to invalid hosts (witanime's loadIframe() decode can fail
+    // and produce `https://undefined/...`, spamming ERR_NAME_NOT_RESOLVED).
+    if (/^https?:\/\//.test(u)) {
+      try {
+        const h = new URL(details.url).hostname.toLowerCase();
+        if (!h || h === "undefined" || h === "null" || !h.includes(".")) {
+          return cb({ cancel: true });
+        }
+      } catch {
+        return cb({ cancel: true });
+      }
+    }
     if (details.webContentsId) {
       const entry = activeJobs.get(details.webContentsId);
       if (entry && /\.m3u8(\?|$)/i.test(u)) {

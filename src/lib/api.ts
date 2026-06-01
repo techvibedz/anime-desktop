@@ -7,7 +7,11 @@ import {
   scrapeGenre,
   scrapeAllAnime,
   scrapeVideoServers,
+  scrapeAnime4upServersDirect,
+  searchAnime4upDirect,
+  scrapeAnime4upEpisodesDirect,
   findCrossSourceUrl,
+  type RawServer,
 } from "./scraper";
 
 const HOME_CACHE_KEY = "@home_cache_v1";
@@ -95,13 +99,37 @@ async function getCrossSourceUrl(title: string, primary: "witanime" | "anime4up"
   const hit = xsourceCache.get(key);
   if (hit && Date.now() - hit.ts < XSOURCE_TTL) return hit.url;
   let url: string | null = null;
+  // Fast lane: when the target is anime4up, search its static HTML directly.
+  // The headless render trips anime4up's ad redirects / JS gates and often
+  // returns an empty result (so even "One Piece" gets no cross-source match).
+  if (primary === "witanime") {
+    for (const v of searchVariants(title)) {
+      try {
+        const direct = await searchAnime4upDirect(v);
+        if (direct) { url = direct; break; }
+      } catch { /* fall through to headless */ }
+    }
+    if (url) {
+      console.info(`[cross-source] direct anime4up match for "${title}": ${url}`);
+      xsourceCache.set(key, { url, ts: Date.now() });
+      return url;
+    }
+    console.info(`[cross-source] direct search found nothing for "${title}", trying headless`);
+  }
   for (const v of searchVariants(title)) {
-    // Retry once on network failure — anime4up is intermittently
+    // Retry up to 3 times on network failure — anime4up is intermittently
     // unreachable so a single timeout shouldn't kill the lookup.
-    url = await findCrossSourceUrl(v, primary).catch(async () =>
-      new Promise<string | null>((resolve) => setTimeout(resolve, 2000))
-        .then(() => findCrossSourceUrl(v, primary).catch(() => null)),
-    );
+    // Wait 8s between retries to give the network time to recover.
+    url = await findCrossSourceUrl(v, primary).catch(async () => {
+      await new Promise((r) => setTimeout(r, 8000));
+      return findCrossSourceUrl(v, primary).catch(async () => {
+        await new Promise((r) => setTimeout(r, 8000));
+        return findCrossSourceUrl(v, primary).catch(async () => {
+          await new Promise((r) => setTimeout(r, 8000));
+          return findCrossSourceUrl(v, primary).catch(() => null);
+        });
+      });
+    });
     if (url) break;
   }
   if (!url) console.warn(`[cross-source] no match for "${title}" on ${primary === "witanime" ? "anime4up" : "witanime"}`);
@@ -143,7 +171,20 @@ export async function fetchEpisodesUp4(animeUrl: string, title: string | null, u
   if (!crossUrl) { const lookupTitle = title || titleFromSlug(animeUrl); if (lookupTitle) crossUrl = await getCrossSourceUrl(lookupTitle, "witanime").catch(() => null); }
   if (!crossUrl) return { merged: null, episodes4up: [] };
   let episodes4up: Episode[] = [];
-  try { episodes4up = (await scrapeEpisodesPage(crossUrl)).episodes; } catch {}
+  // Fast lane: parse the episode list from anime4up's static HTML. Falls back
+  // to the headless scrape (with one retry) only when the direct parse is empty.
+  try {
+    episodes4up = await scrapeAnime4upEpisodesDirect(crossUrl);
+  } catch { /* fall through */ }
+  if (episodes4up.length === 0) {
+    // Retry episode scraping once on failure — anime4up is intermittently slow
+    try {
+      episodes4up = (await scrapeEpisodesPage(crossUrl)).episodes;
+    } catch {
+      await new Promise((r) => setTimeout(r, 5000));
+      try { episodes4up = (await scrapeEpisodesPage(crossUrl)).episodes; } catch {}
+    }
+  }
   const result = { merged: { anime4up: crossUrl }, episodes4up };
   void writeCache(cacheKey, result);
   return result;
@@ -184,9 +225,19 @@ export function fetchVideoServers(episodeUrl: string, url4up?: string): Promise<
   return promise;
 }
 
+// Drop every cached server list for an episode (regardless of which
+// anime4up url was paired with it) so leaving and re-opening the episode
+// triggers a fresh scrape instead of replaying stale servers/tokens.
+export function invalidateServersCache(episodeUrl: string) {
+  const prefix = `${episodeUrl}|`;
+  for (const key of serversCache.keys()) {
+    if (key.startsWith(prefix)) serversCache.delete(key);
+  }
+}
+
 async function doFetchVideoServers(episodeUrl: string, url4up?: string) {
   const primaryIsUp4 = /anime4up/i.test(episodeUrl);
-  const primary = await scrapeVideoServers(episodeUrl).then((r) => ({ source: primaryIsUp4 ? "anime4up" as const : "witanime" as const, servers: r.servers, episodeTitle: r.episodeTitle, animeTitle: r.animeTitle })).catch(() => null);
+  const primary = await scrapeVideoServers(episodeUrl).then((r) => ({ source: primaryIsUp4 ? "anime4up" as const : "witanime" as const, servers: r.servers, episodeTitle: r.episodeTitle, animeTitle: r.animeTitle, up4EpisodeUrl: r.up4EpisodeUrl ?? null })).catch(() => null);
   const seen = new Set<string>();
   const merged: (VideoServer & { source?: string })[] = [];
   function add(arr: any[] | undefined, source: string) {
@@ -194,17 +245,79 @@ async function doFetchVideoServers(episodeUrl: string, url4up?: string) {
     for (const s of arr) { if (!s.iframeUrl || seen.has(s.iframeUrl)) continue; seen.add(s.iframeUrl); merged.push({ id: String(merged.length), name: s.name, iframeUrl: s.iframeUrl, provider: s.provider, source }); }
   }
   if (primary) add(primary.servers, primary.source);
-  return { success: true, data: { episodeTitle: primary?.episodeTitle || "", animeTitle: primary?.animeTitle || "", animeHref: "", serverCount: merged.length, servers: merged, navigation: { prev: null, next: null } } };
+  // A direct anime4up episode link harvested off the witanime page lets the
+  // watch screen enrich anime4up servers immediately, skipping the slow
+  // cross-source search. Prefer an explicit ?up4= but fall back to it.
+  const harvestedUp4 = (!primaryIsUp4 && primary?.up4EpisodeUrl && /\/episode\/|الحلقة/i.test(primary.up4EpisodeUrl)) ? primary.up4EpisodeUrl : null;
+  return { success: true, data: { episodeTitle: primary?.episodeTitle || "", animeTitle: primary?.animeTitle || "", animeHref: "", serverCount: merged.length, servers: merged, up4EpisodeUrl: harvestedUp4, navigation: { prev: null, next: null } } };
+}
+
+// Resolve the anime4up episode URL for a given anime title + episode number
+// using only direct (no-headless) HTTP fetches. This is the robust fallback
+// for the watch screen when there's no explicit ?up4= and nothing was
+// harvested off the witanime page (e.g. One Piece, where witanime carries no
+// anime4up link). Returns the matching episode URL, or null.
+const up4EpUrlCache = new Map<string, { url: string | null; ts: number }>();
+export async function resolveUp4EpisodeUrl(animeTitle: string, epNumber: number): Promise<string | null> {
+  if (!animeTitle || epNumber == null) return null;
+  const key = `${animeTitle.toLowerCase().trim()}#${epNumber}`;
+  const hit = up4EpUrlCache.get(key);
+  if (hit && Date.now() - hit.ts < UP4_CACHE_TTL) return hit.url;
+  console.info(`[up4-resolve] searching anime4up for "${animeTitle}" ep ${epNumber}`);
+  let animeUrl: string | null = null;
+  for (const v of searchVariants(animeTitle)) {
+    try {
+      animeUrl = await searchAnime4upDirect(v);
+      if (animeUrl) break;
+    } catch (e) { console.warn(`[up4-resolve] search variant "${v}" threw:`, e); }
+  }
+  if (!animeUrl) {
+    console.warn(`[up4-resolve] no anime4up anime page found for "${animeTitle}"`);
+    return null;
+  }
+  console.info(`[up4-resolve] matched anime page: ${animeUrl}`);
+  let eps: Episode[] = [];
+  try {
+    eps = await scrapeAnime4upEpisodesDirect(animeUrl);
+  } catch (e) { console.warn(`[up4-resolve] episode list fetch threw:`, e); }
+  console.info(`[up4-resolve] parsed ${eps.length} episodes from anime4up page`);
+  const match = eps.find((e) => e.number === epNumber);
+  const url = match?.href ?? null;
+  if (url) console.info(`[up4-resolve] found ep ${epNumber}: ${url}`);
+  else console.warn(`[up4-resolve] ep ${epNumber} not in anime4up list (have ${eps.length} eps)`);
+  up4EpUrlCache.set(key, { url, ts: Date.now() });
+  return url;
 }
 
 export async function enrichServersFromUp4(servers: (VideoServer & { source?: string })[], url4up: string): Promise<(VideoServer & { source?: string })[]> {
   try {
-    const r = await scrapeVideoServers(url4up);
+    console.info(`[enrich] fetching anime4up servers from: ${url4up}`);
+    // Fast lane: read the server list straight from anime4up's static HTML.
+    // The headless render trips anime4up's ad redirects / JS gates and often
+    // returns nothing, so try a direct GET first and only fall back to the
+    // headless scrape if it yields no servers.
+    let up4Servers: RawServer[] = [];
+    try {
+      up4Servers = await scrapeAnime4upServersDirect(url4up);
+      console.info(`[enrich] direct fetch found ${up4Servers.length} anime4up servers`);
+    } catch (e) {
+      console.warn(`[enrich] direct fetch failed:`, e);
+    }
+    if (up4Servers.length === 0) {
+      console.info(`[enrich] falling back to headless scrape`);
+      const r = await scrapeVideoServers(url4up);
+      console.info(`[enrich] headless found ${r.servers.length} anime4up servers`);
+      up4Servers = r.servers;
+    }
     const seen = new Set<string>(servers.map((s) => s.iframeUrl));
     const extra: (VideoServer & { source?: string })[] = [];
-    for (const s of r.servers) { if (!s.iframeUrl || seen.has(s.iframeUrl)) continue; seen.add(s.iframeUrl); extra.push({ ...s, id: `up4_${servers.length + extra.length}`, source: "anime4up" }); }
+    for (const s of up4Servers) { if (!s.iframeUrl || seen.has(s.iframeUrl)) continue; seen.add(s.iframeUrl); extra.push({ ...s, id: `up4_${servers.length + extra.length}`, source: "anime4up" }); }
+    console.info(`[enrich] added ${extra.length} new anime4up servers`);
     return [...servers, ...extra];
-  } catch { return servers; }
+  } catch (e) {
+    console.warn(`[enrich] failed to scrape anime4up:`, e);
+    return servers;
+  }
 }
 
 // ── Video resolve — iframe-hybrid path ──

@@ -33,6 +33,7 @@ declare global {
         provider: string,
         iframeUrl: string,
       ) => Promise<{ url: string; type: "hls" | "mp4" } | null>;
+      fetchHtml: (url: string, referer?: string) => Promise<string | null>;
     };
   }
 }

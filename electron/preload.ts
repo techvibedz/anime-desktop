@@ -59,4 +59,8 @@ contextBridge.exposeInMainWorld("pantoufa", {
     ipcRenderer.invoke("pantoufa:direct-extract", { provider, iframeUrl }) as Promise<
       { url: string; type: "hls" | "mp4" } | null
     >,
+  // Privileged HTML GET from the main process (no CORS). Used to read
+  // anime4up episode pages directly instead of rendering them headless.
+  fetchHtml: (url: string, referer?: string) =>
+    ipcRenderer.invoke("pantoufa:fetch-html", { url, referer }) as Promise<string | null>,
 });

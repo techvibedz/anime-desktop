@@ -2,7 +2,9 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useParams, useSearchParams, Link, useNavigate } from "react-router-dom";
 import Hls from "hls.js";
 import {
-  fetchVideoServers, enrichServersFromUp4, resolveVideo, fetchEpisodes,
+  fetchVideoServers, enrichServersFromUp4, resolveVideo, fetchEpisodes, fetchEpisodesUp4,
+  resolveUp4EpisodeUrl,
+  invalidateServersCache, invalidateResolveCache,
   type VideoServer, type Episode,
 } from "../lib/api";
 import { saveProgress, getProgress } from "../lib/history";
@@ -22,8 +24,8 @@ function setMutedSafe(muted: boolean) {
 
 const PROVIDER_RANK: Record<string, number> = {
   dailymotion: 0, streamwish: 1, videa: 2, voe: 3,
-  share4max: 4, mp4upload: 5, doodstream: 6, uqload: 7,
-  okru: 8, yonaplay: 9, vk: 10,
+  share4max: 4, streamruby: 5, mp4upload: 6, doodstream: 7,
+  uqload: 8, okru: 9, yonaplay: 10, vk: 11,
 };
 function rank(p: string) { return PROVIDER_RANK[p] ?? 50; }
 
@@ -69,6 +71,14 @@ export function WatchPage() {
   const animeParam = params.get("anime");
 
   const [servers, setServers] = useState<ServerWithSource[]>([]);
+  // Direct anime4up episode URL harvested off the witanime episode page by
+  // the server scrape. When present we enrich anime4up servers immediately,
+  // skipping the slow cross-source title-search + sibling-match chain.
+  const [harvestedUp4, setHarvestedUp4] = useState<string | null>(null);
+  // anime4up episode URL resolved directly from the anime title + episode
+  // number via no-headless HTTP fetches. This is the robust fallback when
+  // there's no ?up4= and witanime carried no anime4up link (e.g. One Piece).
+  const [directUp4, setDirectUp4] = useState<string | null>(null);
   const [meta, setMeta] = useState<{ episodeTitle: string; animeTitle: string }>({ episodeTitle: "", animeTitle: "" });
   const [activeIdx, setActiveIdx] = useState<number | null>(null);
   const [resolved, setResolved] = useState<{ url: string; type: "hls" | "mp4" | "dailymotion" | "iframe"; embed: string } | null>(null);
@@ -96,6 +106,12 @@ export function WatchPage() {
   const reextractCount = useRef(0);
   const MAX_REEXTRACTS_BEFORE_FALLBACK = 2;
   const iframeFailedRef = useRef(false);
+  // Tracks which anime4up URL we've already merged into the server list,
+  // so enrichment runs once per episode even as `servers` updates.
+  const enrichedUp4Ref = useRef<string | null>(null);
+  // Latest server embed URLs, read at cleanup time to flush their
+  // resolve-cache entries when the user leaves the episode.
+  const serverUrlsRef = useRef<string[]>([]);
 
   // Sibling episode navigation
   const [siblings, setSiblings] = useState<Episode[]>([]);
@@ -123,7 +139,10 @@ export function WatchPage() {
 
   const sortedServers = useMemo(
     () => [...servers]
-      .filter((s) => s.provider !== "generic")
+      // Hide unrecognized witanime embeds (mega.nz etc.), but always keep
+      // anime4up-sourced servers — their data-watch URLs often don't match
+      // a known provider regex yet still play fine in an iframe.
+      .filter((s) => s.provider !== "generic" || s.source === "anime4up")
       .sort((a, b) => rank(a.provider) - rank(b.provider)),
     [servers],
   );
@@ -132,24 +151,27 @@ export function WatchPage() {
   useEffect(() => {
     if (!episodeUrl) return;
     let cancelled = false;
-    // Only show the spinner on initial load (no servers yet). For
-    // prev/next navigation, keep the old server list visible while
-    // fetching in the background so the transition feels instant.
-    if (servers.length === 0) setLoadingServers(true);
+    // Clear servers when episode changes so the loading state shows
+    // properly. This prevents showing servers for the wrong episode
+    // during prev/next navigation.
+    setServers([]);
+    setHarvestedUp4(null);
+    setDirectUp4(null);
+    setLoadingServers(true);
     setServerError(false);
+    console.info(`[player] fetching servers for episode: ${episodeUrl}`);
+    console.info(`[player] up4Param: ${up4Param || 'none'}`);
     fetchVideoServers(episodeUrl, up4Param || undefined)
       .then((r) => {
         if (cancelled) return;
+        console.info(`[player] loaded ${r.data.servers.length} servers for: ${r.data.episodeTitle}`);
         setServers(r.data.servers);
+        if ((r.data as any).up4EpisodeUrl) {
+          console.info(`[player] harvested direct anime4up episode: ${(r.data as any).up4EpisodeUrl}`);
+          setHarvestedUp4((r.data as any).up4EpisodeUrl);
+        }
         setMeta({ episodeTitle: r.data.episodeTitle, animeTitle: r.data.animeTitle });
         setLoadingServers(false);
-
-        // Background enrichment from anime4up — non-blocking.
-        if (up4Param && !/anime4up/i.test(episodeUrl)) {
-          enrichServersFromUp4(r.data.servers, up4Param)
-            .then((enriched) => { if (!cancelled) setServers(enriched); })
-            .catch(() => {});
-        }
       })
       .catch((err) => {
         if (cancelled) return;
@@ -180,10 +202,106 @@ export function WatchPage() {
         setUp4Siblings(r.data.episodes4up || []);
         if (r.data.title) setAnimeTitleFromDetail(r.data.title);
         if (r.data.poster) setPosterFromDetail(r.data.poster);
+        // fetchEpisodes never resolves the anime4up cross-source list
+        // (episodes4up is always []). Resolve it here so anime4up servers
+        // can be enriched even when the watch link didn't carry ?up4=.
+        if (!/anime4up/i.test(resolvedAnimeHref)) {
+          fetchEpisodesUp4(resolvedAnimeHref, r.data.title || null, r.data.up4Hint)
+            .then((up4) => { if (!cancelled && up4.episodes4up.length) setUp4Siblings(up4.episodes4up); })
+            .catch(() => {});
+        }
       })
       .catch(() => {});
     return () => { cancelled = true; };
   }, [resolvedAnimeHref]);
+
+  // Episode number of the currently playing episode (used to match the
+  // anime4up sibling when no explicit ?up4= was supplied).
+  const currentEpNumber = useMemo(() => {
+    const m = episodeUrl.match(/الحلقة[\s\-_]*(\d+)/);
+    if (m) return parseInt(m[1], 10);
+    const byHref = siblings.find((e) => {
+      try { return decodeURIComponent(e.href || "").replace(/\/+$/, "") === decodeURIComponent(episodeUrl).replace(/\/+$/, ""); }
+      catch { return false; }
+    });
+    return byHref?.number ?? null;
+  }, [episodeUrl, siblings]);
+
+  // Effective anime4up episode URL: the explicit ?up4= if present, else
+  // the cross-source sibling matched by episode number.
+  const effectiveUp4 = useMemo(() => {
+    if (up4Param) return up4Param;
+    // Direct link harvested off the witanime page — available as soon as the
+    // servers load, so anime4up enrichment doesn't wait on the cross-source
+    // sibling lookup.
+    if (harvestedUp4) return harvestedUp4;
+    if (currentEpNumber == null) return null;
+    const sibling = up4Siblings.find((u) => u.number === currentEpNumber)?.href;
+    if (sibling) return sibling;
+    // Last resort: the URL resolved directly from the anime title + ep number.
+    return directUp4;
+  }, [up4Param, harvestedUp4, currentEpNumber, up4Siblings, directUp4]);
+
+  // Direct anime4up resolution — runs independently of the sibling chain
+  // (fetchEpisodes/fetchEpisodesUp4), which can silently fail when the
+  // anime URL is derived/guessed (e.g. One Piece, no embedded anime4up link).
+  // Only kicks in when no other source has produced an anime4up URL yet.
+  useEffect(() => {
+    if (up4Param || harvestedUp4) return;          // already have a better source
+    if (/anime4up/i.test(episodeUrl)) return;       // primary is already anime4up
+    if (currentEpNumber == null) return;            // can't match without ep number
+    if (up4Siblings.some((u) => u.number === currentEpNumber)) return; // sibling will cover it
+    const title = meta.animeTitle || animeTitleFromDetail;
+    if (!title) return;                             // wait until we know the title
+    let cancelled = false;
+    console.info(`[player] resolving anime4up directly for "${title}" ep ${currentEpNumber}`);
+    resolveUp4EpisodeUrl(title, currentEpNumber)
+      .then((url) => {
+        if (cancelled || !url) return;
+        console.info(`[player] direct anime4up episode resolved: ${url}`);
+        setDirectUp4(url);
+      })
+      .catch((e) => console.warn(`[player] direct anime4up resolution failed:`, e));
+    return () => { cancelled = true; };
+  }, [up4Param, harvestedUp4, episodeUrl, currentEpNumber, up4Siblings, meta.animeTitle, animeTitleFromDetail]);
+
+  // Reset the enrichment guard whenever the episode changes.
+  useEffect(() => { enrichedUp4Ref.current = null; }, [episodeUrl, retryServersNonce]);
+
+  // Keep the latest server URLs available to the unmount cleanup.
+  useEffect(() => { serverUrlsRef.current = servers.map((s) => s.iframeUrl); }, [servers]);
+
+  // When the user leaves an episode (navigates back/away or to another
+  // episode), drop its cached server list and per-embed resolve entries so
+  // returning re-scrapes fresh instead of replaying a stale, saved state.
+  useEffect(() => {
+    if (!episodeUrl) return;
+    return () => {
+      invalidateServersCache(episodeUrl);
+      for (const u of serverUrlsRef.current) invalidateResolveCache(u);
+    };
+  }, [episodeUrl]);
+
+  // Merge anime4up servers once an anime4up URL is known (explicit ?up4=
+  // or resolved cross-source). Runs after the primary witanime servers
+  // have loaded, and only once per episode/URL.
+  useEffect(() => {
+    if (loadingServers) return;
+    if (!effectiveUp4) return;
+    if (/anime4up/i.test(episodeUrl)) return;
+    if (enrichedUp4Ref.current === effectiveUp4) return;
+    enrichedUp4Ref.current = effectiveUp4;
+    let cancelled = false;
+    console.info(`[player] enriching with anime4up servers from: ${effectiveUp4}`);
+    enrichServersFromUp4(servers, effectiveUp4)
+      .then((enriched) => {
+        if (cancelled) return;
+        console.info(`[player] enriched to ${enriched.length} total servers`);
+        setServers(enriched);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [effectiveUp4, loadingServers, episodeUrl, servers]);
 
   // Auto-pick the highest-ranked NON-broken server (highlight only).
   useEffect(() => {
@@ -293,27 +411,6 @@ export function WatchPage() {
     const t = setTimeout(() => setIframeLoaded(true), 8000);
     return () => clearTimeout(t);
   }, [resolved]);
-
-  // Streamwish Cloudflare auto-reload: the first iframe load hits
-  // Cloudflare's JS challenge which blocks the player. Wait 10 s then
-  // reload the iframe — the CF token will be cached and the player
-  // loads instantly on the second attempt.
-  const streamwishReloaded = useRef(false);
-  useEffect(() => {
-    if (resolved?.type !== "iframe" || !iframeLoaded) return;
-    if (resolved.embed && !/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish/.test(resolved.embed)) return;
-    if (streamwishReloaded.current) return;
-    const reload = setTimeout(() => {
-      console.info("[player] streamwish auto-reload for Cloudflare");
-      streamwishReloaded.current = true;
-      setFallbackReload((n) => n + 1);
-    }, 10000);
-    return () => clearTimeout(reload);
-  }, [resolved?.url, iframeLoaded]);
-  useEffect(() => {
-    // Reset the reload flag when the embed URL changes (new server selected).
-    streamwishReloaded.current = false;
-  }, [resolved?.embed]);
 
   // Unmute the window when we swap from iframe → custom player so the
   // user hears their show, and on unmount so leaving the page doesn't
@@ -722,32 +819,19 @@ export function WatchPage() {
 
   const navTo = useCallback((ep: Episode) => {
     if (!ep.href) return;
-    // Try to find the matching anime4up URL from the pre-loaded siblings.
-    let matching4 = up4Siblings.find((u) => u.number === ep.number)?.href ?? null;
-    // Fallback: if we're currently watching an anime4up-sourced episode,
-    // derive the target up4 URL by swapping the episode path in the
-    // current up4Param — this works when anime4up was unreachable during
-    // the initial detail-page load but we have the current episode's URL.
-    if (!matching4 && up4Param) {
-      try {
-        const curUp4 = new URL(decodeURIComponent(up4Param));
-        const segments = curUp4.pathname.replace(/\/+$/, "").split("/");
-        if (segments.length >= 2) {
-          segments.pop();
-          const target = new URL(decodeURIComponent(ep.href));
-          const targetSeg = target.pathname.replace(/\/+$/, "").split("/").pop() || "";
-          segments.push(targetSeg);
-          matching4 = `${curUp4.origin}${segments.join("/")}`;
-        }
-      } catch {}
-    }
+    // Match the anime4up sibling by episode number. Do NOT try to derive
+    // the URL by slug-swapping from the current up4Param: witanime and
+    // anime4up use different episode slugs, so that yields a 404 that
+    // then poisons enrichment. If there's no number match here the
+    // destination page re-resolves it from up4Siblings on its own.
+    const matching4 = up4Siblings.find((u) => u.number === ep.number)?.href ?? null;
     const p = new URLSearchParams();
     if (matching4) p.set("up4", matching4);
     if (ep.screenshot) p.set("img", ep.screenshot);
     if (animeParam) p.set("anime", animeParam);
     const qs = p.toString();
     navigate(`/watch/${encodeURIComponent(ep.href)}${qs ? `?${qs}` : ""}`);
-  }, [up4Siblings, up4Param, animeParam, navigate]);
+  }, [up4Siblings, animeParam, navigate]);
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current; if (!v) return;

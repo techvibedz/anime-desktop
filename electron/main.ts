@@ -218,11 +218,37 @@ function createMainWindow() {
       if (!frame || frame.isDestroyed()) return;
       await frame.executeJavaScript(`
         (function(){
-          if (document.getElementById('__pa_ad_block')) return;
-          var s = document.createElement('style');
-          s.id = '__pa_ad_block';
-          s.textContent = 'div[class*="ad-"],div[id*="-ad"],div[class*="ads-"],div[id*="banner"],div[class*="popup"],div[class*="popunder"],[class*="adsby"],[class*="adsence"],[class*="ajax-ad"],[class*="sponsored"],[class*="native-ad"],[class*="promoted"],[id*="google_ads"],[id*="div-gpt-ad"],[class*="outbrain"],[class*="taboola"],[class*="mgid"],[class*="revcontent"]{display:none!important}';
-          document.head.appendChild(s);
+          if (window.__pa_adkill) return;
+          window.__pa_adkill = true;
+
+          // Hide common ad containers / overlay layers. Targets ad-specific
+          // class/id patterns only — never the player chrome itself.
+          if (!document.getElementById('__pa_ad_block')) {
+            var s = document.createElement('style');
+            s.id = '__pa_ad_block';
+            s.textContent = 'div[class*="ad-"],div[id*="-ad"],div[class*="ads-"],div[id*="banner"],div[class*="popup"],div[class*="popunder"],div[class*="modal-ad"],[class*="adsby"],[class*="adsence"],[class*="ajax-ad"],[class*="sponsored"],[class*="native-ad"],[class*="promoted"],[id*="google_ads"],[id*="div-gpt-ad"],[class*="outbrain"],[class*="taboola"],[class*="mgid"],[class*="revcontent"],ins.adsbygoogle{display:none!important}';
+            (document.head || document.documentElement).appendChild(s);
+          }
+
+          // Kill popups / popunders. Pirate embeds open an ad tab via
+          // window.open on the first click anywhere on the player. Inline
+          // players never legitimately call it, so neutralize it outright.
+          try {
+            window.open = function(){ return null; };
+            Object.defineProperty(window, 'open', { value: function(){ return null; }, writable: false, configurable: false });
+          } catch (e) {}
+
+          // Swallow the default navigation of cross-origin target=_blank
+          // anchors (the other common popunder trigger) in the capture phase.
+          // preventDefault only — we don't stopPropagation, so the player's
+          // own play handler on the same click still runs.
+          document.addEventListener('click', function (e) {
+            try {
+              var a = e.target && e.target.closest && e.target.closest('a[target="_blank"]');
+              if (!a || !a.href) return;
+              if (new URL(a.href).hostname !== location.hostname) e.preventDefault();
+            } catch (e2) {}
+          }, true);
         })();
       `).catch(() => {});
     } catch {}
@@ -1258,6 +1284,36 @@ app.whenReady().then(() => {
     if (typeof url !== "string" || !/^https?:\/\//.test(url)) return false;
     await shell.openExternal(url);
     return true;
+  });
+
+  // Privileged HTML fetch from the main process (no CORS, any port). Used to
+  // read anime4up episode pages directly: their server list lives in the
+  // static HTML (<li data-watch>), so a plain GET is far faster and more
+  // reliable than rendering the page in a headless window (which trips
+  // anime4up's ad redirects / JS gates). Returns the body text, or null.
+  ipcMain.handle("pantoufa:fetch-html", async (
+    _evt,
+    opts: { url: string; referer?: string },
+  ): Promise<string | null> => {
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 20000);
+      const res = await fetch(opts.url, {
+        signal: controller.signal,
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "ar,en;q=0.9",
+          ...(opts.referer ? { Referer: opts.referer } : {}),
+        },
+      });
+      clearTimeout(t);
+      if (!res.ok) return null;
+      return await res.text();
+    } catch {
+      return null;
+    }
   });
 
   // Kept for backwards compatibility; no-op now that we proxy.
