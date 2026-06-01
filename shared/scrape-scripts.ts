@@ -469,7 +469,12 @@ function normalizeEmbed(src) {
   try {
     var u = new URL(src);
     if (/mp4upload/.test(u.hostname)) {
-      if (/\\/embed-/.test(u.pathname)) return src; // already embed form
+      // Always force the canonical www host + embed form. A bare-host embed
+      // (https://mp4upload.com/embed-X.html) 301-redirects to www, which
+      // desyncs the iframe URL from our referer/failure tracking and renders
+      // blank — so normalize even when /embed- is already present.
+      var em = u.pathname.match(/\\/embed-([a-z0-9]+)\\.html/i);
+      if (em) return 'https://www.mp4upload.com/embed-' + em[1] + '.html';
       var m = u.pathname.match(/^\\/([a-z0-9]{8,})/i);
       if (m) return 'https://www.mp4upload.com/embed-' + m[1] + '.html';
     }

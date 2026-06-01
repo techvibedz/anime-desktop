@@ -155,14 +155,23 @@ function classifyProvider(url: string): string {
   return "generic";
 }
 
-// Normalize mp4upload watch-page URLs to their embed form so they autoplay.
+// Normalize mp4upload URLs to the canonical embed form so they autoplay.
+// anime4up hands out two broken-for-us shapes:
+//   1. watch-page URLs (https://mp4upload.com/CODE) → render the download page
+//   2. embed URLs on the bare host (https://mp4upload.com/embed-CODE.html) →
+//      301-redirect to www.mp4upload.com, so the iframe's real URL ends up on
+//      a different host than the one we tracked for referer / did-fail-load,
+//      and the embed renders blank.
+// Force https://www.mp4upload.com/embed-CODE.html in every case so the URL we
+// load, force a Referer for, and track for failure all agree.
 function normalizeEmbedUrl(src: string): string {
   try {
     const u = new URL(src);
     if (/mp4upload/.test(u.hostname)) {
-      if (/\/embed-/.test(u.pathname)) return src;
-      const m = u.pathname.match(/^\/([a-z0-9]{8,})/i);
-      if (m) return `https://www.mp4upload.com/embed-${m[1]}.html`;
+      const embedM = u.pathname.match(/\/embed-([a-z0-9]+)\.html/i);
+      if (embedM) return `https://www.mp4upload.com/embed-${embedM[1]}.html`;
+      const codeM = u.pathname.match(/^\/([a-z0-9]{8,})/i);
+      if (codeM) return `https://www.mp4upload.com/embed-${codeM[1]}.html`;
     }
   } catch {}
   return src;

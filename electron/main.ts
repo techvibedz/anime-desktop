@@ -186,12 +186,24 @@ function createMainWindow() {
   // did-fail-load and would cause false-positive fast-advances.
   mainWindow.webContents.on("did-fail-load", (_evt, _errorCode, errorDescription, validatedURL, isMainFrame) => {
     if (isMainFrame) return;
-    const url = (validatedURL || "").split("?")[0].split("#")[0];
-    const active = (activeIframeUrl || "").split("?")[0].split("#")[0];
-    if (!active || url !== active) return;
+    // Compare by host + last path segment so a provider redirect (e.g.
+    // mp4upload.com → www.mp4upload.com, or a CDN mirror swap) doesn't make
+    // the failed URL look like a different iframe and either suppress a real
+    // failure or, worse, never clear — leaving the embed blank.
+    const key = (s: string) => {
+      try {
+        const u = new URL(s);
+        const seg = u.pathname.split("/").filter(Boolean).pop() || "";
+        return `${u.hostname.replace(/^www\./, "")}/${seg}`;
+      } catch {
+        return (s || "").split("?")[0].split("#")[0];
+      }
+    };
+    if (!activeIframeUrl) return;
+    if (key(validatedURL || "") !== key(activeIframeUrl)) return;
     console.info(`[player] iframe load failed (${errorDescription}), advancing`);
     activeIframeUrl = null;
-    mainWindow?.webContents.send("pantoufa:iframe-failed", { url });
+    mainWindow?.webContents.send("pantoufa:iframe-failed", { url: validatedURL });
   });
 
   mainWindow.webContents.on("did-finish-load", () => {
