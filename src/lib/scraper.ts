@@ -222,6 +222,10 @@ function tm_seasonNum(s: string): number {
   s = (s || "").toLowerCase();
   const m =
     s.match(/\b(?:season|s|part|cour)\s*(\d+)\b/) ||
+    // Ordinal-before-keyword form: "7th Season", "2nd Part", "3rd Cour".
+    // Without this "Boku no Hero Academia 7th Season" parses as season 1
+    // and matches the wrong anime4up season page.
+    s.match(/\b(\d+)(?:st|nd|rd|th)\s+(?:season|part|cour)\b/) ||
     s.match(/الموسم\s*([٠-٩\d]+)/) ||
     s.match(/الجزء\s*([٠-٩\d]+)/);
   if (!m) return 1;
@@ -272,11 +276,21 @@ function tm_score(want: string, title: string): number {
   return s;
 }
 
-// Search anime4up for `title` via a direct GET and return the best-scoring
+// Search anime4up for `searchTitle` via a direct GET and return the best-scoring
 // anime page URL (or null). Threshold matches EXTRACT_TITLE_MATCH (>=34).
-export async function searchAnime4upDirect(title: string): Promise<string | null> {
-  if (!title) return null;
-  const url = `${UP4_BASE}/?search_param=animes&s=${encodeURIComponent(title)}`;
+//
+// `scoreTitle` is what candidates are scored against and defaults to the search
+// term. Callers that fall back to truncated search variants (e.g. "Boku no
+// Hero" for "Boku no Hero Academia 7th Season") MUST pass the full title here —
+// otherwise the season is stripped from the comparison and a different season's
+// anime page outscores the correct one, so the episode lookup later fails and
+// no anime4up servers show up.
+export async function searchAnime4upDirect(
+  searchTitle: string,
+  scoreTitle: string = searchTitle,
+): Promise<string | null> {
+  if (!searchTitle) return null;
+  const url = `${UP4_BASE}/?search_param=animes&s=${encodeURIComponent(searchTitle)}`;
   const html = await window.pantoufa.fetchHtml?.(url, UP4_BASE + "/");
   if (!html) return null;
   // anime4up cards expose the anime URL twice (overlay <a> + title <h3><a>).
@@ -288,7 +302,7 @@ export async function searchAnime4upDirect(title: string): Promise<string | null
     const href = (m[1] || "").trim();
     const cardTitle = (m[2] || "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
     if (!href || href.indexOf("/anime/") < 0 || !cardTitle) continue;
-    const s = tm_score(title, cardTitle);
+    const s = tm_score(scoreTitle, cardTitle);
     if (s > best.score) best = { url: href.indexOf("http") === 0 ? href : UP4_BASE + href, score: s };
   }
   // Fallback: if the card markup didn't match (layout drift), scan every
@@ -312,7 +326,7 @@ export async function searchAnime4upDirect(title: string): Promise<string | null
         } catch {}
       }
       if (!label) continue;
-      const s = tm_score(title, label);
+      const s = tm_score(scoreTitle, label);
       if (s > best.score) best = { url: href, score: s };
     }
   }

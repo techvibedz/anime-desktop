@@ -106,6 +106,14 @@ export function WatchPage() {
   const reextractCount = useRef(0);
   const MAX_REEXTRACTS_BEFORE_FALLBACK = 2;
   const iframeFailedRef = useRef(false);
+  // True once the active embed iframe has fired `onLoad`. After a successful
+  // load, any `did-fail-load` reported by the main process is an internal
+  // redirect / sub-navigation inside the embed (ok.ru, videa, mp4upload all
+  // re-navigate after their landing page), NOT the embed dying — so we must
+  // NOT advance to the next server. Reset to false whenever a new embed URL
+  // is mounted. This is the renderer-side counterpart to the main process
+  // ignoring ERR_ABORTED, and it hot-reloads (the main change needs a restart).
+  const iframeLoadedRef = useRef(false);
   // Tracks which anime4up URL we've already merged into the server list,
   // so enrichment runs once per episode even as `servers` updates.
   const enrichedUp4Ref = useRef<string | null>(null);
@@ -296,8 +304,19 @@ export function WatchPage() {
     enrichServersFromUp4(servers, effectiveUp4)
       .then((enriched) => {
         if (cancelled) return;
-        console.info(`[player] enriched to ${enriched.length} total servers`);
-        setServers(enriched);
+        // Merge into the LATEST state, append-only, deduped by URL. A second
+        // enrichment run (the effect re-fires when `servers` changes) can
+        // capture a stale `servers` snapshot; replacing wholesale with its
+        // result would wipe out anime4up servers an earlier run already added
+        // whenever the flaky anime4up scrape comes back short. Merging instead
+        // means no run can ever drop servers another run contributed.
+        setServers((prev) => {
+          const have = new Set(prev.map((s) => s.iframeUrl));
+          const additions = enriched.filter((s) => !have.has(s.iframeUrl));
+          if (additions.length === 0) return prev;
+          console.info(`[player] enriched: +${additions.length} anime4up servers (${prev.length + additions.length} total)`);
+          return [...prev, ...additions];
+        });
       })
       .catch(() => {});
     return () => { cancelled = true; };
@@ -334,6 +353,12 @@ export function WatchPage() {
   // Fires within ~1s vs the iframe onError which takes ~5s on some platforms.
   useEffect(() => {
     const off = window.pantoufa.onIframeFailed(({ url }) => {
+      // The embed already loaded successfully — this failure is an internal
+      // redirect/sub-navigation, not the embed dying. Keep playing.
+      if (iframeLoadedRef.current) {
+        console.info(`[player] ignoring post-load iframe failure (embed already loaded): ${url}`);
+        return;
+      }
       console.info(`[player] main process reports iframe failure, advancing: ${url}`);
       iframeFailedRef.current = true;
       advanceToNext();
@@ -346,6 +371,9 @@ export function WatchPage() {
   // embed pages) and only fast-advance for the actual embed iframe.
   useEffect(() => {
     const url = resolved?.type === "iframe" ? resolved.url : null;
+    // New embed mounting — it hasn't loaded yet, so honor did-fail-load until
+    // its onLoad fires (a genuine "can't connect" failure happens pre-load).
+    if (url) iframeLoadedRef.current = false;
     window.pantoufa.setActiveIframe(url);
   }, [resolved?.url, resolved?.type]);
 
@@ -655,10 +683,18 @@ export function WatchPage() {
       });
       hlsRef.current = hls;
     } else {
-      // mp4upload: its CDN on port 183 is too slow for the proxy's
-      // timeout/waitdog machinery. Load the signed HTTPS URL directly
-      // — the browser's native networking handles slow CDNs fine.
-      v.src = proxied;
+      // Progressive MP4. mp4upload serves a single large file over a slow,
+      // non-standard port (:183). Routing it through the proxy means the
+      // proxy buffers the WHOLE file via arrayBuffer() before returning a
+      // byte, which blows past its 15-20s watchdog → all strategies abort →
+      // 502 Bad Gateway → DEMUXER_ERROR_COULD_NOT_OPEN. Load it directly
+      // instead: Chromium's native networking streams it with Range/partial
+      // content, and the onBeforeSendHeaders interceptor still forces the
+      // canonical www.mp4upload.com Referer on the <video> media request.
+      // Other MP4 providers keep the proxy (they need its Referer/Origin
+      // strategy racing and cookie sharing).
+      const isMp4upload = /mp4upload/i.test(resolved.url);
+      v.src = isMp4upload ? resolved.url : proxied;
     }
 
     return () => {
@@ -963,6 +999,7 @@ export function WatchPage() {
                  allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
                  onLoad={() => {
                    console.info(`[player] iframe loaded: ${resolved.url}`);
+                   iframeLoadedRef.current = true;
                    setIframeLoaded(true);
                  }}
                  onError={() => {

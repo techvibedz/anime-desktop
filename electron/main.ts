@@ -105,6 +105,29 @@ function handleAuthCallbackUrl(url: string) {
 // when preceded by a dot (they're the top-level domain).
 const AD_HOST_RE = /doubleclick|googletagmanager|google-analytics|googleadservices|googlesyndication|adservice\.google|adnxs|facebook\.com\/tr|pixel\.facebook|popads|popcash|popmyads|popunder|propeller|propellerads|trafficjunky|adsterra|hilltopads|onclkds|onclickbid|onclickpredictiv|exoclick|magsrv|tsyndicate|clickadu|adcash|ad-maven|admaven|adsupply|servedbyadbutler|mgid|revcontent|adskeeper|trustedclicks|outbrain|taboola|etymonstheine|savorsaveragereaudit|offletsoroche|horizonungyve|visageagar|protrafficinspector|spendsdetachment|\.(?:cfd|cyou|life|shop|sbs|quest|buzz|top|ooo|live|today|icu|site|click|link|bid|trade|webcam|date|download|party|review|science|stream|racing|accountant|win|men|loan|faith|gdn)$/i;
 
+// Canonical Referer/Origin a provider's embed expects, keyed by hostname.
+// Used both for proxy fetches AND (critically) for the embed iframe's own
+// FRAME navigation: in a packaged build the app loads from file://, so
+// Chromium sends NO Referer when the embed iframe navigates. mp4upload,
+// ok.ru, voe, dood, etc. anti-hotlink by rendering a BLACK player when
+// document.referrer is empty — forging the provider's own domain as the
+// frame Referer makes the embed believe it's hosted on the provider's site.
+function providerRefererForHost(host: string): { referer: string; origin: string } | null {
+  host = (host || "").toLowerCase();
+  if (/mp4upload/.test(host)) return { referer: "https://www.mp4upload.com/", origin: "https://www.mp4upload.com" };
+  if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(host)) return { referer: "https://streamwish.to/", origin: "https://streamwish.to" };
+  if (/voe\./.test(host)) return { referer: "https://voe.sx/", origin: "https://voe.sx" };
+  if (/dood/.test(host)) return { referer: "https://dood.li/", origin: "https://dood.li" };
+  if (/uqload/.test(host)) return { referer: "https://uqload.io/", origin: "https://uqload.io" };
+  if (/share4max|megamax/.test(host)) return { referer: "https://share4max.com/", origin: "https://share4max.com" };
+  if (/videa|vidvaita|vidit/.test(host)) return { referer: "https://videa.hu/", origin: "https://videa.hu" };
+  if (/streamruby|rubyvidhub|rubystm|ruby/.test(host)) return { referer: "https://streamruby.com/", origin: "https://streamruby.com" };
+  if (/ok\.ru|odnoklassniki/.test(host)) return { referer: "https://ok.ru/", origin: "https://ok.ru" };
+  if (/vk\.com|vkvideo/.test(host)) return { referer: "https://vk.com/", origin: "https://vk.com" };
+  if (/dailymotion|dmcdn/.test(host)) return { referer: "https://www.dailymotion.com/", origin: "https://www.dailymotion.com" };
+  return null;
+}
+
 function createMainWindow() {
   // Resolve the bundled icon — packaged app reads from resources/build/, dev reads from ../../build/.
   const iconExt = process.platform === "win32" ? "ico" : "png";
@@ -184,8 +207,16 @@ function createMainWindow() {
   // (which fires ~5s later on some platforms). Only trigger for the
   // ACTIVE iframe URL — ad sub-frames inside the embed page also fire
   // did-fail-load and would cause false-positive fast-advances.
-  mainWindow.webContents.on("did-fail-load", (_evt, _errorCode, errorDescription, validatedURL, isMainFrame) => {
+  mainWindow.webContents.on("did-fail-load", (_evt, errorCode, errorDescription, validatedURL, isMainFrame) => {
     if (isMainFrame) return;
+    // ERR_ABORTED (-3) is NOT a failure — it fires when a load is superseded
+    // by a redirect or a fresh navigation inside the same frame. ok.ru and
+    // videa embeds load their landing page and then immediately redirect /
+    // re-navigate internally, so they hit did-fail-load with -3 milliseconds
+    // after onLoad. Treating that as a failure ripped the working embed out
+    // and advanced to the next server (the "loads then goes black" symptom).
+    // Only advance on genuine network failures (timeouts, DNS, refused, etc.).
+    if (errorCode === -3) return;
     // Compare by host + last path segment so a provider redirect (e.g.
     // mp4upload.com → www.mp4upload.com, or a CDN mirror swap) doesn't make
     // the failed URL look like a different iframe and either suppress a real
@@ -449,46 +480,252 @@ async function extractDailymotion(
   return null;
 }
 
-async function extractVidea(
+// Generic headless capture. Loads the embed in an offscreen window with the
+// fetch/XHR/video-tag hooks armed (VIDEO_HOOK_INSTALL) and returns the first
+// real .m3u8/.mp4 the player asks for. Works for EVERY provider whose player
+// requests a URL ending in .m3u8/.mp4 — streamwish, videa, voe, share4max,
+// streamruby, uqload all qualify. Providers whose CDN URLs carry no file
+// extension (ok.ru/mycdn.me, doodstream tokens, vk) are NOT captured here and
+// need a dedicated extractor or the iframe fallback.
+async function extractViaCapture(
   iframeUrl: string,
+  label: string,
+  timeoutMs = 30000,
 ): Promise<{ url: string; type: "hls" | "mp4" } | null> {
   try {
     const result = await enqueue({
       url: iframeUrl,
       injectBefore: VIDEO_HOOK_INSTALL,
       injectAfter: EXTRACT_VIDEO_URL,
-      timeoutMs: 25000,
+      timeoutMs,
       isVideoJob: true,
     });
     if (result?.url) {
+      console.info(`[${label}] capture hit → ${result.url}`);
       return { url: result.url, type: result.url.includes(".m3u8") ? "hls" : "mp4" };
     }
+    console.warn(`[${label}] capture found nothing`);
     return null;
   } catch (e) {
-    console.warn("[extractVidea] scraper failed:", e);
+    console.warn(`[${label}] capture failed:`, e);
     return null;
   }
 }
 
-async function extractStreamwish(
+async function extractVidea(iframeUrl: string) {
+  return extractViaCapture(iframeUrl, "extractVidea", 25000);
+}
+
+async function extractStreamwish(iframeUrl: string) {
+  // Cloudflare challenge can take longer.
+  return extractViaCapture(iframeUrl, "extractStreamwish", 35000);
+}
+
+// ok.ru can't be captured by the generic hook: its stream URLs come off
+// *.mycdn.me with NO .mp4/.m3u8 extension (…/?expires=…&type=4), so the
+// fetch/XHR hook's isVideo() regex never matches. Instead, ok.ru inlines the
+// whole player config in a `data-options` attribute whose `flashvars.metadata`
+// is (sometimes double-encoded) JSON carrying an `hlsManifestUrl` and a
+// `videos` array of progressive MP4s. Fetch the embed HTML and parse it.
+async function extractOkru(
   iframeUrl: string,
 ): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+  // Normalize to the canonical embed form (works for /video/ and /videoembed/).
+  let embedUrl = iframeUrl;
+  const idM = iframeUrl.match(/(?:videoembed|video)\/(\d+)/);
+  if (idM) embedUrl = `https://ok.ru/videoembed/${idM[1]}`;
+
+  let html = "";
+  try {
+    const resp = await session.defaultSession.fetch(embedUrl, {
+      method: "GET",
+      headers: {
+        "User-Agent": VIDEO_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://ok.ru/",
+        "Origin": "https://ok.ru",
+        "X-Pantoufa-Proxy": "1",
+      },
+      redirect: "follow",
+      cache: "no-store",
+    });
+    console.info(`[extractOkru] GET ${embedUrl} → ${resp.status}`);
+    if (resp.ok) html = await resp.text();
+  } catch (e) {
+    console.warn("[extractOkru] HTML fetch failed:", e);
+  }
+
+  if (html) {
+    // Recover the `data-options` JSON: HTML-entity-decode, then parse. The
+    // metadata field is itself a JSON string (occasionally double-escaped).
+    const decode = (s: string) =>
+      s
+        .replace(/&quot;/g, '"')
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&#92;/g, "\\")
+        .replace(/\\u0026/g, "&");
+    try {
+      // The data-options attribute uses double quotes with &quot; entities for
+      // its inner JSON, so everything up to the closing literal " is the value.
+      const optM = html.match(/data-options="([^"]*)"/) || html.match(/data-options='([^']*)'/);
+      let metaRaw: unknown = null;
+      if (optM) {
+        const opts = JSON.parse(decode(optM[1]));
+        metaRaw = opts?.flashvars?.metadata ?? null;
+      }
+      // Fallback: pull the metadata JSON string directly if data-options
+      // didn't parse (some layouts inline metadata in a separate script).
+      if (!metaRaw) {
+        const mm = html.match(/"metadata"\s*:\s*"((?:\\.|[^"\\])*)"/);
+        if (mm) metaRaw = decode(mm[1]).replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+      }
+      if (metaRaw) {
+        const meta = typeof metaRaw === "string" ? JSON.parse(metaRaw) : metaRaw;
+        const hls: string | undefined = meta?.hlsManifestUrl || meta?.hlsMasterPlaylistUrl;
+        if (hls) {
+          console.info(`[extractOkru] hls manifest → ${hls}`);
+          return { url: hls, type: "hls" };
+        }
+        const videos: Array<{ name?: string; url?: string }> = Array.isArray(meta?.videos) ? meta.videos : [];
+        // ok.ru orders videos low→high; prefer the highest progressive MP4.
+        const rankName: Record<string, number> = { mobile: 0, lowest: 1, low: 2, sd: 3, hd: 4, full: 5, quad: 6, ultra: 7 };
+        const best = videos
+          .filter((v) => v?.url)
+          .sort((a, b) => (rankName[b.name || ""] ?? 0) - (rankName[a.name || ""] ?? 0))[0];
+        if (best?.url) {
+          const url = best.url.startsWith("//") ? "https:" + best.url : best.url;
+          console.info(`[extractOkru] mp4 (${best.name}) → ${url}`);
+          return { url, type: "mp4" };
+        }
+      }
+    } catch (e) {
+      console.warn("[extractOkru] parse failed:", e);
+    }
+    console.info("[extractOkru] no stream URL in HTML");
+  }
+  return null;
+}
+
+// Dean Edwards / p.a.c.k.e.r de-obfuscator. mp4upload wraps its player
+// config (including the real .mp4 URL) in an eval(function(p,a,c,k,e,d){…})
+// blob; un-pack it so the URL regexes below can see the source.
+function unpackPacked(source: string): string {
+  // eval(function(p,a,c,k,e,d){…}('PAYLOAD',RADIX,COUNT,'k1|k2|…'.split('|'),0,{}))
+  const m = source.match(
+    /\}\s*\(\s*'((?:\\.|[^'\\])*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'((?:\\.|[^'\\])*)'\s*\.split\(\s*'\|'\s*\)/,
+  );
+  if (!m) return source;
+  let payload = m[1].replace(/\\'/g, "'").replace(/\\\\/g, "\\");
+  const radix = parseInt(m[2], 10);
+  let count = parseInt(m[3], 10);
+  const keywords = m[4].split("|");
+  const toBase = (n: number): string =>
+    (n < radix ? "" : toBase(Math.floor(n / radix))) +
+    ((n = n % radix) > 35 ? String.fromCharCode(n + 29) : n.toString(36));
+  while (count--) {
+    if (keywords[count]) {
+      payload = payload.replace(
+        new RegExp("\\b" + toBase(count) + "\\b", "g"),
+        keywords[count],
+      );
+    }
+  }
+  return payload;
+}
+
+// Pull the real .mp4 URL straight out of mp4upload's embed page from the
+// main process, the same way we do for dailymotion/videa/streamwish. The
+// renderer then plays it in the native <video> element via the proxy
+// (which already forces the canonical www.mp4upload.com Referer and the
+// bytes=0- Range retry the CDN needs). This bypasses the embed iframe
+// entirely — the iframe renders a black player because, loaded from
+// file://, document.referrer is empty and mp4upload anti-hotlinks it.
+async function extractMp4upload(
+  iframeUrl: string,
+): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+  // Force the canonical www host + embed form (matches normalizeEmbedUrl in
+  // the renderer) so the page returns the player, not the download page.
+  let embedUrl = iframeUrl;
+  try {
+    const u = new URL(iframeUrl);
+    const code =
+      u.pathname.match(/\/embed-([a-z0-9]+)\.html/i)?.[1] ||
+      u.pathname.match(/^\/([a-z0-9]{8,})/i)?.[1];
+    if (code) embedUrl = `https://www.mp4upload.com/embed-${code}.html`;
+  } catch {}
+
+  // ── Strategy 1: cheap server-side HTML fetch + un-pack ──
+  let html = "";
+  try {
+    const resp = await session.defaultSession.fetch(embedUrl, {
+      method: "GET",
+      headers: {
+        "User-Agent": VIDEO_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.mp4upload.com/",
+        "Origin": "https://www.mp4upload.com",
+        // Marker so onBeforeSendHeaders leaves our Referer alone (see handler).
+        "X-Pantoufa-Proxy": "1",
+      },
+      redirect: "follow",
+      cache: "no-store",
+    });
+    console.info(`[extractMp4upload] GET ${embedUrl} → ${resp.status}`);
+    if (resp.ok) html = await resp.text();
+  } catch (e) {
+    console.warn("[extractMp4upload] HTML fetch failed:", e);
+  }
+
+  if (html) {
+    const haystacks = [html];
+    if (/eval\(function\(p,a,c,k,e,d\)/.test(html)) {
+      try { haystacks.push(unpackPacked(html)); } catch {}
+    }
+    const patterns = [
+      /player\.src\(\s*["']([^"']+\.mp4[^"']*)["']/i,
+      /(?:file|src)\s*:\s*["']([^"']+\.mp4[^"']*)["']/i,
+      /<source[^>]+src\s*=\s*["']([^"']+\.mp4[^"']*)["']/i,
+      /(https?:\/\/[^"'\s\\]+mp4upload\.com[^"'\s\\]*\.mp4[^"'\s\\]*)/i,
+      /(https?:\/\/[^"'\s\\]+\.mp4[^"'\s\\]*)/i,
+    ];
+    for (const text of haystacks) {
+      for (const re of patterns) {
+        const url = text.match(re)?.[1];
+        if (url && !/sample[-_.]|placeholder|bigbuckbunny|tos\.mp4/i.test(url)) {
+          console.info(`[extractMp4upload] HTML unpack hit → ${url}`);
+          return { url, type: "mp4" };
+        }
+      }
+    }
+    console.info("[extractMp4upload] HTML unpack found no .mp4, trying headless capture");
+  }
+
+  // ── Strategy 2: headless capture (same engine streamwish uses) ──
+  // Loads the embed in an offscreen BrowserWindow so the player JS runs and
+  // actually requests its tokenized .mp4 — the VIDEO_HOOK captures that URL.
+  // Handles cases where the URL is computed at runtime / behind a gate the
+  // static HTML scan can't see.
   try {
     const result = await enqueue({
-      url: iframeUrl,
+      url: embedUrl,
       injectBefore: VIDEO_HOOK_INSTALL,
       injectAfter: EXTRACT_VIDEO_URL,
-      timeoutMs: 35000, // Cloudflare challenge can take longer
+      timeoutMs: 30000,
       isVideoJob: true,
     });
     if (result?.url) {
+      console.info(`[extractMp4upload] headless capture hit → ${result.url}`);
       return { url: result.url, type: result.url.includes(".m3u8") ? "hls" : "mp4" };
     }
-    return null;
+    console.warn("[extractMp4upload] headless capture found nothing");
   } catch (e) {
-    console.warn("[extractStreamwish] scraper failed:", e);
-    return null;
+    console.warn("[extractMp4upload] headless capture failed:", e);
   }
+  return null;
 }
 
 function registerVideoProxy() {
@@ -557,6 +794,12 @@ function registerVideoProxy() {
         } else if (/share4max|megamax/.test(host)) {
           ref = "https://share4max.com/";
           ori = "https://share4max.com";
+        } else if (/streamruby|rubyvidhub|rubystm|ruby/.test(host)) {
+          ref = "https://streamruby.com/";
+          ori = "https://streamruby.com";
+        } else if (/ok\.ru|odnoklassniki|mycdn\.me/.test(host)) {
+          ref = "https://ok.ru/";
+          ori = "https://ok.ru";
         } else if (/videa|vidvaita|vidit/.test(host)) {
           ref = "https://videa.hu/";
           ori = "https://videa.hu";
@@ -613,6 +856,14 @@ function registerVideoProxy() {
     }
     if (/share4max|megamax/.test(host)) {
       return { referer: "https://share4max.com/", origin: "https://share4max.com" };
+    }
+    if (/streamruby|rubyvidhub|rubystm|ruby/.test(host)) {
+      return { referer: "https://streamruby.com/", origin: "https://streamruby.com" };
+    }
+    // ok.ru streams from *.mycdn.me, which whitelists the ok.ru embed Referer
+    // (not its own CDN domain). Extracted ok.ru mp4/hls plays via this proxy.
+    if (/ok\.ru|odnoklassniki|mycdn\.me/.test(host)) {
+      return { referer: "https://ok.ru/", origin: "https://ok.ru" };
     }
     if (/videa|vidvaita|vidit/.test(host)) {
       return { referer: "https://videa.hu/", origin: "https://videa.hu" };
@@ -1171,7 +1422,32 @@ app.whenReady().then(() => {
       // media). Never touch mainFrame/subFrame navigations — the iframe
       // needs to load the embed page with its native Referer chain.
       const rt = (details as any).resourceType;
-      if (rt === "mainFrame" || rt === "subFrame") {
+      // Our own app frame — never touch.
+      if (rt === "mainFrame") {
+        callback({ requestHeaders: details.requestHeaders });
+        return;
+      }
+      // Embed iframe navigation (mp4upload, ok.ru, voe, dood, uqload, …). In a
+      // packaged build the parent app origin is file://, so Chromium sends no
+      // Referer here and the provider renders a BLACK player. Force the
+      // provider's canonical domain as the frame Referer so the embed plays.
+      // We strip any pre-existing file://-/localhost-derived Referer/Origin
+      // first so the forged value is the one the provider sees.
+      if (rt === "subFrame") {
+        try {
+          const fhost = new URL(details.url).hostname.toLowerCase();
+          const pr = providerRefererForHost(fhost);
+          if (pr) {
+            const fhdrs = details.requestHeaders;
+            for (const k of Object.keys(fhdrs)) {
+              const lk = k.toLowerCase();
+              if (lk === "referer" || lk === "origin") delete fhdrs[k];
+            }
+            fhdrs["Referer"] = pr.referer;
+            callback({ requestHeaders: fhdrs });
+            return;
+          }
+        } catch {}
         callback({ requestHeaders: details.requestHeaders });
         return;
       }
@@ -1189,9 +1465,20 @@ app.whenReady().then(() => {
         );
         let ref = "";
         let ori = "";
+        // `force` = override the Referer even if the request already carries
+        // one. The mp4upload direct-play path loads the raw .mp4 in a native
+        // <video> (NOT through the proxy or an iframe), so the request inherits
+        // the app's own file://-/localhost Referer — which mp4upload's CDN
+        // rejects with 403, leaving a black player. Only-when-missing injection
+        // silently kept that wrong Referer. Every OTHER provider's requests
+        // originate inside their embed iframe (correct natural Referer) or go
+        // through the proxy, so we leave those only-when-missing to avoid
+        // clobbering a working full-path embed Referer.
+        let force = false;
         if (/mp4upload/.test(host)) {
           ref = "https://www.mp4upload.com/";
           ori = "https://www.mp4upload.com";
+          force = true;
         } else if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(host)) {
           ref = "https://streamwish.to/";
           ori = "https://streamwish.to";
@@ -1213,17 +1500,25 @@ app.whenReady().then(() => {
         } else if (/dailymotion|dmcdn/.test(host)) {
           ref = "https://www.dailymotion.com/";
           ori = "https://www.dailymotion.com";
+        } else if (/ok\.ru|odnoklassniki|mycdn\.me/.test(host)) {
+          // ok.ru streams its video from *.mycdn.me, which expects the
+          // ok.ru embed Referer — not its own CDN domain.
+          ref = "https://ok.ru/";
+          ori = "https://ok.ru";
         } else if (!AD_HOST_RE.test(host) && host.includes(".") && !/^\d+\.\d+/.test(host)) {
-          // Is this request originating from a streamwish embed iframe?
-          // If so, inject the canonical streamwish.to Referer regardless
-          // of the CDN mirror's actual hostname. This fixes black screens
-          // when streamwish rotates to new CDN mirrors like cybervynx.com
-          // or ghbrisk.com that aren't in any static regex.
+          // Sub-resource on a CDN host that doesn't match any provider regex
+          // (e.g. a rotating streamwish/voe mirror, or ok.ru's mycdn.me). Use
+          // the EMBED FRAME's origin to pick the canonical Referer the CDN
+          // expects, so token/segment requests aren't rejected (the classic
+          // "loads then goes black" symptom on rotating mirrors).
           let frameOrigin = "";
           try { frameOrigin = ((details as any).frame?.origin || "").toLowerCase(); } catch {}
-          if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish/.test(frameOrigin)) {
-            ref = "https://streamwish.to/";
-            ori = "https://streamwish.to";
+          let frameHost = "";
+          try { frameHost = new URL(frameOrigin).hostname.toLowerCase(); } catch {}
+          const fromFrame = frameHost ? providerRefererForHost(frameHost) : null;
+          if (fromFrame) {
+            ref = fromFrame.referer;
+            ori = fromFrame.origin;
           } else {
             // Generic fallback: root-domain Referer for any non-ad host.
             const root = host.split(".").slice(-2).join(".");
@@ -1231,7 +1526,16 @@ app.whenReady().then(() => {
             ori = `https://${root}`;
           }
         }
-        if (!hasReferer && ref) {
+        if (ref && (force || !hasReferer)) {
+          if (force) {
+            // Drop any inherited Referer/Origin (any casing) first so we don't
+            // emit a duplicate header — Chromium may have set "Referer" while
+            // we'd add "referer", and the CDN could read the wrong one.
+            for (const k of Object.keys(hdrs)) {
+              const lk = k.toLowerCase();
+              if (lk === "referer" || lk === "origin") delete hdrs[k];
+            }
+          }
           hdrs["Referer"] = ref;
           hdrs["Origin"] = ori;
         }
@@ -1285,6 +1589,25 @@ app.whenReady().then(() => {
       }
       if (opts.provider === "streamwish") {
         return await extractStreamwish(opts.iframeUrl);
+      }
+      if (opts.provider === "mp4upload") {
+        return await extractMp4upload(opts.iframeUrl);
+      }
+      if (opts.provider === "okru") {
+        return await extractOkru(opts.iframeUrl);
+      }
+      // Providers whose player requests a real .m3u8/.mp4 URL — the generic
+      // headless capture engine pulls the stream so it plays in the custom
+      // <video> player. Falls back to the iframe in the renderer on null.
+      if (
+        opts.provider === "voe" ||
+        opts.provider === "share4max" ||
+        opts.provider === "streamruby" ||
+        opts.provider === "uqload"
+      ) {
+        // voe/share4max sometimes sit behind Cloudflare → allow extra time.
+        const timeout = opts.provider === "uqload" ? 25000 : 32000;
+        return await extractViaCapture(opts.iframeUrl, `extract:${opts.provider}`, timeout);
       }
     } catch (e) {
       console.warn("[direct-extract] failed:", e);

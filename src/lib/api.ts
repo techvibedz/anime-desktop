@@ -105,7 +105,9 @@ async function getCrossSourceUrl(title: string, primary: "witanime" | "anime4up"
   if (primary === "witanime") {
     for (const v of searchVariants(title)) {
       try {
-        const direct = await searchAnime4upDirect(v);
+        // Search with the (possibly truncated) variant but score candidates
+        // against the full title so season disambiguation survives.
+        const direct = await searchAnime4upDirect(v, title);
         if (direct) { url = direct; break; }
       } catch { /* fall through to headless */ }
     }
@@ -267,7 +269,10 @@ export async function resolveUp4EpisodeUrl(animeTitle: string, epNumber: number)
   let animeUrl: string | null = null;
   for (const v of searchVariants(animeTitle)) {
     try {
-      animeUrl = await searchAnime4upDirect(v);
+      // Search with the (possibly truncated) variant but score candidates
+      // against the full title so a shorter variant like "Boku no Hero"
+      // doesn't match the wrong season's page (which lacks this episode).
+      animeUrl = await searchAnime4upDirect(v, animeTitle);
       if (animeUrl) break;
     } catch (e) { console.warn(`[up4-resolve] search variant "${v}" threw:`, e); }
   }
@@ -322,6 +327,14 @@ export async function enrichServersFromUp4(servers: (VideoServer & { source?: st
 
 // ── Video resolve — iframe-hybrid path ──
 
+// Providers we attempt to extract a direct stream from (→ custom <video>
+// player), falling back to their iframe only when extraction yields nothing.
+// dailymotion/videa/mp4upload are handled by their own branches above; this
+// set covers the ones routed through directExtract generically.
+const CUSTOM_PLAYER_PROVIDERS = new Set([
+  "voe", "share4max", "streamruby", "uqload", "okru",
+]);
+
 type ResolvePayload = { success: true; data: { videoUrl: string; type: "hls" | "mp4" | "iframe" } } | { success: false; error: string };
 const resolveCache = new Map<string, { ts: number; promise: Promise<ResolvePayload> }>();
 const RESOLVE_TTL = 15 * 1000;
@@ -344,9 +357,32 @@ async function doResolveVideo(iframeUrl: string, provider: string) {
     } catch {}
     return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
   }
-  // Every other provider: render the embed in a visible iframe. The user
-  // clicks play inside it, the capture listener catches the stream URL,
-  // and we swap to the custom <video> player. Extraction via hidden
-  // BrowserWindow is NOT attempted — mp4upload times out on this network.
+  // mp4upload renders a BLACK player inside the embed iframe: loaded from
+  // file://, document.referrer is empty and mp4upload anti-hotlinks it. Pull
+  // the real .mp4 URL server-side and play it in the native player via the
+  // proxy (which forces the canonical Referer the CDN wants). Fall back to
+  // the iframe only if extraction comes up empty.
+  if (provider === "mp4upload") {
+    try {
+      const direct = await window.pantoufa.directExtract?.(provider, iframeUrl);
+      if (direct?.url) return { success: true as const, data: { videoUrl: direct.url, type: direct.type } };
+    } catch {}
+    return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
+  }
+  // Providers whose stream we can pull server-side (real .m3u8/.mp4 for the
+  // capture set; data-options JSON for ok.ru). Extracting lets them play in
+  // the custom <video> player instead of the provider's iframe. If extraction
+  // comes up empty (Cloudflare, layout drift, geo-block), fall back to the
+  // iframe so the user still gets a picture.
+  if (CUSTOM_PLAYER_PROVIDERS.has(provider)) {
+    try {
+      const direct = await window.pantoufa.directExtract?.(provider, iframeUrl);
+      if (direct?.url) return { success: true as const, data: { videoUrl: direct.url, type: direct.type } };
+    } catch {}
+    return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
+  }
+  // Remaining providers (vk, doodstream, generic): render the embed in a
+  // visible iframe. Their CDN URLs carry no file extension / token scheme the
+  // capture hook can recognize, so the provider's own player is the surface.
   return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
 }
