@@ -398,15 +398,19 @@ async function resolveAnime3rbTitleUrl(animeTitle: string): Promise<string | nul
   if (hit && Date.now() - hit.ts < UP4_CACHE_TTL) return hit.url;
   const stored = await readCache<string>(A3RB_TITLE_PREFIX + key, UP4_CACHE_TTL);
   if (stored) { a3rbTitleCache.set(key, { url: stored, ts: Date.now() }); return stored; }
-  // Slug guessing first: anime3rb's slugs derive cleanly from romaji titles,
-  // so this lands in one or two cheap GETs for the vast majority of anime.
-  let url = await searchAnime3rbDirect(animeTitle).catch(() => null);
+  // Catalog (sitemap) matching FIRST: one plain GET (cached 6h in memory)
+  // plus one verification probe of a slug that's KNOWN to exist — both fast
+  // 200s. Slug guessing used to run first, but anime3rb's edge TARPITS
+  // unknown /titles/<slug> paths instead of 404ing them: every missed guess
+  // hung for the full fetch timeout (~27s) and the probe burst got the whole
+  // site temporarily blackholed — which is why the anime3rb server never
+  // appeared for seasonal titles ("4th Season" etc.) whose slug isn't an
+  // exact first guess.
+  let url = await searchAnime3rbCatalog(animeTitle).catch(() => null);
   if (!url) {
-    // Catalog matching second: anime3rb's daily titles sitemap (one plain
-    // GET, cached in-memory) covers anime whose slug can't be guessed —
-    // different romanization, alt-name-only indexing, shortened titles.
-    console.info(`[a3rb-resolve] slug guesses missed for "${animeTitle}", matching sitemap catalog`);
-    url = await searchAnime3rbCatalog(animeTitle).catch(() => null);
+    // Capped slug probing as last resort (covers a stale/failed sitemap).
+    console.info(`[a3rb-resolve] catalog miss for "${animeTitle}", probing top slug guesses`);
+    url = await searchAnime3rbDirect(animeTitle).catch(() => null);
   }
   // NOTE: no headless /search fallback. anime3rb's /search sits behind a
   // Cloudflare managed challenge that never completes inside the hidden

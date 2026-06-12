@@ -268,11 +268,14 @@ export async function scrapeAnime4upEpisodePageDirect(
 function tm_seasonNum(s: string): number {
   s = (s || "").toLowerCase();
   const m =
-    s.match(/\b(?:season|s|part|cour)\s*(\d+)\b/) ||
-    // Ordinal-before-keyword form: "7th Season", "2nd Part", "3rd Cour".
-    // Without this "Boku no Hero Academia 7th Season" parses as season 1
-    // and matches the wrong anime4up season page.
+    // Ordinal-before-keyword form FIRST: "7th Season", "2nd Part", "3rd Cour".
+    // It's unambiguous, while the keyword-number form below can misfire on a
+    // number that merely FOLLOWS the keyword: anime3rb's
+    // "…-4th-season-2-nensei-hen-1-gakki" read as season 2 ("season 2"
+    // matched before "4th season" was even tried) and hard-rejected the
+    // correct catalog entry.
     s.match(/\b(\d+)(?:st|nd|rd|th)\s+(?:season|part|cour)\b/) ||
+    s.match(/\b(?:season|s|part|cour)\s*(\d+)\b/) ||
     s.match(/الموسم\s*([٠-٩\d]+)/) ||
     s.match(/الجزء\s*([٠-٩\d]+)/);
   if (!m) return 1;
@@ -532,11 +535,35 @@ export async function findUp4EpisodeAcrossPages(
 // is in the initial HTML) and uses PREDICTABLE URLs: /titles/<slug> for the
 // anime page and /episode/<slug>/<number> for episodes, with clean
 // Str::slug-style slugs ("Dr. Stone: Science Future Part 3" →
-// dr-stone-science-future-part-3). So the whole resolution chain is: derive
-// candidate slugs from the title → probe /titles/<slug> (a miss is a fast
-// 404) → construct the episode URL directly. Only /search sits behind a
-// Cloudflare managed challenge, so free-text search falls back to the
-// headless window (real Chromium passes the challenge).
+// dr-stone-science-future-part-3). Resolution matches the daily titles
+// sitemap first (one plain GET, see api.ts), with direct slug probing only
+// as a capped fallback — a missed /titles/<slug> probe is NOT a fast 404,
+// the edge tarpits it (hangs until timeout) and bursts of stalled probes get
+// the whole site temporarily blackholed. /search sits behind a Cloudflare
+// managed challenge and is effectively dead to us.
+
+// Every anime3rb GET goes through this gate. The site's edge does NOT 404
+// unknown paths — it tarpits them (the connection hangs until our timeout),
+// and a burst of requests gets EVERY subsequent request blackholed for a
+// while (verified live: after ~15 rapid probes even the homepage stalled).
+// So each request fails fast (single attempt, short timeout — a retry would
+// just re-enter the tarpit) and successive requests stay spaced out.
+let a3rbLastFetchAt = 0;
+const A3RB_FETCH_SPACING_MS = 700;
+async function a3rbFetch(
+  url: string,
+  opts?: { attempts?: number; timeoutMs?: number },
+): Promise<string | null> {
+  const wait = a3rbLastFetchAt + A3RB_FETCH_SPACING_MS - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  a3rbLastFetchAt = Date.now();
+  const html = await window.pantoufa.fetchHtml?.(url, A3RB_BASE + "/", {
+    attempts: 1,
+    timeoutMs: 8000,
+    ...opts,
+  });
+  return html ?? null;
+}
 
 function a3rbSlugify(s: string): string {
   return (s || "")
@@ -609,19 +636,23 @@ function a3rbSlugVariants(title: string): string[] {
 // coincidental slug can't hijack the match. Returns the page URL or null.
 async function probeA3rbTitlePage(slug: string, title: string): Promise<string | null> {
   const url = `${A3RB_BASE}/titles/${slug}`;
-  const html = await window.pantoufa.fetchHtml?.(url, A3RB_BASE + "/");
-  if (!html) return null; // 404 / fetch failure
+  const html = await a3rbFetch(url);
+  if (!html) return null; // miss (tarpit timeout) / fetch failure
   const tm =
     html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i) ||
     html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  const got = tm ? tm[1].replace(/\s*[|–]\s*Anime3rb.*$/i, "").trim() : slug.replace(/-+/g, " ");
+  // The suffix separator has been seen as "|", "–" AND a plain "-" — match all.
+  const got = tm ? tm[1].replace(/\s*[-|–—]\s*Anime3rb.*$/i, "").trim() : slug.replace(/-+/g, " ");
   return tm_score(title, got) >= 34 ? url : null;
 }
 
-// Probe /titles/<slug> for each candidate slug shape derived from the title.
+// Probe /titles/<slug> for the top candidate slug shapes derived from the
+// title. Only a FALLBACK now (the catalog resolves first — see api.ts): a
+// missed probe doesn't 404, it hangs until the timeout, so each guess is
+// expensive and a long guess chain re-triggers the tarpit. Cap hard.
 export async function searchAnime3rbDirect(title: string): Promise<string | null> {
   if (!title) return null;
-  for (const slug of a3rbSlugVariants(title)) {
+  for (const slug of a3rbSlugVariants(title).slice(0, 3)) {
     const url = await probeA3rbTitlePage(slug, title);
     if (url) return url;
   }
@@ -643,10 +674,12 @@ const A3RB_CATALOG_TTL = 6 * 60 * 60 * 1000;
 
 async function fetchA3rbCatalog(): Promise<string[]> {
   if (a3rbCatalog && Date.now() - a3rbCatalog.ts < A3RB_CATALOG_TTL) return a3rbCatalog.slugs;
-  const xml = await window.pantoufa.fetchHtml?.(
-    `${A3RB_BASE}/storage/sitemaps/titles_sitemap.xml`,
-    A3RB_BASE + "/",
-  );
+  // The sitemap is ~2.6MB, so give the download room — but still single-shot
+  // (a stalled attempt means the tarpit is active; retrying re-enters it).
+  const xml = await a3rbFetch(`${A3RB_BASE}/storage/sitemaps/titles_sitemap.xml`, {
+    attempts: 1,
+    timeoutMs: 20000,
+  });
   if (!xml) return a3rbCatalog?.slugs ?? [];
   const slugs: string[] = [];
   const re = /<loc>\s*https?:\/\/anime3rb\.com\/titles\/([^<\s]+?)\/?\s*<\/loc>/g;
@@ -762,7 +795,9 @@ export async function searchAnime3rbHeadless(title: string): Promise<string | nu
 // pulls direct tokenized .mp4 qualities from — so the custom player path
 // works end-to-end with two plain GETs.
 export async function scrapeAnime3rbEpisodeServers(episodeUrl: string): Promise<RawServer[]> {
-  const html = await window.pantoufa.fetchHtml?.(episodeUrl, A3RB_BASE + "/");
+  // Episode pages are ~1.7MB; a missing episode (not yet uploaded) doesn't
+  // 404 — it tarpits — so bound the wait and let the retry loop re-try later.
+  const html = await a3rbFetch(episodeUrl, { attempts: 1, timeoutMs: 12000 });
   if (!html) return [];
   // The snapshot lives inside an HTML attribute, so quotes arrive as &quot;
   // and the URL as JSON-escaped https:\/\/… with &amp; between query params.

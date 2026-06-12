@@ -2153,10 +2153,14 @@ app.whenReady().then(() => {
   // transient miss self-heals in well under a second instead of bubbling up.
   ipcMain.handle("pantoufa:fetch-html", async (
     _evt,
-    opts: { url: string; referer?: string },
+    opts: { url: string; referer?: string; attempts?: number; timeoutMs?: number },
   ): Promise<string | null> => {
-    const ATTEMPTS = 3;
-    const PER_ATTEMPT_TIMEOUT_MS = 9000;
+    // anime3rb's edge does NOT 404 unknown paths — it TARPITS them (the
+    // connection hangs until our timeout), and a burst of stalled probes gets
+    // the whole site blackholed for a while. Callers probing such hosts pass
+    // attempts/timeoutMs overrides so a miss costs seconds, not half a minute.
+    const ATTEMPTS = Math.max(1, Math.min(opts.attempts ?? 3, 5));
+    const PER_ATTEMPT_TIMEOUT_MS = Math.max(1000, Math.min(opts.timeoutMs ?? 9000, 30000));
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), PER_ATTEMPT_TIMEOUT_MS);

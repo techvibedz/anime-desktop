@@ -62,6 +62,6 @@ contextBridge.exposeInMainWorld("pantoufa", {
     >,
   // Privileged HTML GET from the main process (no CORS). Used to read
   // anime4up episode pages directly instead of rendering them headless.
-  fetchHtml: (url: string, referer?: string) =>
-    ipcRenderer.invoke("pantoufa:fetch-html", { url, referer }) as Promise<string | null>,
+  fetchHtml: (url: string, referer?: string, opts?: { attempts?: number; timeoutMs?: number }) =>
+    ipcRenderer.invoke("pantoufa:fetch-html", { url, referer, ...opts }) as Promise<string | null>,
 });
