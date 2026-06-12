@@ -129,8 +129,11 @@ if (-not $DryRun) {
   # NOTE: do NOT `git add release/` — it's gitignored (build artifacts), and
   # with $ErrorActionPreference="Stop" the ignored-path warning aborts the
   # whole pipeline before tagging/pushing. Stage only tracked release files.
-  git add package.json 2>$null
-  git commit -m "v$Version" --allow-empty 2>$null
+  # No `2>$null` on git calls: with $ErrorActionPreference="Stop", redirecting
+  # native stderr turns ANY stderr line (e.g. the LF/CRLF warning) into a
+  # fatal NativeCommandError — unredirected stderr just prints and continues.
+  git add package.json
+  git commit -m "v$Version" --allow-empty
   if ($LASTEXITCODE -ne 0) { Write-Host "  (nothing to commit, continuing)" }
   git tag -a $Tag -m "v$Version" -f
   git push origin main --follow-tags -f
