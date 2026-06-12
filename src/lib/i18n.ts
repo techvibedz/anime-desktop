@@ -81,10 +81,16 @@ export const ar = {
   noVideo: "تعذّر تشغيل الفيديو",
   servers: "المصادر",
   skipServer: "تخطّي هذا المصدر",
+  refreshServers: "تحديث المصادر",
+  loadingMoreServers: "جاري البحث عن مصادر إضافية…",
+  skipIntro: "تخطّي المقدمة",
 
   // Sign out
   signOut: "تسجيل الخروج",
   guest: "زائر",
+
+  // Refresh
+  refresh: "تحديث الصفحة",
 };
 
 export const t = ar;

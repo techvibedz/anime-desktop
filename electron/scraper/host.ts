@@ -8,6 +8,11 @@ export type ScrapeJob = {
   injectAfter: string;
   timeoutMs: number;
   isVideoJob?: boolean;
+  // Jump the queue like isVideoJob does, WITHOUT the video-job navigation
+  // semantics (video jobs allow cross-domain navigation and deny popups).
+  // Used for the watch page's server-list scrape so it never waits behind
+  // background home/listing scrapes.
+  priority?: boolean;
 };
 
 type Pending = {
@@ -30,7 +35,7 @@ let slotsReady: Promise<void> | null = null;
 export function enqueue(job: ScrapeJob): Promise<any> {
   return new Promise((resolve, reject) => {
     const entry = { job, resolve, reject };
-    if (job.isVideoJob) {
+    if (job.isVideoJob || job.priority) {
       videoQueue.push(entry);
     } else {
       queue.push(entry);
@@ -115,7 +120,10 @@ function initSlots(): Slot[] {
       },
     });
 
-    // Never show this window.
+    // Never show this window — and never let it make a sound. Embed pages
+    // autoplay ads with audio; the capture hook mutes <video> elements but
+    // not <audio>/WebAudio, so hard-mute the whole webContents.
+    try { win.webContents.setAudioMuted(true); } catch {}
     try { win.hide(); } catch {}
     try { win.setOpacity(0); } catch {}
     win.on("show", () => {

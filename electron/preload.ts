@@ -9,6 +9,7 @@ export type ScrapeJob = {
   injectAfter: string;
   timeoutMs: number;
   isVideoJob?: boolean;
+  priority?: boolean;
 };
 
 export type UpdateInfo = {

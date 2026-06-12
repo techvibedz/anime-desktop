@@ -8,9 +8,14 @@ import {
   scrapeAllAnime,
   scrapeVideoServers,
   scrapeAnime4upServersDirect,
+  scrapeAnime4upEpisodePageDirect,
   searchAnime4upDirect,
   scrapeAnime4upEpisodesDirect,
+  findUp4EpisodeAcrossPages,
   findCrossSourceUrl,
+  searchAnime3rbDirect,
+  searchAnime3rbCatalog,
+  scrapeAnime3rbEpisodeServers,
   type RawServer,
 } from "./scraper";
 
@@ -80,17 +85,61 @@ export async function fetchHome(): Promise<HomePayload> {
   return fetchHomeFresh();
 }
 
+// Drop the home cache so the next fetchHome() re-scrapes from scratch instead
+// of replaying an empty/stale list. Used by the header refresh button when the
+// page came up without its animes (failed first scrape on startup).
+export async function clearHomeCache(): Promise<void> {
+  try { await storage.removeItem(HOME_CACHE_KEY); } catch {}
+}
+
 const xsourceCache: Map<string, { url: string | null; ts: number }> = new Map();
 const XSOURCE_TTL = 24 * 60 * 60 * 1000;
 
 function searchVariants(title: string): string[] {
+  // Drop bracketed/parenthetical notes and collapse whitespace.
   const cleaned = title.replace(/[\(\[][^\)\]]*[\)\]]/g, "").replace(/\s+/g, " ").trim();
-  const words = cleaned.split(/\s+/);
   const variants = new Set<string>();
-  if (cleaned) variants.add(cleaned);
-  if (words.length > 3) variants.add(words.slice(0, 3).join(" "));
-  if (words.length > 2) variants.add(words.slice(0, 2).join(" "));
-  if (words.length > 1) variants.add(words[0]);
+  const add = (s: string) => { const t = (s || "").replace(/\s+/g, " ").trim(); if (t) variants.add(t); };
+
+  // Full cleaned title first — when it matches it's the most precise.
+  add(cleaned);
+  // anime4up's search returns ZERO results when the query carries a long
+  // subtitle after a colon ("… 4th Season: 2-nensei-hen 1 Gakki") or trailing
+  // punctuation ("Tadaima Ojamasaremasu!"). Emit cleaner — but still specific —
+  // variants BEFORE the crude word-count truncations so the FIRST hit is a
+  // precise, correctly-scored match instead of a lucky first-word result that
+  // can resolve to the wrong anime. Candidates are always scored against the
+  // FULL title by the caller, so a too-broad variant can't mis-match.
+  add(cleaned.split(/\s*[:：]\s*/)[0]);              // strip ": subtitle"
+  add(cleaned.split(/\s+[-–—]\s+/)[0]);             // strip " - subtitle"
+  add(cleaned.replace(/[^\p{L}\p{N} ]+/gu, " "));   // strip stray punctuation (!, ., …)
+
+  // Parenthesized alternative names: witanime often appends the romaji
+  // original in parens ("The Beginning After the End Season 2 (Saikyou no
+  // Ousama Nidome no Jinsei wa Nani wo Suru Season 2)") and anime4up indexes
+  // the anime ONLY under the romaji name — every English-title query returns
+  // zero results. Candidates are still scored against the FULL title, whose
+  // tokens include the parenthesized words, so this can't mis-match.
+  const reParen = /[\(\[]([^\)\]]+)[\)\]]/g;
+  let pm: RegExpExecArray | null;
+  while ((pm = reParen.exec(title))) {
+    const inner = pm[1].trim();
+    if (!inner) continue;
+    add(inner);
+    add(inner.split(/\s*[:：]\s*/)[0]);
+    // The long-query-returns-zero quirk applies to the alt name too
+    // (the full "Saikyou no Ousama Nidome no Jinsei wa Nani wo Suru Season 2"
+    // finds nothing; "Saikyou no Ousama" finds it), so truncate it as well.
+    const iw = inner.split(/\s+/);
+    if (iw.length > 3) add(iw.slice(0, 3).join(" "));
+    if (iw.length > 2) add(iw.slice(0, 2).join(" "));
+  }
+
+  // Last-resort progressive head truncations.
+  const words = cleaned.split(/\s+/);
+  if (words.length > 3) add(words.slice(0, 3).join(" "));
+  if (words.length > 2) add(words.slice(0, 2).join(" "));
+  if (words.length > 1) add(words[0]);
   return Array.from(variants);
 }
 
@@ -188,7 +237,11 @@ export async function fetchEpisodesUp4(animeUrl: string, title: string | null, u
     }
   }
   const result = { merged: { anime4up: crossUrl }, episodes4up };
-  void writeCache(cacheKey, result);
+  // Only cache a populated episode list. anime4up is flaky and frequently
+  // returns an empty list on the first try; caching that empty result for 24h
+  // would block every later attempt (and the manual refresh) from ever landing
+  // the anime4up siblings — exactly why some anime "never" show anime4up servers.
+  if (episodes4up.length > 0) void writeCache(cacheKey, result);
   return result;
 }
 
@@ -239,7 +292,24 @@ export function invalidateServersCache(episodeUrl: string) {
 
 async function doFetchVideoServers(episodeUrl: string, url4up?: string) {
   const primaryIsUp4 = /anime4up/i.test(episodeUrl);
-  const primary = await scrapeVideoServers(episodeUrl).then((r) => ({ source: primaryIsUp4 ? "anime4up" as const : "witanime" as const, servers: r.servers, episodeTitle: r.episodeTitle, animeTitle: r.animeTitle, up4EpisodeUrl: r.up4EpisodeUrl ?? null })).catch(() => null);
+  // Fast lane for anime4up-primary episodes: the entire server list lives in
+  // the static HTML, so a single privileged GET returns it in well under a
+  // second — the headless render takes many seconds and often trips
+  // anime4up's ad gates. Fall back to the headless scrape only when the
+  // direct parse yields nothing.
+  let primary: { source: "anime4up" | "witanime"; servers: any[]; episodeTitle: string; animeTitle: string; up4EpisodeUrl: string | null } | null = null;
+  if (primaryIsUp4) {
+    try {
+      const direct = await scrapeAnime4upEpisodePageDirect(episodeUrl);
+      if (direct) {
+        console.info(`[servers] direct anime4up parse: ${direct.servers.length} servers`);
+        primary = { source: "anime4up", servers: direct.servers, episodeTitle: direct.episodeTitle, animeTitle: direct.animeTitle, up4EpisodeUrl: null };
+      }
+    } catch { /* fall through to headless */ }
+  }
+  if (!primary) {
+    primary = await scrapeVideoServers(episodeUrl).then((r) => ({ source: primaryIsUp4 ? "anime4up" as const : "witanime" as const, servers: r.servers, episodeTitle: r.episodeTitle, animeTitle: r.animeTitle, up4EpisodeUrl: r.up4EpisodeUrl ?? null })).catch(() => null);
+  }
   const seen = new Set<string>();
   const merged: (VideoServer & { source?: string })[] = [];
   function add(arr: any[] | undefined, source: string) {
@@ -260,11 +330,17 @@ async function doFetchVideoServers(episodeUrl: string, url4up?: string) {
 // harvested off the witanime page (e.g. One Piece, where witanime carries no
 // anime4up link). Returns the matching episode URL, or null.
 const up4EpUrlCache = new Map<string, { url: string | null; ts: number }>();
+const UP4_EP_URL_PREFIX = "@up4_ep_url_v1:";
 export async function resolveUp4EpisodeUrl(animeTitle: string, epNumber: number): Promise<string | null> {
   if (!animeTitle || epNumber == null) return null;
   const key = `${animeTitle.toLowerCase().trim()}#${epNumber}`;
   const hit = up4EpUrlCache.get(key);
   if (hit && Date.now() - hit.ts < UP4_CACHE_TTL) return hit.url;
+  // Successful resolutions are persisted, so revisiting an episode after an
+  // app restart serves the anime4up URL instantly instead of re-running the
+  // search + episode-list fetches (the main "servers take a while" cost).
+  const stored = await readCache<string>(UP4_EP_URL_PREFIX + key, UP4_CACHE_TTL);
+  if (stored) { up4EpUrlCache.set(key, { url: stored, ts: Date.now() }); return stored; }
   console.info(`[up4-resolve] searching anime4up for "${animeTitle}" ep ${epNumber}`);
   let animeUrl: string | null = null;
   for (const v of searchVariants(animeTitle)) {
@@ -281,17 +357,86 @@ export async function resolveUp4EpisodeUrl(animeTitle: string, epNumber: number)
     return null;
   }
   console.info(`[up4-resolve] matched anime page: ${animeUrl}`);
-  let eps: Episode[] = [];
+  // Pagination-aware lookup: anime4up anime pages only list the newest ~40
+  // episodes on page 1 (One Piece spans 25 pages), so a page-1 parse can NEVER
+  // find an older episode — which made anime4up servers permanently absent for
+  // catch-up watching. findUp4EpisodeAcrossPages walks the pagination toward
+  // the requested number instead.
+  let url: string | null = null;
   try {
-    eps = await scrapeAnime4upEpisodesDirect(animeUrl);
-  } catch (e) { console.warn(`[up4-resolve] episode list fetch threw:`, e); }
-  console.info(`[up4-resolve] parsed ${eps.length} episodes from anime4up page`);
-  const match = eps.find((e) => e.number === epNumber);
-  const url = match?.href ?? null;
+    url = await findUp4EpisodeAcrossPages(animeUrl, epNumber);
+  } catch (e) { console.warn(`[up4-resolve] episode lookup threw:`, e); }
   if (url) console.info(`[up4-resolve] found ep ${epNumber}: ${url}`);
-  else console.warn(`[up4-resolve] ep ${epNumber} not in anime4up list (have ${eps.length} eps)`);
-  up4EpUrlCache.set(key, { url, ts: Date.now() });
+  else console.warn(`[up4-resolve] ep ${epNumber} not found on anime4up pages`);
+  // Only cache a successful resolution. anime4up's search / episode list is
+  // intermittently empty (ad gates, rate-limited request bursts on page load);
+  // caching a null for 24h would permanently block retries — including the
+  // natural re-runs as better titles arrive and the manual refresh — so some
+  // anime would "never" get anime4up servers. Mirror getCrossSourceUrl, which
+  // also only caches hits.
+  if (url) {
+    up4EpUrlCache.set(key, { url, ts: Date.now() });
+    void writeCache(UP4_EP_URL_PREFIX + key, url);
+  }
   return url;
+}
+
+// ── anime3rb (third server source) ──
+// anime3rb's episode URLs are constructible (/episode/<slug>/<number>), so
+// resolving an episode is just "find the title page once, then append the
+// number". The title resolution result is cached in memory AND persisted so
+// every later episode of the same anime resolves instantly. Mirrors the
+// anime4up lesson: only successful resolutions are cached — caching a miss
+// for 24h would permanently block retries while the site is briefly flaky.
+const a3rbTitleCache = new Map<string, { url: string; ts: number }>();
+const A3RB_TITLE_PREFIX = "@a3rb_title_v1:";
+
+async function resolveAnime3rbTitleUrl(animeTitle: string): Promise<string | null> {
+  if (!animeTitle) return null;
+  const key = animeTitle.toLowerCase().trim();
+  const hit = a3rbTitleCache.get(key);
+  if (hit && Date.now() - hit.ts < UP4_CACHE_TTL) return hit.url;
+  const stored = await readCache<string>(A3RB_TITLE_PREFIX + key, UP4_CACHE_TTL);
+  if (stored) { a3rbTitleCache.set(key, { url: stored, ts: Date.now() }); return stored; }
+  // Slug guessing first: anime3rb's slugs derive cleanly from romaji titles,
+  // so this lands in one or two cheap GETs for the vast majority of anime.
+  let url = await searchAnime3rbDirect(animeTitle).catch(() => null);
+  if (!url) {
+    // Catalog matching second: anime3rb's daily titles sitemap (one plain
+    // GET, cached in-memory) covers anime whose slug can't be guessed —
+    // different romanization, alt-name-only indexing, shortened titles.
+    console.info(`[a3rb-resolve] slug guesses missed for "${animeTitle}", matching sitemap catalog`);
+    url = await searchAnime3rbCatalog(animeTitle).catch(() => null);
+  }
+  // NOTE: no headless /search fallback. anime3rb's /search sits behind a
+  // Cloudflare managed challenge that never completes inside the hidden
+  // scraper window (verified: it idles on the interstitial until timeout), so
+  // the old fallback could never succeed — it just pinned the in-flight latch
+  // for 45s, which BLOCKED the quick re-run with the better scraped title.
+  // Failing fast here lets the watch screen's retry loop converge instead.
+  if (url) {
+    console.info(`[a3rb-resolve] matched title page: ${url}`);
+    a3rbTitleCache.set(key, { url, ts: Date.now() });
+    void writeCache(A3RB_TITLE_PREFIX + key, url);
+  } else {
+    console.warn(`[a3rb-resolve] no anime3rb match for "${animeTitle}"`);
+  }
+  return url;
+}
+
+// Servers for an episode by anime title + episode number. Returns [] on any
+// miss (unknown anime, episode not yet uploaded, transient fetch failure) —
+// the watch screen's retry loop decides whether to try again.
+export async function fetchAnime3rbServers(animeTitle: string, epNumber: number): Promise<RawServer[]> {
+  if (!animeTitle || epNumber == null) return [];
+  const titleUrl = await resolveAnime3rbTitleUrl(animeTitle);
+  if (!titleUrl) return [];
+  const slug = titleUrl.replace(/\/+$/, "").split("/").pop();
+  if (!slug) return [];
+  const episodeUrl = `https://anime3rb.com/episode/${slug}/${epNumber}`;
+  const servers = await scrapeAnime3rbEpisodeServers(episodeUrl).catch(() => [] as RawServer[]);
+  if (servers.length > 0) console.info(`[a3rb-resolve] ep ${epNumber}: ${servers.length} server(s) from ${episodeUrl}`);
+  return servers;
 }
 
 export async function enrichServersFromUp4(servers: (VideoServer & { source?: string })[], url4up: string): Promise<(VideoServer & { source?: string })[]> {
@@ -333,16 +478,45 @@ export async function enrichServersFromUp4(servers: (VideoServer & { source?: st
 // set covers the ones routed through directExtract generically.
 const CUSTOM_PLAYER_PROVIDERS = new Set([
   "voe", "share4max", "streamruby", "uqload", "okru",
+  "streamwish", "doodstream", "vk",
+  // anime3rb's first-party host: one static GET on the player page yields
+  // direct tokenized .mp4 qualities, so extraction is near-instant and the
+  // custom player is the normal path (iframe only as a last resort).
+  "vid3rb",
 ]);
+
+// Providers we expect to yield a direct stream (.m3u8/.mp4). When extraction
+// for one of these comes back as an iframe fallback the extraction FAILED
+// (transient Cloudflare check / slow embed) — caching that fallback would
+// poison the user's Play click (or a retry) with a stale iframe for the full
+// TTL, which is exactly why a server "sometimes" refused to run in the custom
+// player. mp4upload and videa are included (their own branches return a
+// direct stream or iframe).
+const EXPECT_DIRECT_PROVIDERS = new Set([...CUSTOM_PLAYER_PROVIDERS, "mp4upload", "videa"]);
 
 type ResolvePayload = { success: true; data: { videoUrl: string; type: "hls" | "mp4" | "iframe" } } | { success: false; error: string };
 const resolveCache = new Map<string, { ts: number; promise: Promise<ResolvePayload> }>();
-const RESOLVE_TTL = 15 * 1000;
+// 90s (was 15s): long enough that the prefetch fired when the server list
+// loads still serves the user's Play click, and that a click during a slow
+// in-flight extraction reuses that promise instead of starting a second
+// one. Provider stream tokens live far longer than this, and the 410
+// re-extract path covers the rare expiry anyway.
+const RESOLVE_TTL = 90 * 1000;
 
 export function resolveVideo(iframeUrl: string, provider: string): Promise<ResolvePayload> {
   const hit = resolveCache.get(iframeUrl);
   if (hit && Date.now() - hit.ts < RESOLVE_TTL) return hit.promise;
-  const promise = doResolveVideo(iframeUrl, provider).then((r) => { if (!r.success) resolveCache.delete(iframeUrl); return r; }).catch((e) => { resolveCache.delete(iframeUrl); throw e; });
+  const promise = doResolveVideo(iframeUrl, provider).then((r) => {
+    // Don't cache hard failures, nor iframe fallbacks for providers we expect
+    // to extract a direct stream from: those fallbacks mean extraction missed
+    // this round, and caching them makes the next resolve (prefetch → click,
+    // or a manual retry) replay the stale iframe instead of re-extracting.
+    const isFallback = r.success && r.data?.type === "iframe";
+    if (!r.success || (isFallback && EXPECT_DIRECT_PROVIDERS.has(provider))) {
+      resolveCache.delete(iframeUrl);
+    }
+    return r;
+  }).catch((e) => { resolveCache.delete(iframeUrl); throw e; });
   resolveCache.set(iframeUrl, { ts: Date.now(), promise });
   return promise;
 }
@@ -381,8 +555,8 @@ async function doResolveVideo(iframeUrl: string, provider: string) {
     } catch {}
     return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
   }
-  // Remaining providers (vk, doodstream, generic): render the embed in a
-  // visible iframe. Their CDN URLs carry no file extension / token scheme the
-  // capture hook can recognize, so the provider's own player is the surface.
+  // Remaining providers (generic/unknown): render the embed in a visible
+  // iframe — we have no extractor for them, so the provider's own player
+  // is the surface.
   return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
 }

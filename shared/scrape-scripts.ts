@@ -429,6 +429,82 @@ document.querySelectorAll('.anime-card-container').forEach(function (el) {
 return { url: best.score >= 34 ? best.url : null, score: best.score };
 })();`;
 
+/* ── TITLE MATCH (anime3rb search) ────────────── */
+// anime3rb's /search endpoint sits behind a Cloudflare managed challenge, so
+// it can't be read with a plain GET (unlike its /titles/ and /episode/ pages).
+// This runs inside the headless window — a real Chromium that passes the
+// challenge — and scores every /titles/ result link against the wanted title.
+// Used only as the fallback when direct slug-guessing missed.
+
+export const EXTRACT_TITLE_MATCH_A3RB = (want: string) => `(async function(){${HELPERS}
+var WANT = ${JSON.stringify(want)};
+function seasonNum(s) {
+  s = (s || '').toLowerCase();
+  var m = s.match(/\\b(?:season|s|part|cour)\\s*(\\d+)\\b/) || s.match(/\\b(\\d+)(?:st|nd|rd|th)\\s+(?:season|part|cour)\\b/) || s.match(/الموسم\\s*([\\u0660-\\u0669\\d]+)/) || s.match(/الجزء\\s*([\\u0660-\\u0669\\d]+)/);
+  if (!m) return 1;
+  var n = m[1].replace(/[\\u0660-\\u0669]/g, function (d) { return String(d.charCodeAt(0) - 0x0660); });
+  var v = parseInt(n, 10);
+  return isNaN(v) ? 1 : v;
+}
+function normLatin(s) {
+  return String(s || '').toLowerCase()
+    .replace(/\\b(?:season|s|part|cour)\\s*\\d+\\b/g, ' ')
+    .replace(/\\b(?:the|a|an|of|to|wa|no|wo|ga|ni)\\b/g, ' ')
+    .replace(/[^a-z0-9 ]+/g, ' ')
+    .replace(/\\s+/g, ' ').trim();
+}
+function normArabic(s) {
+  return String(s || '')
+    .replace(/[\\u064B-\\u065F\\u0670]/g, '')
+    .replace(/[\\u0622\\u0623\\u0625]/g, '\\u0627')
+    .replace(/\\u0629/g, '\\u0647')
+    .replace(/\\u0649/g, '\\u064A')
+    .replace(/[^\\u0600-\\u06FF ]+/g, ' ')
+    .replace(/\\s+/g, ' ').trim();
+}
+function toks(s) { return s ? s.split(' ').filter(function (w) { return w.length >= 2; }) : []; }
+function overlap(a, b) {
+  var A = toks(a), B = toks(b);
+  if (!A.length || !B.length) return 0;
+  var setB = {}; B.forEach(function (w) { setB[w] = true; });
+  var common = 0; A.forEach(function (w) { if (setB[w]) common++; });
+  return common / Math.min(A.length, B.length);
+}
+function score(title) {
+  var latinWant = normLatin(WANT), latinGot = normLatin(title);
+  var arWant = normArabic(WANT), arGot = normArabic(title);
+  var s = 0;
+  if (latinWant && latinGot === latinWant) s = 100;
+  else if (latinWant && latinGot.indexOf(latinWant) === 0) s = 85;
+  else if (arWant && arGot === arWant) s = 95;
+  else s = Math.round(Math.max(overlap(latinWant, latinGot), overlap(arWant, arGot)) * 75);
+  var sw = seasonNum(WANT), sg = seasonNum(title);
+  if (sw === sg) s += 8; else s -= 12;
+  return s;
+}
+// __pWaitFor already idles while the Cloudflare interstitial is up; give the
+// challenge + results render a generous window.
+await window.__pWaitFor(function () {
+  return !!document.querySelector('a[href*="/titles/"]');
+}, 30000);
+var best = { url: null, score: 0 };
+document.querySelectorAll('a[href*="/titles/"]').forEach(function (a) {
+  var href = a.getAttribute('href') || '';
+  if (!href) return;
+  if (href.indexOf('http') !== 0) href = 'https://anime3rb.com' + (href.charAt(0) === '/' ? '' : '/') + href;
+  href = href.split('?')[0].split('#')[0].replace(/\\/+$/, '');
+  var slug = href.split('/titles/')[1] || '';
+  // Skip non-detail links (the "all titles" listing, genre filters, …).
+  if (!slug || slug === 'list' || slug.indexOf('/') >= 0) return;
+  var label = (a.textContent || '').replace(/\\s+/g, ' ').trim();
+  // Overlay anchors carry no text — fall back to the human-readable slug.
+  if (!label || label.length < 2) label = slug.replace(/[-_]+/g, ' ').trim();
+  var s = score(label);
+  if (s > best.score) best = { url: href, score: s };
+});
+return { url: best.score >= 34 ? best.url : null, score: best.score };
+})();`;
+
 /* ── VIDEO SERVERS (episode page) ─────────────── */
 
 export const EXTRACT_VIDEO_SERVERS = `(async function(){${HELPERS}

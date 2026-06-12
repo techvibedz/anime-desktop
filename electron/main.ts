@@ -46,6 +46,12 @@ const VIDEO_PROTOCOL = "pantoufa-video";
 // most providers expect from real users. mp4upload + streamwish refuse
 // some desktop UAs.
 const VIDEO_UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+// Desktop UA — MUST match the mainWindow / headless scraper UA exactly. The
+// mp4upload direct-.mp4 token is bound to the UA that fetched the embed page;
+// if we extract the URL under a different UA than the one the <video> element
+// (mainWindow) plays it with, mp4upload's CDN rejects the token with 403 and
+// the player goes black. So mp4upload's server-side extraction fetch uses this.
+const PLAYBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 let mainWindow: BrowserWindow | null = null;
 let pendingAuthCallback: string | null = null;
@@ -512,13 +518,202 @@ async function extractViaCapture(
   }
 }
 
+// videa.hu (and its vidvaita/vidit clones) never inline the stream in the embed
+// HTML — the player pulls it from an XML API (/player/xml). Older/clone hosts
+// return that XML in plaintext; videa.hu proper now returns it base64'd and
+// RC4-encrypted, keyed off an `_xt` nonce printed in the player page. Both are
+// resolved here so the real progressive MP4 plays in the custom <video> player
+// instead of dropping back to videa's iframe. (Mirrors yt-dlp's videa flow.)
+const VIDEA_STATIC_SECRET = "xHb0ZvME5q8CBcoQi6AngerDu3FGO9fkUlwPmLVY_RTzj2hJIS4NasXWKy1td7p";
+
+function videaRc4(cipher: Buffer, key: string): string {
+  const keyLen = key.length;
+  const S = Array.from({ length: 256 }, (_, i) => i);
+  let j = 0;
+  for (let i = 0; i < 256; i++) {
+    j = (j + S[i] + key.charCodeAt(i % keyLen)) % 256;
+    [S[i], S[j]] = [S[j], S[i]];
+  }
+  const out = Buffer.alloc(cipher.length);
+  let a = 0, b = 0;
+  for (let m = 0; m < cipher.length; m++) {
+    a = (a + 1) % 256;
+    b = (b + S[a]) % 256;
+    [S[a], S[b]] = [S[b], S[a]];
+    out[m] = S[(S[a] + S[b]) % 256] ^ cipher[m];
+  }
+  return out.toString("utf8");
+}
+
+// Pick the best <video_source> out of a videa player XML. Prefers the highest
+// resolution and HLS over progressive when both exist.
+function parseVideaSources(xml: string): { url: string; type: "hls" | "mp4" } | null {
+  // videa signs each progressive variant: the bare <video_source> URL (e.g.
+  // //videa.hu/static/720p/…, no extension) 403s at the CDN. The real URL needs
+  // ?md5=<hash>&expires=<exp>, where <hash> is the per-quality token from the
+  // <hash_values> block (hash_value_360p, hash_value_720p, …) and <exp> is the
+  // source's exp attr. Mirrors yt-dlp's update_url_query(md5, expires). Without
+  // this the custom player loads a dead URL and falls back to videa's iframe.
+  const hashes = new Map<string, string>();
+  const hre = /<hash_value_([^>\s]+)>\s*([^<]+?)\s*<\/hash_value_[^>]+>/gi;
+  let hm: RegExpExecArray | null;
+  while ((hm = hre.exec(xml))) hashes.set(hm[1].toLowerCase(), hm[2].trim());
+  const parentExp = xml.match(/<video_sources\b[^>]*\bexp="(\d+)"/i)?.[1] || "";
+
+  const sources: Array<{ url: string; q: number; hls: boolean }> = [];
+  const re = /<video_source\b([^>]*)>(?:<!\[CDATA\[)?\s*([^<\]]+?)\s*(?:\]\]>)?<\/video_source>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml))) {
+    let url = m[2].trim();
+    if (url.startsWith("//")) url = "https:" + url;
+    if (!/^https?:\/\//.test(url) || DECOY_RE.test(url)) continue;
+    const attrs = m[1];
+    const height = parseInt(attrs.match(/height\s*=\s*"(\d+)"/i)?.[1] || "0", 10);
+    const name = attrs.match(/name\s*=\s*"([^"]*)"/i)?.[1] || "";
+    const hls = /\.m3u8/i.test(url);
+    // Progressive variants need the md5/expires signature; HLS playlists are
+    // already self-contained.
+    if (!hls) {
+      const md5 = hashes.get(name.toLowerCase());
+      if (md5) {
+        const exp = attrs.match(/\bexp="(\d+)"/i)?.[1] || parentExp;
+        const sep = url.includes("?") ? "&" : "?";
+        url += `${sep}md5=${encodeURIComponent(md5)}`;
+        if (exp) url += `&expires=${encodeURIComponent(exp)}`;
+      }
+    }
+    sources.push({ url, q: height || parseInt(name, 10) || 0, hls });
+  }
+  if (sources.length) {
+    sources.sort((x, y) => (y.hls ? 1 : 0) - (x.hls ? 1 : 0) || y.q - x.q);
+    const best = sources[0];
+    return { url: best.url, type: best.hls ? "hls" : "mp4" };
+  }
+  // No structured tags — fall back to any media URL in the document.
+  const any = xml.match(/https?:\/\/[^"'<\s]+\.(?:m3u8|mp4)[^"'<\s]*/i)?.[0];
+  if (any && !DECOY_RE.test(any)) return { url: any, type: /\.m3u8/i.test(any) ? "hls" : "mp4" };
+  return null;
+}
+
+async function extractVideaXml(
+  iframeUrl: string,
+): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+  try {
+    const u = new URL(iframeUrl);
+    const idM =
+      iframeUrl.match(/[?&]v=([a-zA-Z0-9]+)/) ||
+      iframeUrl.match(/\/player\/v\/([a-zA-Z0-9]+)/) ||
+      u.pathname.match(/\/([a-zA-Z0-9]{8,})(?:\/|$)/);
+    if (!idM) {
+      console.info("[extractVidea] no video id in URL");
+      return null;
+    }
+    const id = idM[1];
+    const origin = u.origin;
+    const ref = providerRefererForHost(u.hostname) ?? { referer: `${origin}/`, origin };
+    const fetchVidea = (target: string) =>
+      session.defaultSession.fetch(target, {
+        method: "GET",
+        headers: {
+          "User-Agent": PLAYBACK_UA,
+          "Accept": "*/*",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Referer": ref.referer,
+          "Origin": ref.origin,
+          "X-Pantoufa-Proxy": "1",
+        },
+        redirect: "follow",
+        cache: "no-store",
+      });
+
+    // 1) Plaintext XML (clone hosts + older videa).
+    for (const ep of [
+      `${origin}/player/xml?platform=desktop&v=${id}`,
+      `${origin}/videaplayer_get_xml.php?v=${id}`,
+    ]) {
+      try {
+        const resp = await fetchVidea(ep);
+        if (!resp.ok) continue;
+        const text = await resp.text();
+        if (/<\?xml|<video_source/i.test(text)) {
+          const got = parseVideaSources(text);
+          if (got) {
+            console.info(`[extractVidea] xml hit → ${got.url}`);
+            return got;
+          }
+        }
+      } catch {}
+    }
+
+    // 2) Encrypted videa.hu flow: derive the request token from the `_xt`
+    //    nonce in the player page, then RC4-decrypt the base64 XML response.
+    try {
+      const playerResp = await fetchVidea(`${origin}/player?v=${id}`);
+      if (playerResp.ok) {
+        const page = await playerResp.text();
+        const nonce = page.match(/_xt\s*=\s*"([^"]+)"/)?.[1];
+        if (nonce && nonce.length > 32) {
+          const l = nonce.slice(0, 32);
+          const s = nonce.slice(32);
+          let result = "";
+          // Exactly 32 iterations (one per char of `l`), NOT s.length — `s` is
+          // longer than 32. Looping over s.length reads l[i] past its end
+          // (→ undefined → indexOf -1) and yields a wrong-length `result`,
+          // corrupting both the `_t` token and the RC4 key. Mirrors yt-dlp's
+          // `for i in range(0, 32)`.
+          for (let i = 0; i < 32; i++) {
+            // Python wraps negative indices to the end of the string; JS's
+            // String.at() matches that, plain s[k] would not.
+            const k = i - (VIDEA_STATIC_SECRET.indexOf(l[i]) - 31);
+            result += s.at(k) ?? "";
+          }
+          const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+          let randomSeed = "";
+          for (let i = 0; i < 8; i++) randomSeed += alphabet[Math.floor(Math.random() * alphabet.length)];
+          const xmlResp = await fetchVidea(
+            `${origin}/player/xml?platform=desktop&v=${id}&_s=${randomSeed}&_t=${result.slice(0, 16)}`,
+          );
+          if (xmlResp.ok) {
+            const body = await xmlResp.text();
+            let xml = body;
+            if (!body.trimStart().startsWith("<?xml") && !/<video_source/i.test(body)) {
+              const xs = xmlResp.headers.get("x-videa-xs") || "";
+              xml = videaRc4(Buffer.from(body, "base64"), result.slice(16) + randomSeed + xs);
+            }
+            const got = parseVideaSources(xml);
+            if (got) {
+              console.info(`[extractVidea] decrypted xml hit → ${got.url}`);
+              return got;
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("[extractVidea] encrypted flow failed:", e);
+    }
+
+    console.info("[extractVidea] xml API yielded no source");
+    return null;
+  } catch (e) {
+    console.warn("[extractVidea] xml extraction failed:", e);
+    return null;
+  }
+}
+
 async function extractVidea(iframeUrl: string) {
-  return extractViaCapture(iframeUrl, "extractVidea", 25000);
+  // Direct XML API first (exact source URLs, sub-second), then static HTML
+  // scrape, then headless capture as the last resort.
+  return (await extractVideaXml(iframeUrl))
+    ?? (await extractViaHtml(iframeUrl, "extractVidea"))
+    ?? extractViaCapture(iframeUrl, "extractVidea", 25000);
 }
 
 async function extractStreamwish(iframeUrl: string) {
-  // Cloudflare challenge can take longer.
-  return extractViaCapture(iframeUrl, "extractStreamwish", 35000);
+  // streamwish inlines its hls source in a packed-JS blob — the static pass
+  // resolves it in well under a second. Headless capture (which also rides
+  // out Cloudflare challenges) remains the fallback.
+  return (await extractViaHtml(iframeUrl, "extractStreamwish"))
+    ?? extractViaCapture(iframeUrl, "extractStreamwish", 35000);
 }
 
 // ok.ru can't be captured by the generic hook: its stream URLs come off
@@ -636,6 +831,227 @@ function unpackPacked(source: string): string {
   return payload;
 }
 
+// Decoy / placeholder streams some embeds preload to fool scrapers.
+const DECOY_RE = /test-videos\.co\.uk|bigbuckbunny|sample[-_.]|placeholder|tos\.mp4|\/lol\/file\.mp4/i;
+
+// Un-pack EVERY p.a.c.k.e.r blob in a page (unpackPacked only handles the
+// first). streamwish/streamruby/share4max pages often carry several eval()
+// blobs and the player config isn't always the first one.
+function unpackAllPacked(html: string): string[] {
+  const out: string[] = [];
+  const re = /eval\(function\(p,a,c,k,e,d\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    try {
+      const up = unpackPacked(html.slice(m.index));
+      if (up && up !== html.slice(m.index)) out.push(up);
+    } catch {}
+  }
+  return out;
+}
+
+/**
+ * Generic static extractor: fetch the embed page HTML from the main process
+ * (correct canonical Referer, playback UA so any minted token stays valid for
+ * the <video> that plays it), un-pack packed JS, and regex out the first real
+ * .m3u8/.mp4 source. Sub-second when it hits — the headless capture engine is
+ * only needed for embeds that compute the URL at runtime.
+ *
+ * Handles two provider quirks:
+ *  - voe-style tiny redirect pages (`window.location.href = '…'`) — followed once.
+ *  - voe's base64 `'hls': '…'` source field.
+ */
+async function extractViaHtml(
+  iframeUrl: string,
+  label: string,
+): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+  try {
+    let pageUrl = iframeUrl;
+    let html = "";
+    for (let hop = 0; hop < 2; hop++) {
+      const u = new URL(pageUrl);
+      const canon = providerRefererForHost(u.hostname) ?? {
+        referer: `${u.protocol}//${u.host}/`,
+        origin: `${u.protocol}//${u.host}`,
+      };
+      const resp = await session.defaultSession.fetch(pageUrl, {
+        method: "GET",
+        headers: {
+          "User-Agent": PLAYBACK_UA,
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Referer": canon.referer,
+          "Origin": canon.origin,
+          "X-Pantoufa-Proxy": "1",
+        },
+        redirect: "follow",
+        cache: "no-store",
+      });
+      if (!resp.ok) {
+        console.info(`[${label}] static GET ${pageUrl} → ${resp.status}`);
+        return null;
+      }
+      html = await resp.text();
+      // voe serves a tiny stub that client-side-redirects to a mirror domain.
+      const redir = html.match(/window\.location\.href\s*=\s*['"](https?:\/\/[^'"]+)['"]/);
+      if (redir && hop === 0 && html.length < 4096) {
+        pageUrl = redir[1];
+        continue;
+      }
+      break;
+    }
+    if (!html) return null;
+
+    const haystacks = [html, ...unpackAllPacked(html)];
+    const patterns = [
+      /(?:file|src)\s*:\s*["']([^"']+\.m3u8[^"']*)["']/i,
+      /sources\s*:\s*\[\s*\{[^}]*?(?:file|src)\s*:\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']/i,
+      // uqload-style bare string array: sources: ["https://…mp4"]
+      /sources\s*:\s*\[\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']/i,
+      /(?:file|src)\s*:\s*["']([^"']+\.mp4[^"']*)["']/i,
+      /<source[^>]+src\s*=\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']/i,
+      /(https?:\/\/[^"'\s\\<>]+\.(?:m3u8|mp4)[^"'\s\\<>]*)/i,
+    ];
+    for (const text of haystacks) {
+      for (const re of patterns) {
+        const raw = text.match(re)?.[1];
+        if (!raw || DECOY_RE.test(raw)) continue;
+        let abs = "";
+        try { abs = new URL(raw, pageUrl).toString(); } catch { continue; }
+        if (!/^https?:\/\//.test(abs)) continue;
+        console.info(`[${label}] static HTML hit → ${abs}`);
+        return { url: abs, type: /\.m3u8(\?|#|$)/i.test(abs) ? "hls" : "mp4" };
+      }
+    }
+    // voe inline base64 HLS source.
+    const hlsB64 = html.match(/['"]hls['"]\s*:\s*['"]([A-Za-z0-9+/=]{40,})['"]/);
+    if (hlsB64) {
+      try {
+        const dec = Buffer.from(hlsB64[1], "base64").toString("utf8");
+        if (/^https?:\/\//.test(dec)) {
+          console.info(`[${label}] base64 hls hit → ${dec}`);
+          return { url: dec, type: "hls" };
+        }
+      } catch {}
+    }
+    console.info(`[${label}] static HTML found no source`);
+    return null;
+  } catch (e) {
+    console.warn(`[${label}] static HTML extraction failed:`, e);
+    return null;
+  }
+}
+
+// doodstream: the embed page carries a /pass_md5/… path; GET-ing it (with the
+// embed page as Referer) returns the CDN base URL, to which the player appends
+// 10 random chars + ?token=<md5 tail>&expiry=<now>. No .mp4 extension on the
+// final URL — the proxy's extension-less chunking handles playback.
+async function extractDood(
+  iframeUrl: string,
+): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+  try {
+    const u = new URL(iframeUrl);
+    const idM = u.pathname.match(/\/(?:e|d)\/([a-zA-Z0-9]+)/);
+    const embedUrl = idM ? `${u.origin}/e/${idM[1]}` : iframeUrl;
+    const resp = await session.defaultSession.fetch(embedUrl, {
+      method: "GET",
+      headers: {
+        "User-Agent": PLAYBACK_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": `${u.origin}/`,
+        "X-Pantoufa-Proxy": "1",
+      },
+      redirect: "follow",
+      cache: "no-store",
+    });
+    if (!resp.ok) return null;
+    // dood domains rotate via redirects (dood.li → dood.watch …) — pass_md5
+    // must be fetched from the FINAL host with the final page as Referer.
+    const finalUrl = resp.url || embedUrl;
+    const html = await resp.text();
+    const md5Path =
+      html.match(/\$\.get\(\s*['"](\/pass_md5\/[^'"]+)['"]/)?.[1] ||
+      html.match(/['"](\/pass_md5\/[^'"]+)['"]/)?.[1];
+    if (!md5Path) {
+      console.info("[extractDood] no pass_md5 in embed HTML");
+      return null;
+    }
+    const token = md5Path.split("/").pop() || "";
+    const fo = new URL(finalUrl);
+    const r2 = await session.defaultSession.fetch(`${fo.origin}${md5Path}`, {
+      method: "GET",
+      headers: {
+        "User-Agent": PLAYBACK_UA,
+        "Referer": finalUrl,
+        "X-Pantoufa-Proxy": "1",
+      },
+      cache: "no-store",
+    });
+    if (!r2.ok) return null;
+    const base = (await r2.text()).trim();
+    if (!/^https?:\/\//.test(base)) return null;
+    const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let rand = "";
+    for (let i = 0; i < 10; i++) rand += alphabet[Math.floor(Math.random() * alphabet.length)];
+    const url = `${base}${rand}?token=${token}&expiry=${Date.now()}`;
+    console.info(`[extractDood] → ${url}`);
+    return { url, type: "mp4" };
+  } catch (e) {
+    console.warn("[extractDood] failed:", e);
+    return null;
+  }
+}
+
+// vk: the video_ext.php embed HTML inlines a player JSON with progressive
+// MP4s keyed "url240"…"url1080" plus an optional "hls" manifest.
+async function extractVk(
+  iframeUrl: string,
+): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+  try {
+    const resp = await session.defaultSession.fetch(iframeUrl, {
+      method: "GET",
+      headers: {
+        "User-Agent": PLAYBACK_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://vk.com/",
+        "Origin": "https://vk.com",
+        "X-Pantoufa-Proxy": "1",
+      },
+      redirect: "follow",
+      cache: "no-store",
+    });
+    if (!resp.ok) return null;
+    const html = await resp.text();
+    const unesc = (s: string) => s.replace(/\\\//g, "/").replace(/\\u0026/g, "&").replace(/&amp;/g, "&");
+    let best: { q: number; url: string } | null = null;
+    const re = /"url(\d{3,4})"\s*:\s*"([^"]+)"/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html))) {
+      const q = parseInt(m[1], 10);
+      const url = unesc(m[2]);
+      if (!/^https?:\/\//.test(url)) continue;
+      if (!best || q > best.q) best = { q, url };
+    }
+    if (best) {
+      console.info(`[extractVk] mp4 ${best.q}p → ${best.url}`);
+      return { url: best.url, type: "mp4" };
+    }
+    const hls = html.match(/"hls"\s*:\s*"([^"]+)"/);
+    if (hls) {
+      const url = unesc(hls[1]);
+      if (/^https?:\/\//.test(url)) {
+        console.info(`[extractVk] hls → ${url}`);
+        return { url, type: "hls" };
+      }
+    }
+    console.info("[extractVk] no stream URL in embed HTML");
+    return null;
+  } catch (e) {
+    console.warn("[extractVk] failed:", e);
+    return null;
+  }
+}
+
 // Pull the real .mp4 URL straight out of mp4upload's embed page from the
 // main process, the same way we do for dailymotion/videa/streamwish. The
 // renderer then plays it in the native <video> element via the proxy
@@ -658,26 +1074,41 @@ async function extractMp4upload(
   } catch {}
 
   // ── Strategy 1: cheap server-side HTML fetch + un-pack ──
+  // Retry transient failures (Cloudflare 5xx/503 "checking your browser",
+  // rate-limit, network blip). A single attempt that came back non-200 was
+  // silently dropping us to the black iframe fallback even though the embed
+  // HTML reliably carries the .mp4 URL. The UA MUST be the desktop playback
+  // UA (see PLAYBACK_UA) so the token we extract is valid for the <video>
+  // request that plays it.
   let html = "";
-  try {
-    const resp = await session.defaultSession.fetch(embedUrl, {
-      method: "GET",
-      headers: {
-        "User-Agent": VIDEO_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.mp4upload.com/",
-        "Origin": "https://www.mp4upload.com",
-        // Marker so onBeforeSendHeaders leaves our Referer alone (see handler).
-        "X-Pantoufa-Proxy": "1",
-      },
-      redirect: "follow",
-      cache: "no-store",
-    });
-    console.info(`[extractMp4upload] GET ${embedUrl} → ${resp.status}`);
-    if (resp.ok) html = await resp.text();
-  } catch (e) {
-    console.warn("[extractMp4upload] HTML fetch failed:", e);
+  for (let attempt = 0; attempt < 3 && !html; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
+    try {
+      const resp = await session.defaultSession.fetch(embedUrl, {
+        method: "GET",
+        headers: {
+          "User-Agent": PLAYBACK_UA,
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Referer": "https://www.mp4upload.com/",
+          "Origin": "https://www.mp4upload.com",
+          // Marker so onBeforeSendHeaders leaves our Referer alone (see handler).
+          "X-Pantoufa-Proxy": "1",
+        },
+        redirect: "follow",
+        cache: "no-store",
+      });
+      console.info(`[extractMp4upload] GET ${embedUrl} (try ${attempt + 1}) → ${resp.status}`);
+      if (resp.ok) {
+        const text = await resp.text();
+        // A Cloudflare interstitial / placeholder returns 200 but carries no
+        // player config — only accept a body that actually has a source.
+        if (/player\.src|sources?\s*[:=]|\.mp4/i.test(text)) html = text;
+        else console.warn("[extractMp4upload] 200 but no source markers, retrying");
+      }
+    } catch (e) {
+      console.warn(`[extractMp4upload] HTML fetch failed (try ${attempt + 1}):`, e);
+    }
   }
 
   if (html) {
@@ -724,6 +1155,55 @@ async function extractMp4upload(
     console.warn("[extractMp4upload] headless capture found nothing");
   } catch (e) {
     console.warn("[extractMp4upload] headless capture failed:", e);
+  }
+  return null;
+}
+
+// anime3rb's first-party video host (video.vid3rb.com). The /player/<uuid>
+// page inlines a `video_sources` JSON array carrying direct tokenized .mp4
+// URLs per quality (480p/720p/1080p), so a single cheap GET yields a stream
+// the custom player plays natively — the CDN URLs answer Range requests,
+// need no Referer, and aren't IP-locked (their signed redirect carries
+// noip=yes). Premium-gated qualities ship with an empty src and are skipped.
+// Tokens expire in ~40 minutes, which is why extraction happens at play time
+// (the resolve cache is 90s) rather than when the server list is built.
+async function extractVid3rb(
+  playerUrl: string,
+): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
+    try {
+      const resp = await session.defaultSession.fetch(playerUrl, {
+        method: "GET",
+        headers: {
+          "User-Agent": PLAYBACK_UA,
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "ar,en;q=0.9",
+          "Referer": "https://anime3rb.com/",
+          "X-Pantoufa-Proxy": "1",
+        },
+        redirect: "follow",
+        cache: "no-store",
+      });
+      console.info(`[extractVid3rb] GET ${playerUrl} (try ${attempt + 1}) → ${resp.status}`);
+      if (!resp.ok) continue;
+      const html = await resp.text();
+      // The page declares `video_sources` twice — an empty [] then the real
+      // array — so match the non-empty form. The match is valid JSON as-is
+      // (URLs use JSON's escaped https:\/\/… slashes).
+      const m = html.match(/video_sources\s*=\s*(\[\{[\s\S]*?\}\])\s*;/);
+      if (!m) { console.warn("[extractVid3rb] no video_sources in player HTML"); continue; }
+      let sources: { src?: string; res?: string; label?: string; premium?: boolean }[] = [];
+      try { sources = JSON.parse(m[1]); } catch { continue; }
+      const best = sources
+        .filter((s) => s.src && /^https?:\/\//.test(s.src) && !s.premium)
+        .sort((a, b) => (parseInt(b.res || "0", 10) || 0) - (parseInt(a.res || "0", 10) || 0))[0];
+      if (!best?.src) { console.warn("[extractVid3rb] no playable (non-premium) source"); return null; }
+      console.info(`[extractVid3rb] ${best.label || best.res || "?"} → ${best.src}`);
+      return { url: best.src, type: /\.m3u8(\?|$)/i.test(best.src) ? "hls" : "mp4" };
+    } catch (e) {
+      console.warn(`[extractVid3rb] fetch failed (try ${attempt + 1}):`, e);
+    }
   }
   return null;
 }
@@ -907,16 +1387,23 @@ function registerVideoProxy() {
       ];
     }
 
-    // streamwish family: CDN host (vibuxer.com, audinifer.com) expects the
-    // embed-page Referer (hgcloud.to, streamwish.to) not its own domain.
-    // Also check embed.hostname so rotating CDN mirrors (cybervynx.com,
-    // ghbrisk.com) that don't match any static regex still get the single
-    // canonical strategy instead of a 4-way parallel race that overloads
-    // the CDN and triggers 403 rate-limiting.
+    // streamwish family: the CDN whitelists the Referer of the EMBED PAGE that
+    // minted the token — and streamwish rotates that page across many mirror
+    // domains (hgcloud.to, embedwish.com, awish.pro, …). Hard-coding
+    // streamwish.to as the only Referer therefore 403s every segment whenever
+    // the embed lives on a different mirror, with no fallback to recover (which
+    // is exactly why streamwish "doesn't play" in the custom player while every
+    // other provider does). So lead with the ACTUAL embed-page Referer, then
+    // fall back to the streamwish.to literal and the CDN's own domain. The
+    // winning strategy is cached per host, so this races at most once per host
+    // — the rate-limit concern that motivated the single-strategy lock still
+    // holds for every subsequent fetch.
     if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(target.hostname)
-        || /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish/.test(embed.hostname)) {
+        || /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(embed.hostname)) {
       return [
+        { name: "embed", headers: embedHeaders },
         { name: "canonical", headers: canonicalHeaders },
+        { name: "target-self", headers: targetHeaders },
       ];
     }
 
@@ -1169,7 +1656,16 @@ function registerVideoProxy() {
       // fast and the user sees the picture quickly.
       const isMp4 = /\.mp4(\?|$)/i.test(target);
       const isHlsSegment = /\.(m4s|ts)(\?|$)/i.test(target);
-      const isLargeMedia = isMp4 || isHlsSegment;
+      const isManifest = /\.(m3u8|mpd)(\?|$)/i.test(target);
+      // Extension-less CDN media (ok.ru/mycdn.me progressive mp4, doodstream
+      // tokens, vk) must ALSO be chunked — without this the proxy buffers the
+      // entire 100MB+ file via arrayBuffer() before returning a byte, which
+      // trips the watchdogs and ends in a black player. Manifests (which may
+      // also lack an extension, e.g. ok.ru hlsManifestUrl) are tiny and get
+      // detected by content-type below, so chunking them is harmless.
+      const lastSeg = target.split("?")[0].split("#")[0].split("/").pop() || "";
+      const hasExtension = /\.[a-z0-9]{2,5}$/i.test(lastSeg);
+      const isLargeMedia = isMp4 || isHlsSegment || (!isManifest && !hasExtension);
       const CHUNK_SIZE = isMp4 ? 1 * 1024 * 1024 : 4 * 1024 * 1024;
       let range = request.headers.get("range");
       if (isLargeMedia) {
@@ -1267,6 +1763,13 @@ function registerVideoProxy() {
       }
       if (/\.m4s(\?|$)/i.test(target) && (!outCt || outCt === "application/octet-stream")) {
         outHeaders.set("content-type", "video/iso.segment");
+      }
+      // Extension-less progressive media (dood tokens, vk, ok.ru mp4) often
+      // comes back as octet-stream, which the <video> element refuses to
+      // decode. Manifests never reach here (handled in the isHls branch), so
+      // defaulting to video/mp4 is safe.
+      if (!hasExtension && (!outCt || outCt === "application/octet-stream")) {
+        outHeaders.set("content-type", "video/mp4");
       }
 
       outHeaders.set("Access-Control-Allow-Origin", "*");
@@ -1596,15 +2099,27 @@ app.whenReady().then(() => {
       if (opts.provider === "okru") {
         return await extractOkru(opts.iframeUrl);
       }
-      // Providers whose player requests a real .m3u8/.mp4 URL — the generic
-      // headless capture engine pulls the stream so it plays in the custom
-      // <video> player. Falls back to the iframe in the renderer on null.
+      if (opts.provider === "doodstream") {
+        return await extractDood(opts.iframeUrl);
+      }
+      if (opts.provider === "vk") {
+        return await extractVk(opts.iframeUrl);
+      }
+      if (opts.provider === "vid3rb") {
+        return await extractVid3rb(opts.iframeUrl);
+      }
+      // Providers whose player requests a real .m3u8/.mp4 URL. Try the cheap
+      // static-HTML pass first (most of these inline the source in packed JS,
+      // so it resolves in <1s); the generic headless capture engine is the
+      // fallback. Renderer falls back to the iframe on null.
       if (
         opts.provider === "voe" ||
         opts.provider === "share4max" ||
         opts.provider === "streamruby" ||
         opts.provider === "uqload"
       ) {
+        const viaHtml = await extractViaHtml(opts.iframeUrl, `extract:${opts.provider}`);
+        if (viaHtml) return viaHtml;
         // voe/share4max sometimes sit behind Cloudflare → allow extra time.
         const timeout = opts.provider === "uqload" ? 25000 : 32000;
         return await extractViaCapture(opts.iframeUrl, `extract:${opts.provider}`, timeout);
@@ -1626,29 +2141,51 @@ app.whenReady().then(() => {
   // static HTML (<li data-watch>), so a plain GET is far faster and more
   // reliable than rendering the page in a headless window (which trips
   // anime4up's ad redirects / JS gates). Returns the body text, or null.
+  //
+  // anime4up is intermittently flaky: a single GET routinely hits a timeout,
+  // a 429 rate-limit (the resolve chain fires several GETs in a burst), a 503,
+  // or a transient Cloudflare hiccup. The anime4up→servers chain is THREE such
+  // GETs back-to-back (search → episode list → server list), so any one of
+  // them returning null used to collapse the whole chain and leave the user
+  // waiting on the renderer's slow (1.5s–15s) backoff loops — that's the
+  // "servers take forever / sometimes never show" symptom. Retry each GET a few
+  // times with a short per-attempt timeout and a small growing backoff so a
+  // transient miss self-heals in well under a second instead of bubbling up.
   ipcMain.handle("pantoufa:fetch-html", async (
     _evt,
     opts: { url: string; referer?: string },
   ): Promise<string | null> => {
-    try {
+    const ATTEMPTS = 3;
+    const PER_ATTEMPT_TIMEOUT_MS = 9000;
+    for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
       const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 20000);
-      const res = await fetch(opts.url, {
-        signal: controller.signal,
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language": "ar,en;q=0.9",
-          ...(opts.referer ? { Referer: opts.referer } : {}),
-        },
-      });
-      clearTimeout(t);
-      if (!res.ok) return null;
-      return await res.text();
-    } catch {
-      return null;
+      const t = setTimeout(() => controller.abort(), PER_ATTEMPT_TIMEOUT_MS);
+      try {
+        const res = await fetch(opts.url, {
+          signal: controller.signal,
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ar,en;q=0.9",
+            ...(opts.referer ? { Referer: opts.referer } : {}),
+          },
+        });
+        clearTimeout(t);
+        if (res.ok) return await res.text();
+        // Retry the transient/edge statuses (rate-limit, Cloudflare, 5xx);
+        // a hard 4xx (404/410) won't change on retry, so bail immediately.
+        const retryable = res.status === 429 || res.status === 403 || res.status >= 500;
+        if (!retryable || attempt === ATTEMPTS) return null;
+      } catch {
+        clearTimeout(t);
+        if (attempt === ATTEMPTS) return null;
+      }
+      // Growing backoff between attempts (0.6s, 1.2s) — long enough to ride out
+      // a rate-limit burst, short enough that recovery stays near-instant.
+      await new Promise((r) => setTimeout(r, 600 * attempt));
     }
+    return null;
   });
 
   // Kept for backwards compatibility; no-op now that we proxy.

@@ -11,6 +11,7 @@ import {
   EXTRACT_RECENT,
   EXTRACT_LISTING,
   EXTRACT_TITLE_MATCH,
+  EXTRACT_TITLE_MATCH_A3RB,
   EXTRACT_VIDEO_SERVERS,
   EXTRACT_VIDEO_URL,
   VIDEO_HOOK_INSTALL,
@@ -18,6 +19,7 @@ import {
 
 const WIT_BASE = "https://witanime.you";
 const UP4_BASE = "https://w1.anime4up.rest";
+const A3RB_BASE = "https://anime3rb.com";
 const ALL_ANIME_PATH = encodeURIComponent("قائمة-الانمي");
 
 function enqueue<T>(job: {
@@ -26,6 +28,7 @@ function enqueue<T>(job: {
   injectAfter: string;
   timeoutMs: number;
   isVideoJob?: boolean;
+  priority?: boolean;
 }): Promise<T> {
   return window.pantoufa.scrape(job) as Promise<T>;
 }
@@ -127,7 +130,9 @@ export type RawServer = { id: string; name: string; iframeUrl: string; provider:
 export async function scrapeVideoServers(episodeUrl: string) {
   console.info(`[scraper] scraping video servers from: ${episodeUrl}`);
   const result = await enqueue<{ servers: RawServer[]; episodeTitle: string; animeTitle: string; up4EpisodeUrl?: string | null; up4AnimeUrl?: string | null }>({
-    url: episodeUrl, injectAfter: EXTRACT_VIDEO_SERVERS, timeoutMs: 25000,
+    // priority: the user is sitting on the watch page waiting for this —
+    // it must never queue behind background home/listing scrapes.
+    url: episodeUrl, injectAfter: EXTRACT_VIDEO_SERVERS, timeoutMs: 25000, priority: true,
   });
   if (!result || !Array.isArray(result.servers)) {
     console.warn(`[scraper] failed to scrape ${episodeUrl}, returning empty result`);
@@ -152,6 +157,7 @@ function classifyProvider(url: string): string {
   if (/ok\.ru/.test(u)) return "okru";
   if (/videa\.|vidvaita|vidit/.test(u)) return "videa";
   if (/vk\.com/.test(u)) return "vk";
+  if (/vid3rb|anime3rb/.test(u)) return "vid3rb";
   return "generic";
 }
 
@@ -182,9 +188,7 @@ function normalizeEmbedUrl(src: string): string {
 // initial response, so a single privileged GET (no CORS, no headless render)
 // returns all servers fast and reliably — the headless window trips
 // anime4up's ad redirects / JS gates and frequently comes back empty.
-export async function scrapeAnime4upServersDirect(episodeUrl: string): Promise<RawServer[]> {
-  const html = await window.pantoufa.fetchHtml?.(episodeUrl, UP4_BASE + "/");
-  if (!html) return [];
+function parseUp4Servers(html: string): RawServer[] {
   // Constrain to the #episode-servers list when present to avoid menu/li noise.
   let scope = html;
   const segStart = html.indexOf('id="episode-servers"');
@@ -209,6 +213,49 @@ export async function scrapeAnime4upServersDirect(episodeUrl: string): Promise<R
     out.push({ id: String(out.length), name, iframeUrl: src, provider: classifyProvider(src) });
   }
   return out;
+}
+
+export async function scrapeAnime4upServersDirect(episodeUrl: string): Promise<RawServer[]> {
+  const html = await window.pantoufa.fetchHtml?.(episodeUrl, UP4_BASE + "/");
+  if (!html) return [];
+  return parseUp4Servers(html);
+}
+
+// Full episode-page parse (servers + display titles) from a single static GET.
+// Used when the PRIMARY episode is an anime4up URL: the headless render takes
+// many seconds and frequently trips anime4up's ad gates, while the static HTML
+// reliably carries the entire server list — so this path shows servers
+// near-instantly. Returns null when the fetch fails or no servers parse, in
+// which case the caller falls back to the headless scrape.
+export async function scrapeAnime4upEpisodePageDirect(
+  episodeUrl: string,
+): Promise<{ servers: RawServer[]; episodeTitle: string; animeTitle: string } | null> {
+  const html = await window.pantoufa.fetchHtml?.(episodeUrl, UP4_BASE + "/");
+  if (!html) return null;
+  const servers = parseUp4Servers(html);
+  if (servers.length === 0) return null;
+  const deent = (s: string) =>
+    s.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#0?39;/g, "'")
+      .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/\s+/g, " ").trim();
+  // Episode title: prefer the page heading, fall back to <title> minus the
+  // site-name suffix.
+  let episodeTitle = "";
+  const h3 = html.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i);
+  if (h3) episodeTitle = deent(h3[1].replace(/<[^>]+>/g, ""));
+  if (!episodeTitle) {
+    const t = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    if (t) episodeTitle = deent(t[1]).split(/\s*[|–-]\s*(?:anime4up|أنمي فور أب).*/i)[0].trim();
+  }
+  // Anime title: the breadcrumb/anime-page link, else strip "الحلقة N" off
+  // the episode title.
+  let animeTitle = "";
+  const link = html.match(/anime-page-link[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i)
+    || html.match(/<a[^>]*href=["'][^"']*\/anime\/[^"']*["'][^>]*>([\s\S]*?)<\/a>/i);
+  if (link) animeTitle = deent(link[1].replace(/<[^>]+>/g, ""));
+  if (!animeTitle && episodeTitle) {
+    animeTitle = episodeTitle.replace(/الحلقة\s*\d+.*$/, "").replace(/\bepisode\s*\d+.*$/i, "").trim();
+  }
+  return { servers, episodeTitle, animeTitle };
 }
 
 // ── Direct (no-headless) cross-source search + episode list for anime4up ──
@@ -357,11 +404,21 @@ function up4EpisodeNumber(href: string, title?: string): number | null {
 // Parse an anime4up anime page's episode list straight from static HTML.
 // Captures the full <a> tag so we can read the episode number from its title
 // attribute (the URL hash slug carries no reliable number).
-export async function scrapeAnime4upEpisodesDirect(
-  animeUrl: string,
-): Promise<{ title: string; number: number; type: string; screenshot: string; href: string }[]> {
-  const html = await window.pantoufa.fetchHtml?.(animeUrl, UP4_BASE + "/");
-  if (!html) return [];
+function parseUp4Episodes(
+  html: string,
+): { title: string; number: number; type: string; screenshot: string; href: string }[] {
+  // Constrain to the episodes-list container when present. The page chrome
+  // (the "latest episodes" rail on paginated pages) carries /episode/ links
+  // from the NEWEST part of the series, which widen the parsed number range —
+  // findUp4EpisodeAcrossPages then sees the wanted episode "within this
+  // page's range but missing", concludes numbering gap, and gives up even
+  // though the neighbouring page actually has it (verified live: One Piece
+  // /page/16/ parses as 420–1165 unscoped, 420–467 scoped).
+  const segStart = html.indexOf("episodes-list-content");
+  if (segStart >= 0) {
+    const segEnd = html.indexOf("pagination", segStart);
+    html = html.slice(segStart, segEnd > segStart ? segEnd : undefined);
+  }
   const out: { title: string; number: number; type: string; screenshot: string; href: string }[] = [];
   const seen = new Set<string>();
   // Match an episode anchor and grab the whole opening tag so title= (which may
@@ -385,6 +442,341 @@ export async function scrapeAnime4upEpisodesDirect(
   }
   out.sort((a, b) => a.number - b.number);
   return out;
+}
+
+export async function scrapeAnime4upEpisodesDirect(
+  animeUrl: string,
+): Promise<{ title: string; number: number; type: string; screenshot: string; href: string }[]> {
+  const html = await window.pantoufa.fetchHtml?.(animeUrl, UP4_BASE + "/");
+  if (!html) return [];
+  return parseUp4Episodes(html);
+}
+
+function up4PageUrl(animeUrl: string, page: number): string {
+  const base = animeUrl.replace(/\/+$/, "");
+  return page <= 1 ? base + "/" : `${base}/page/${page}/`;
+}
+
+function up4MaxPage(html: string): number {
+  let max = 1;
+  const re = /\/page\/(\d+)\//g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    const v = parseInt(m[1], 10);
+    if (!isNaN(v) && v > max) max = v;
+  }
+  return max;
+}
+
+// anime4up PAGINATES anime episode lists (newest-first, ~40 episodes per page;
+// One Piece spans 25 pages), so a page-1 parse only ever sees the newest chunk.
+// Episodes older than that chunk used to be unresolvable — the cross-source
+// lookup found the anime page, parsed page 1, missed the episode, and anime4up
+// servers NEVER showed for it no matter how often it retried. This walks the
+// pagination toward the requested episode number instead: estimate the target
+// page from the numbers on page 1, fetch it, and correct the estimate from
+// what that page actually shows. Bounded to a handful of fetches.
+export async function findUp4EpisodeAcrossPages(
+  animeUrl: string,
+  epNumber: number,
+): Promise<string | null> {
+  const html = await window.pantoufa.fetchHtml?.(animeUrl, UP4_BASE + "/");
+  if (!html) return null;
+  const eps = parseUp4Episodes(html);
+  const hit = eps.find((e) => e.number === epNumber);
+  if (hit) return hit.href;
+  if (eps.length === 0) return null;
+  const maxPage = up4MaxPage(html);
+  if (maxPage <= 1) return null;
+  const lo = eps[0].number;
+  const hi = eps[eps.length - 1].number;
+  const perPage = Math.max(eps.length, 1);
+  // Episode within page 1's range but absent → a numbering gap (special /
+  // movie), not a pagination miss; other pages won't have it either.
+  if (epNumber >= lo && epNumber <= hi) return null;
+  // First estimate. Direction-agnostic: newest-first lists put older episodes
+  // on higher pages (epNumber < lo), oldest-first the reverse — the correction
+  // loop below converges either way because it re-reads each page's range.
+  const clamp = (p: number) => Math.min(Math.max(p, 2), maxPage);
+  let page = clamp(
+    1 + Math.ceil((epNumber < lo ? lo - epNumber : epNumber - hi) / perPage),
+  );
+  const visited = new Set<number>([1]);
+  for (let i = 0; i < 5; i++) {
+    if (visited.has(page)) break;
+    visited.add(page);
+    const ph = await window.pantoufa.fetchHtml?.(up4PageUrl(animeUrl, page), UP4_BASE + "/");
+    if (!ph) return null;
+    const pe = parseUp4Episodes(ph);
+    if (pe.length === 0) return null;
+    const phit = pe.find((e) => e.number === epNumber);
+    if (phit) return phit.href;
+    const plo = pe[0].number;
+    const phi = pe[pe.length - 1].number;
+    // Within this page's range but missing → a numbering gap, stop.
+    if (epNumber >= plo && epNumber <= phi) return null;
+    // Derive the sort order by comparing this page's numbers to page 1's:
+    // anime4up lists newest-first (numbers DECREASE as the page increases),
+    // but derive it rather than assume so an ordering flip can't strand us.
+    const numbersDecreaseWithPage = phi < lo;
+    const distance = epNumber < plo ? plo - epNumber : epNumber - phi;
+    const step = Math.max(1, Math.ceil(distance / perPage));
+    const needLowerNumbers = epNumber < plo;
+    page = clamp(needLowerNumbers === numbersDecreaseWithPage ? page + step : page - step);
+  }
+  return null;
+}
+
+// ── anime3rb (third server source) ──
+// anime3rb serves its pages statically (Laravel/Livewire — the full payload
+// is in the initial HTML) and uses PREDICTABLE URLs: /titles/<slug> for the
+// anime page and /episode/<slug>/<number> for episodes, with clean
+// Str::slug-style slugs ("Dr. Stone: Science Future Part 3" →
+// dr-stone-science-future-part-3). So the whole resolution chain is: derive
+// candidate slugs from the title → probe /titles/<slug> (a miss is a fast
+// 404) → construct the episode URL directly. Only /search sits behind a
+// Cloudflare managed challenge, so free-text search falls back to the
+// headless window (real Chromium passes the challenge).
+
+function a3rbSlugify(s: string): string {
+  return (s || "")
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "") // strip diacritics (é → e)
+    .toLowerCase()
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function a3rbOrdinal(n: number): string {
+  return n === 1 ? "1st" : n === 2 ? "2nd" : n === 3 ? "3rd" : `${n}th`;
+}
+
+// Candidate slugs for a title, most-specific first. anime3rb's season naming
+// is inconsistent ("kanojo-okarishimasu-5th-season" but "dorohedoro-season-2"),
+// so when the title carries a season marker we emit every common shape. The
+// bare base name is only probed for season 1 — matching season 1's page for a
+// later season would resolve to the WRONG episodes (numbering restarts).
+// Parenthesized alternative names get their own variant set: witanime often
+// appends the romaji original in parens ("Blades of the Guardians Season 2
+// (Biao Ren 2)") and anime3rb may index the anime ONLY under that name.
+function a3rbSlugVariants(title: string): string[] {
+  const out: string[] = [];
+  const add = (s: string) => { const v = a3rbSlugify(s); if (v && !out.includes(v)) out.push(v); };
+  const forms: string[] = [title];
+  const reParen = /[\(\[]([^\)\]]+)[\)\]]/g;
+  let pm: RegExpExecArray | null;
+  while ((pm = reParen.exec(title))) { const p = pm[1].trim(); if (p) forms.push(p); }
+  for (const form of forms) {
+    const cleaned = form
+      .replace(/[\(\[][^\)\]]*[\)\]]/g, " ")
+      // Episode markers leak into titles derived from episode pages/URLs
+      // ("… الحلقة 11", "… Episode 11") — and a percent-encoded الحلقة arrives
+      // as "%D8%A7%D9%84… 11" junk. Strip all of it or every slug guess 404s.
+      .replace(/الحلقة\s*\d+.*$/, " ")
+      .replace(/\bepisodes?\s*\d+.*$/i, " ")
+      .replace(/(?:%[0-9a-f]{2})+[\s\d]*$/gi, " ") // trailing junk drags its episode number along
+      .replace(/(?:%[0-9a-f]{2})+/gi, " ")
+      .replace(/\s+/g, " ").trim();
+    add(cleaned);
+    // Laravel's Str::slug DROPS a colon that touches both words instead of
+    // dashing it: "Re:Zero kara…" lives at rezero-kara-…, not re-zero-kara-….
+    add(cleaned.replace(/(\S)[:：](\S)/g, "$1$2"));
+    add(cleaned.split(/\s*[:：]\s*/)[0]);
+    const seasonM =
+      cleaned.match(/\b(\d+)(?:st|nd|rd|th)\s+season\b/i) ||
+      cleaned.match(/\bseason\s+(\d+)\b/i) ||
+      cleaned.match(/\bpart\s+(\d+)\b/i);
+    if (seasonM) {
+      const n = parseInt(seasonM[1], 10);
+      const base = cleaned
+        .replace(/\b(?:the\s+)?(?:\d+(?:st|nd|rd|th)\s+season|season\s+\d+|part\s+\d+)\b/i, " ")
+        .replace(/\s+/g, " ").trim();
+      if (base && !isNaN(n)) {
+        add(`${base} ${a3rbOrdinal(n)} season`);
+        add(`${base} season ${n}`);
+        add(`${base} part ${n}`);
+        add(`${base} ${n}`);
+        if (n === 1) add(base);
+      }
+    }
+  }
+  return out.slice(0, 12);
+}
+
+// Probe /titles/<slug> and verify the page's own title actually matches the
+// wanted anime (same >=34 threshold as the other cross-source matchers) so a
+// coincidental slug can't hijack the match. Returns the page URL or null.
+async function probeA3rbTitlePage(slug: string, title: string): Promise<string | null> {
+  const url = `${A3RB_BASE}/titles/${slug}`;
+  const html = await window.pantoufa.fetchHtml?.(url, A3RB_BASE + "/");
+  if (!html) return null; // 404 / fetch failure
+  const tm =
+    html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i) ||
+    html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const got = tm ? tm[1].replace(/\s*[|–]\s*Anime3rb.*$/i, "").trim() : slug.replace(/-+/g, " ");
+  return tm_score(title, got) >= 34 ? url : null;
+}
+
+// Probe /titles/<slug> for each candidate slug shape derived from the title.
+export async function searchAnime3rbDirect(title: string): Promise<string | null> {
+  if (!title) return null;
+  for (const slug of a3rbSlugVariants(title)) {
+    const url = await probeA3rbTitlePage(slug, title);
+    if (url) return url;
+  }
+  return null;
+}
+
+// ── anime3rb catalog (sitemap) matching ──
+// /search sits behind a Cloudflare managed challenge that NEVER completes
+// inside the hidden scraper window (it idles on the interstitial until the
+// timeout), so free-text search is effectively dead. But anime3rb publishes a
+// daily titles sitemap (~6300 slugs, one plain GET, no Cloudflare) — fuzzy-
+// matching the wanted title against the whole catalog finds anime whose slug
+// can't be guessed from the witanime title: different romanization
+// (Re:Zero → rezero-…), an anime indexed only under its alternative name, or
+// a shortened witanime title ("Yuusha no Rokkotsu de" lives at
+// megami-isekai-tensei-…-ore-yuusha-no-rokkotsu-de).
+let a3rbCatalog: { slugs: string[]; ts: number } | null = null;
+const A3RB_CATALOG_TTL = 6 * 60 * 60 * 1000;
+
+async function fetchA3rbCatalog(): Promise<string[]> {
+  if (a3rbCatalog && Date.now() - a3rbCatalog.ts < A3RB_CATALOG_TTL) return a3rbCatalog.slugs;
+  const xml = await window.pantoufa.fetchHtml?.(
+    `${A3RB_BASE}/storage/sitemaps/titles_sitemap.xml`,
+    A3RB_BASE + "/",
+  );
+  if (!xml) return a3rbCatalog?.slugs ?? [];
+  const slugs: string[] = [];
+  const re = /<loc>\s*https?:\/\/anime3rb\.com\/titles\/([^<\s]+?)\/?\s*<\/loc>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml))) {
+    try { slugs.push(decodeURIComponent(m[1])); } catch { slugs.push(m[1]); }
+  }
+  if (slugs.length > 0) a3rbCatalog = { slugs, ts: Date.now() };
+  return slugs;
+}
+
+// Season number for a catalog slug / title. Falls back to a small trailing
+// number ("haikyuu-2" style naming) — capped low so number-bearing titles
+// (mob-psycho-100) aren't misread as season markers.
+function a3rbSeasonOf(label: string): number {
+  const k = tm_seasonNum(label);
+  if (k !== 1) return k;
+  const t = label.match(/(?:^|[\s-])(\d{1,2})$/);
+  if (t) {
+    const v = parseInt(t[1], 10);
+    if (v >= 2 && v <= 20) return v;
+  }
+  return 1;
+}
+
+// Conservative matcher: a wrong match plays the WRONG anime's episodes, so it
+// requires near-total coverage of the wanted title's tokens, an exact season
+// match, and (for short titles) near-total coverage of the slug's tokens too.
+function a3rbCatalogMatch(title: string, slugs: string[]): string | null {
+  // Want-forms: the full title, every parenthesized alternative name, and a
+  // tight-colon-joined copy of each (Str::slug turns "Re:Zero" into "rezero").
+  const rawForms: string[] = [title];
+  const reParen = /[\(\[]([^\)\]]+)[\)\]]/g;
+  let pm: RegExpExecArray | null;
+  while ((pm = reParen.exec(title))) { const p = pm[1].trim(); if (p) rawForms.push(p); }
+  type Want = { set: Record<string, true>; n: number; season: number };
+  const wants: Want[] = [];
+  for (const f of rawForms) {
+    for (const v of [f, f.replace(/(\S)[:：](\S)/g, "$1$2")]) {
+      const toks = tm_toks(tm_normLatin(v));
+      if (!toks.length) continue;
+      const set: Record<string, true> = {};
+      toks.forEach((t) => { set[t] = true; });
+      wants.push({ set, n: toks.length, season: a3rbSeasonOf(v.toLowerCase()) });
+    }
+  }
+  if (!wants.length) return null;
+  let best: { slug: string | null; score: number } = { slug: null, score: 0 };
+  for (const slug of slugs) {
+    const label = slug.replace(/[-_]+/g, " ");
+    const gotToks = tm_toks(tm_normLatin(label));
+    if (!gotToks.length) continue;
+    const gotSeason = a3rbSeasonOf(label);
+    for (const w of wants) {
+      // Wrong season page = wrong episode numbering. Hard reject.
+      if (gotSeason !== w.season) continue;
+      let gc = 0;
+      const gotSet: Record<string, true> = {};
+      for (const t of gotToks) { gotSet[t] = true; if (w.set[t]) gc++; }
+      let wc = 0;
+      for (const t in w.set) { if (gotSet[t]) wc++; }
+      const wantCov = wc / w.n;
+      const gotCov = gc / gotToks.length;
+      // Containment: the slug's ENTIRE name appears inside the wanted title
+      // (with enough tokens to be non-coincidental). Catches witanime titles
+      // that concatenate the English and romaji names — especially the
+      // mount-time slug-derived title, where "X (Y)" arrives flattened as
+      // "x y" and no single name covers 80% of the combined token set.
+      const contained = gotCov === 1 && gc >= 4;
+      const ok = contained || (
+        w.n >= 3 ? wantCov >= 0.8 :
+        w.n === 2 ? wantCov === 1 && gotCov >= 0.6 :
+        wantCov === 1 && gotCov === 1);
+      if (!ok) continue;
+      const score = wantCov * 60 + gotCov * 40;
+      if (score > best.score) best = { slug, score };
+    }
+  }
+  return best.slug;
+}
+
+export async function searchAnime3rbCatalog(title: string): Promise<string | null> {
+  if (!title) return null;
+  const slugs = await fetchA3rbCatalog();
+  if (!slugs.length) return null;
+  const slug = a3rbCatalogMatch(title, slugs);
+  if (!slug) return null;
+  // Confirm against the real page's own title before trusting the match.
+  return probeA3rbTitlePage(slug, title);
+}
+
+// Cloudflare-capable fallback: render the /search page in the headless window
+// and score the result links there. Slow (challenge + render), so callers only
+// reach for this after every slug guess missed.
+export async function searchAnime3rbHeadless(title: string): Promise<string | null> {
+  if (!title) return null;
+  const url = `${A3RB_BASE}/search?q=${encodeURIComponent(title)}`;
+  try {
+    const r = await enqueue<{ url: string | null; score: number }>({
+      url, injectAfter: EXTRACT_TITLE_MATCH_A3RB(title), timeoutMs: 45000,
+    });
+    return r?.url ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Parse the anime3rb episode page's player out of the static HTML. The page
+// is Livewire-rendered server-side: its wire:snapshot JSON carries video_url =
+// https://video.vid3rb.com/player/<uuid>?token=…&expires=…, anime3rb's
+// first-party player. That URL is both iframe-embeddable (the page serves
+// X-Frame-Options: ALLOWALL) and the input the main-process vid3rb extractor
+// pulls direct tokenized .mp4 qualities from — so the custom player path
+// works end-to-end with two plain GETs.
+export async function scrapeAnime3rbEpisodeServers(episodeUrl: string): Promise<RawServer[]> {
+  const html = await window.pantoufa.fetchHtml?.(episodeUrl, A3RB_BASE + "/");
+  if (!html) return [];
+  // The snapshot lives inside an HTML attribute, so quotes arrive as &quot;
+  // and the URL as JSON-escaped https:\/\/… with &amp; between query params.
+  let raw =
+    html.match(/video_url&quot;:&quot;(https:[\s\S]*?)&quot;/)?.[1] ||
+    html.match(/"video_url"\s*:\s*"(https:[\s\S]*?)"/)?.[1] ||
+    null;
+  if (!raw) return [];
+  const url = raw.replace(/\\\//g, "/").replace(/&amp;/g, "&");
+  try {
+    const h = new URL(url).hostname.toLowerCase();
+    if (!h || h.indexOf(".") < 0) return [];
+  } catch { return []; }
+  return [{ id: "0", name: "Anime3rb", iframeUrl: url, provider: "vid3rb" }];
 }
 
 export async function extractVideoUrl(embedUrl: string) {

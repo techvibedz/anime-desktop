@@ -1,6 +1,6 @@
 {
   "name": "pantoufa-desktop",
-  "version": "0.4.8",
+  "version": "0.4.9",
   "description": "Pantoufa anime desktop app — both witanime + anime4up, no backend needed.",
   "author": "techvibedz <contact@techvibedz.com>",
   "main": "dist-electron/electron/main.js",
@@ -63,8 +63,14 @@
       "package.json"
     ],
     "extraResources": [
-      { "from": "build/icon.ico", "to": "build/icon.ico" },
-      { "from": "build/icon.png", "to": "build/icon.png" }
+      {
+        "from": "build/icon.ico",
+        "to": "build/icon.ico"
+      },
+      {
+        "from": "build/icon.png",
+        "to": "build/icon.png"
+      }
     ],
     "win": {
       "target": [

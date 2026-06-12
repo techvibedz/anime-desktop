@@ -3,7 +3,7 @@ import { useParams, useSearchParams, Link, useNavigate } from "react-router-dom"
 import Hls from "hls.js";
 import {
   fetchVideoServers, enrichServersFromUp4, resolveVideo, fetchEpisodes, fetchEpisodesUp4,
-  resolveUp4EpisodeUrl,
+  resolveUp4EpisodeUrl, fetchAnime3rbServers,
   invalidateServersCache, invalidateResolveCache,
   type VideoServer, type Episode,
 } from "../lib/api";
@@ -23,11 +23,30 @@ function setMutedSafe(muted: boolean) {
 }
 
 const PROVIDER_RANK: Record<string, number> = {
-  dailymotion: 0, streamwish: 1, videa: 2, voe: 3,
+  // vid3rb (anime3rb's first-party host) ranks top: a single static GET
+  // yields a direct 1080p .mp4 that plays natively in the custom player —
+  // no ads, no Cloudflare, Range-capable CDN.
+  vid3rb: 0, dailymotion: 0, streamwish: 1, videa: 2, voe: 3,
   share4max: 4, streamruby: 5, mp4upload: 6, doodstream: 7,
   uqload: 8, okru: 9, yonaplay: 10, vk: 11,
 };
 function rank(p: string) { return PROVIDER_RANK[p] ?? 50; }
+
+// Providers we can re-extract cheaply. If extraction returns an iframe
+// fallback for one of these, it was almost certainly a transient miss, so we
+// re-extract once (the resolve cache no longer keeps the stale fallback) to
+// land the direct stream WITHOUT the user manually re-clicking the server.
+// The slow capture providers (voe/share4max/uqload) are deliberately left out
+// — a second ~30s capture attempt isn't worth the wait, so we accept their
+// iframe fallback and let the embed play.
+const FAST_REEXTRACT_PROVIDERS = new Set([
+  "mp4upload", "streamwish", "okru", "doodstream", "vk", "streamruby",
+  // videa resolves via its XML API in well under a second — a re-extract
+  // after a transient miss is essentially free.
+  "videa",
+  // vid3rb resolves from one static player-page GET — also essentially free.
+  "vid3rb",
+]);
 
 function displayName(s: VideoServer): string {
   const n = (s.name || "").trim();
@@ -60,6 +79,16 @@ function formatTime(s: number): string {
 }
 
 const STALL_THRESHOLD_MS = 15000;
+
+// Skip-intro heuristic. Anime openings run ~85s but don't always start at
+// second 0 — a cold-open/recap often pushes the OP a few minutes in. We have
+// no per-episode intro markers, so we keep the "Skip Intro" affordance eligible
+// across the first several minutes (covering late openings), jump forward by a
+// fixed amount when tapped, and auto-fade the pill so it isn't glued on screen.
+const INTRO_SKIP_SECONDS = 85;
+const INTRO_WINDOW_END_SECONDS = 360;
+// How long the pill stays up after appearing / after the last mouse move.
+const SKIP_PILL_VISIBLE_MS = 6000;
 
 export function WatchPage() {
   const { episode } = useParams<{ episode: string }>();
@@ -114,12 +143,42 @@ export function WatchPage() {
   // is mounted. This is the renderer-side counterpart to the main process
   // ignoring ERR_ABORTED, and it hot-reloads (the main change needs a restart).
   const iframeLoadedRef = useRef(false);
-  // Tracks which anime4up URL we've already merged into the server list,
-  // so enrichment runs once per episode even as `servers` updates.
-  const enrichedUp4Ref = useRef<string | null>(null);
+  // Pending "advance to next server" scheduled by a main-process
+  // did-fail-load report. We don't advance instantly: some embeds
+  // (mp4upload, ok.ru) fail their first navigation with a real error code
+  // and then load successfully a moment later. We give the iframe a short
+  // grace window — if its onLoad fires meanwhile, the advance is cancelled.
+  const pendingAdvanceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // anime4up enrichment retry machinery. The anime4up scrape is flaky and
+  // frequently comes back empty on the first try (ad gates / JS redirects, or
+  // a burst of requests during initial page load getting rate-limited), which
+  // is why anime4up servers used to only appear after a manual refresh. We keep
+  // retrying on a steady backoff until anime4up servers actually land
+  // (up4ServerCount > 0) or a generous wall-clock deadline passes — a small
+  // fixed attempt cap gave up while the site was briefly congested, then the
+  // manual refresh (fresh budget) "magically" worked. The deadline only starts
+  // counting once we actually have an anime4up URL to try, so slow cross-source
+  // resolution never eats into the retry window.
+  const ENRICH_RETRY_DEADLINE_MS = 3 * 60 * 1000;
+  const enrichAttemptsRef = useRef(0);
+  const enrichStartedAtRef = useRef(0);
+  const enrichInFlightRef = useRef(false);
+  const enrichRetryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [enrichNonce, setEnrichNonce] = useState(0);
+  // True once the retry deadline passes without landing any anime4up server —
+  // used to stop showing the "searching for more servers" indicator.
+  const [enrichExhausted, setEnrichExhausted] = useState(false);
   // Latest server embed URLs, read at cleanup time to flush their
   // resolve-cache entries when the user leaves the episode.
   const serverUrlsRef = useRef<string[]>([]);
+  // Distinguish "effect re-fired (deps changed)" from "user left this episode"
+  // inside settled async handlers: a cancelled run whose episode is still the
+  // current one produced a result we WANT — discarding it (and scheduling no
+  // retry) was a remaining "anime4up servers never show until reload" hole.
+  const episodeUrlRef = useRef(episodeUrl);
+  useEffect(() => { episodeUrlRef.current = episodeUrl; }, [episodeUrl]);
+  const unmountedRef = useRef(false);
+  useEffect(() => () => { unmountedRef.current = true; }, []);
 
   // Sibling episode navigation
   const [siblings, setSiblings] = useState<Episode[]>([]);
@@ -143,6 +202,8 @@ export function WatchPage() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [skipIntroVisible, setSkipIntroVisible] = useState(false);
+  const skipHideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reextractUsedRef = useRef(false);
 
   const sortedServers = useMemo(
@@ -165,6 +226,12 @@ export function WatchPage() {
     setServers([]);
     setHarvestedUp4(null);
     setDirectUp4(null);
+    // Clear the titles too: on watch→watch navigation the component stays
+    // mounted, so a stale meta.animeTitle from the PREVIOUS anime would pair
+    // with the new URL's episode number and make the title-based resolvers
+    // (anime3rb, direct anime4up) fetch the WRONG anime's episode — which
+    // then merges a wrong-anime server into this episode's list.
+    setMeta({ episodeTitle: "", animeTitle: "" });
     setLoadingServers(true);
     setServerError(false);
     console.info(`[player] fetching servers for episode: ${episodeUrl}`);
@@ -173,7 +240,16 @@ export function WatchPage() {
       .then((r) => {
         if (cancelled) return;
         console.info(`[player] loaded ${r.data.servers.length} servers for: ${r.data.episodeTitle}`);
-        setServers(r.data.servers);
+        // Merge append-only (dedupe by URL) instead of replacing wholesale.
+        // anime4up enrichment can run CONCURRENTLY with this primary scrape
+        // (when the anime4up URL is already known via ?up4= or harvested off
+        // the witanime page), so a wholesale replace here would race-wipe the
+        // anime4up servers an earlier enrichment run already appended.
+        setServers((prev) => {
+          const have = new Set(prev.map((s) => s.iframeUrl));
+          const additions = r.data.servers.filter((s) => !have.has(s.iframeUrl));
+          return additions.length ? [...prev, ...additions] : prev;
+        });
         if ((r.data as any).up4EpisodeUrl) {
           console.info(`[player] harvested direct anime4up episode: ${(r.data as any).up4EpisodeUrl}`);
           setHarvestedUp4((r.data as any).up4EpisodeUrl);
@@ -203,6 +279,13 @@ export function WatchPage() {
   useEffect(() => {
     if (!resolvedAnimeHref) return;
     let cancelled = false;
+    // This effect only re-fires when the PARENT ANIME changes, so clear the
+    // previous anime's data immediately: stale siblings would let prev/next
+    // (and the up4-sibling number match, and the title-based resolvers) act
+    // on the wrong anime until the new fetch lands.
+    setSiblings([]);
+    setUp4Siblings([]);
+    setAnimeTitleFromDetail("");
     fetchEpisodes(resolvedAnimeHref)
       .then((r) => {
         if (cancelled) return;
@@ -250,31 +333,108 @@ export function WatchPage() {
     return directUp4;
   }, [up4Param, harvestedUp4, currentEpNumber, up4Siblings, directUp4]);
 
+  // Anime title derived from the witanime episode URL slug
+  // (…/episode/<anime-slug>-الحلقة-N/). Available synchronously on mount, so
+  // the direct anime4up resolution below can start IMMEDIATELY instead of
+  // waiting many seconds for the witanime scrape to report the real title.
+  const slugTitle = useMemo(() => {
+    if (!episodeUrl) return "";
+    try {
+      const d = decodeURIComponent(episodeUrl);
+      // new URL().pathname RE-percent-encodes non-ASCII, so the Arabic الحلقة
+      // marker comes back as %D8%A7… and the split below silently fails —
+      // leaving "%D8%A7%D9%84… 11" junk in the title. That junk made every
+      // attempt-1 cross-source lookup (anime4up AND anime3rb) search for a
+      // garbage title: wasted round-trips at best, a wrong-anime match at
+      // worst. Decode the slug again before cutting.
+      const slug = decodeURIComponent(new URL(d).pathname.replace(/\/+$/, "").split("/").pop() || "");
+      const cut = slug.split(/-?\s*الحلقة/)[0] || "";
+      return cut.replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
+    } catch { return ""; }
+  }, [episodeUrl]);
+
+  // Retry machinery for the direct anime4up resolution below. The cross-source
+  // search + episode-list fetch is heavier than enrichment, so we retry on a
+  // longer backoff and a shorter deadline — enough to ride out a flaky first
+  // attempt (which used to leave anime4up servers permanently absent) without
+  // hammering the site. Bumping the nonce re-runs the resolution effect.
+  const DIRECT_UP4_DEADLINE_MS = 90 * 1000;
+  const directUp4AttemptsRef = useRef(0);
+  const directUp4StartedAtRef = useRef(0);
+  const directUp4RetryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [directUp4Nonce, setDirectUp4Nonce] = useState(0);
+  useEffect(() => {
+    directUp4AttemptsRef.current = 0;
+    directUp4StartedAtRef.current = 0;
+    if (directUp4RetryTimer.current) { clearTimeout(directUp4RetryTimer.current); directUp4RetryTimer.current = null; }
+  }, [episodeUrl]);
+  useEffect(() => () => { if (directUp4RetryTimer.current) clearTimeout(directUp4RetryTimer.current); }, []);
+
   // Direct anime4up resolution — runs independently of the sibling chain
   // (fetchEpisodes/fetchEpisodesUp4), which can silently fail when the
   // anime URL is derived/guessed (e.g. One Piece, no embedded anime4up link).
   // Only kicks in when no other source has produced an anime4up URL yet.
   useEffect(() => {
     if (up4Param || harvestedUp4) return;          // already have a better source
+    if (directUp4) return;                          // already resolved (e.g. via slug title)
     if (/anime4up/i.test(episodeUrl)) return;       // primary is already anime4up
     if (currentEpNumber == null) return;            // can't match without ep number
     if (up4Siblings.some((u) => u.number === currentEpNumber)) return; // sibling will cover it
-    const title = meta.animeTitle || animeTitleFromDetail;
+    // Slug-derived title lets this fire on mount (no waiting on the scrape);
+    // when the real title differs and the slug search found nothing, the
+    // effect re-runs with the better title once the scrape reports it.
+    const title = meta.animeTitle || animeTitleFromDetail || slugTitle;
     if (!title) return;                             // wait until we know the title
     let cancelled = false;
-    console.info(`[player] resolving anime4up directly for "${title}" ep ${currentEpNumber}`);
+    const epAtStart = episodeUrl;
+    if (!directUp4StartedAtRef.current) directUp4StartedAtRef.current = Date.now();
+    directUp4AttemptsRef.current += 1;
+    const attempt = directUp4AttemptsRef.current;
+    console.info(`[player] resolving anime4up directly for "${title}" ep ${currentEpNumber} (attempt ${attempt})`);
+    // A flaky empty result is no longer cached (see api.ts), so re-running the
+    // lookup genuinely re-queries anime4up. Keep retrying on a backoff until it
+    // resolves or the deadline passes.
+    const scheduleRetry = () => {
+      if (cancelled) return;
+      if (Date.now() - directUp4StartedAtRef.current > DIRECT_UP4_DEADLINE_MS) {
+        console.warn(`[player] direct anime4up resolution gave up after ${attempt} attempts`);
+        return;
+      }
+      const delay = Math.min(5000 * attempt, 15000);
+      directUp4RetryTimer.current = setTimeout(() => setDirectUp4Nonce((n) => n + 1), delay);
+    };
     resolveUp4EpisodeUrl(title, currentEpNumber)
       .then((url) => {
-        if (cancelled || !url) return;
+        if (!url) { if (!cancelled) scheduleRetry(); return; }
+        // Accept a found URL even if this run was cancelled by a dep change
+        // (e.g. the scrape reporting a better title mid-flight) — as long as
+        // the user is still on this episode the result is exactly what the
+        // replacement run is about to re-fetch. Discarding it wasted the
+        // round-trip and delayed anime4up servers for no reason.
+        if (unmountedRef.current || episodeUrlRef.current !== epAtStart) return;
         console.info(`[player] direct anime4up episode resolved: ${url}`);
         setDirectUp4(url);
       })
-      .catch((e) => console.warn(`[player] direct anime4up resolution failed:`, e));
+      .catch((e) => { if (cancelled) return; console.warn(`[player] direct anime4up resolution failed:`, e); scheduleRetry(); });
     return () => { cancelled = true; };
-  }, [up4Param, harvestedUp4, episodeUrl, currentEpNumber, up4Siblings, meta.animeTitle, animeTitleFromDetail]);
+  }, [up4Param, harvestedUp4, directUp4, episodeUrl, currentEpNumber, up4Siblings, meta.animeTitle, animeTitleFromDetail, slugTitle, directUp4Nonce]);
 
-  // Reset the enrichment guard whenever the episode changes.
-  useEffect(() => { enrichedUp4Ref.current = null; }, [episodeUrl, retryServersNonce]);
+  // Reset the enrichment retry state whenever the episode changes (or a
+  // manual/auto refresh is requested via retryServersNonce).
+  useEffect(() => {
+    enrichAttemptsRef.current = 0;
+    enrichStartedAtRef.current = 0;
+    enrichInFlightRef.current = false;
+    setEnrichExhausted(false);
+    if (enrichRetryTimer.current) { clearTimeout(enrichRetryTimer.current); enrichRetryTimer.current = null; }
+  }, [episodeUrl, retryServersNonce]);
+
+  // How many anime4up servers we've successfully attached so far. Once this
+  // is > 0 the enrichment effect considers itself done and stops retrying.
+  const up4ServerCount = useMemo(
+    () => servers.filter((s) => s.source === "anime4up").length,
+    [servers],
+  );
 
   // Keep the latest server URLs available to the unmount cleanup.
   useEffect(() => { serverUrlsRef.current = servers.map((s) => s.iframeUrl); }, [servers]);
@@ -290,37 +450,214 @@ export function WatchPage() {
     };
   }, [episodeUrl]);
 
+  // Clear any pending enrichment-retry timer on unmount.
+  useEffect(() => () => {
+    if (enrichRetryTimer.current) { clearTimeout(enrichRetryTimer.current); enrichRetryTimer.current = null; }
+  }, []);
+
+  // Manual "refresh servers" — re-scrape the primary list AND restart the
+  // anime4up enrichment retry loop from scratch. Busts the servers cache so
+  // the re-scrape is genuinely fresh rather than replaying the cached list.
+  const refreshServers = useCallback(() => {
+    invalidateServersCache(episodeUrl);
+    enrichAttemptsRef.current = 0;
+    enrichStartedAtRef.current = 0;
+    enrichInFlightRef.current = false;
+    if (enrichRetryTimer.current) { clearTimeout(enrichRetryTimer.current); enrichRetryTimer.current = null; }
+    // Also drop the directly-resolved anime4up URL and restart its resolution
+    // loop, so a refresh can recover the "anime4up never showed" case (a flaky
+    // first resolution) instead of only re-running enrichment against a URL we
+    // never found. The resolution caches no longer pin failures (see api.ts),
+    // so this genuinely re-tries the cross-source lookup.
+    setDirectUp4(null);
+    directUp4AttemptsRef.current = 0;
+    directUp4StartedAtRef.current = 0;
+    if (directUp4RetryTimer.current) { clearTimeout(directUp4RetryTimer.current); directUp4RetryTimer.current = null; }
+    setRetryServersNonce((n) => n + 1);
+  }, [episodeUrl]);
+
   // Merge anime4up servers once an anime4up URL is known (explicit ?up4=
-  // or resolved cross-source). Runs after the primary witanime servers
-  // have loaded, and only once per episode/URL.
+  // or resolved cross-source). Runs CONCURRENTLY with the primary witanime
+  // scrape — when the anime4up URL is already known up front (?up4= or
+  // harvested) the two fetches race instead of serializing, so anime4up
+  // servers appear without waiting on the slower witanime render. The
+  // append-only merge (here and in the primary load) means neither run can
+  // clobber the other's servers. Runs only once per episode/URL.
   useEffect(() => {
-    if (loadingServers) return;
     if (!effectiveUp4) return;
     if (/anime4up/i.test(episodeUrl)) return;
-    if (enrichedUp4Ref.current === effectiveUp4) return;
-    enrichedUp4Ref.current = effectiveUp4;
-    let cancelled = false;
-    console.info(`[player] enriching with anime4up servers from: ${effectiveUp4}`);
+    if (up4ServerCount > 0) return;             // already enriched successfully
+    if (enrichInFlightRef.current) return;      // a run is already going
+    if (enrichStartedAtRef.current && Date.now() - enrichStartedAtRef.current > ENRICH_RETRY_DEADLINE_MS) {
+      setEnrichExhausted(true);
+      return;
+    }
+
+    const epAtStart = episodeUrl;
+    // True only when the user actually left this episode — the one case where
+    // this run's outcome is genuinely unwanted. An effect-cleanup `cancelled`
+    // flag can't tell: it also flips when the effect merely re-fires
+    // (effectiveUp4 settles on a different URL mid-flight), and the re-fired
+    // run bails on the in-flight latch above, so if we dropped the result AND
+    // scheduled nothing here the retry chain would be dead until a manual
+    // refresh — anime4up servers "never show" until the user reloads.
+    const leftEpisode = () => unmountedRef.current || episodeUrlRef.current !== epAtStart;
+    enrichInFlightRef.current = true;
+    enrichAttemptsRef.current += 1;
+    if (!enrichStartedAtRef.current) enrichStartedAtRef.current = Date.now();
+    const attempt = enrichAttemptsRef.current;
+    console.info(`[player] enriching with anime4up servers (attempt ${attempt}) from: ${effectiveUp4}`);
+
+    // Schedule a backoff retry. Backoff grows with the attempt count but is
+    // capped, so a persistently-empty anime4up keeps getting polled steadily
+    // (without hammering it) until it responds or the wall-clock deadline
+    // passes. Bumping enrichNonce re-runs this effect.
+    const scheduleRetry = () => {
+      if (leftEpisode()) return;
+      if (Date.now() - enrichStartedAtRef.current > ENRICH_RETRY_DEADLINE_MS) {
+        console.warn(`[player] anime4up enrichment gave up after ${attempt} attempts (deadline reached)`);
+        setEnrichExhausted(true);
+        return;
+      }
+      const delay = Math.min(1500 * attempt, 6000);
+      if (enrichRetryTimer.current) clearTimeout(enrichRetryTimer.current);
+      enrichRetryTimer.current = setTimeout(() => setEnrichNonce((n) => n + 1), delay);
+    };
+
     enrichServersFromUp4(servers, effectiveUp4)
       .then((enriched) => {
-        if (cancelled) return;
+        // Always clear the in-flight latch FIRST, before any bail-out. If this
+        // run was cancelled by a dependency change (e.g. the primary scrape
+        // appending to `servers`) and we bailed here without resetting the
+        // flag, the `enrichInFlightRef.current` guard above would stay latched
+        // forever — no further enrichment, no retry — and anime4up servers
+        // would never appear until a manual refresh.
+        enrichInFlightRef.current = false;
+        // Note: deliberately NOT bailing on `cancelled` alone. A cancelled run
+        // on the SAME episode still merges its result below (the append-only
+        // merge against the latest state is safe), because the effect run that
+        // cancelled us already bailed on the in-flight latch — nobody else
+        // will deliver these servers or schedule a retry.
+        if (leftEpisode()) return;
         // Merge into the LATEST state, append-only, deduped by URL. A second
-        // enrichment run (the effect re-fires when `servers` changes) can
-        // capture a stale `servers` snapshot; replacing wholesale with its
-        // result would wipe out anime4up servers an earlier run already added
-        // whenever the flaky anime4up scrape comes back short. Merging instead
-        // means no run can ever drop servers another run contributed.
+        // enrichment run can capture a stale `servers` snapshot; replacing
+        // wholesale with its result would wipe out anime4up servers an earlier
+        // run already added whenever the flaky anime4up scrape comes back
+        // short. Merging instead means no run can ever drop servers another
+        // run contributed.
+        let added = 0;
         setServers((prev) => {
           const have = new Set(prev.map((s) => s.iframeUrl));
           const additions = enriched.filter((s) => !have.has(s.iframeUrl));
+          added = additions.length;
           if (additions.length === 0) return prev;
           console.info(`[player] enriched: +${additions.length} anime4up servers (${prev.length + additions.length} total)`);
           return [...prev, ...additions];
         });
+        // The flaky anime4up scrape came back empty — try again shortly.
+        if (added === 0) {
+          console.warn(`[player] anime4up enrichment empty (attempt ${attempt}), scheduling retry`);
+          scheduleRetry();
+        }
       })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [effectiveUp4, loadingServers, episodeUrl, servers]);
+      .catch((e) => {
+        enrichInFlightRef.current = false;
+        if (leftEpisode()) return;
+        console.warn(`[player] anime4up enrichment threw (attempt ${attempt}), scheduling retry`, e);
+        scheduleRetry();
+      });
+    // No cleanup: a re-fired run bails on the in-flight latch, and the settled
+    // handlers above decide staleness from leftEpisode(), not a cancel flag.
+    // `servers` is deliberately NOT a dependency. The primary witanime scrape
+    // appends to `servers` moments after enrichment starts; with `servers` as a
+    // dep that append cancels the in-flight run and re-fires the effect, which
+    // both wastes an anime4up round-trip and (previously) latched the in-flight
+    // guard. enrichServersFromUp4 only reads `servers` to seed its dedup set,
+    // and the setServers merge above re-dedups against the LATEST state, so
+    // running with a slightly stale snapshot is harmless. Omitting it stops a
+    // fast-resolved up4 URL (cache / harvest) from racing the primary scrape.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectiveUp4, episodeUrl, up4ServerCount, enrichNonce]);
+
+  // ── anime3rb enrichment ──
+  // Third server source, fully independent of the witanime/anime4up chains:
+  // anime3rb episode URLs are constructible from the anime title + episode
+  // number alone (/episode/<slug>/<n>), so there is no sibling-matching or
+  // harvested-link machinery — just resolve + fetch with the same
+  // retry-on-backoff-until-deadline shape as the other sources. The title
+  // resolution is cached in api.ts, so retries and later episodes are cheap.
+  const A3RB_RETRY_DEADLINE_MS = 2 * 60 * 1000;
+  const a3rbAttemptsRef = useRef(0);
+  const a3rbStartedAtRef = useRef(0);
+  const a3rbInFlightRef = useRef(false);
+  const a3rbRetryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [a3rbNonce, setA3rbNonce] = useState(0);
+  const a3rbServerCount = useMemo(
+    () => servers.filter((s) => s.source === "anime3rb").length,
+    [servers],
+  );
+  useEffect(() => {
+    a3rbAttemptsRef.current = 0;
+    a3rbStartedAtRef.current = 0;
+    a3rbInFlightRef.current = false;
+    if (a3rbRetryTimer.current) { clearTimeout(a3rbRetryTimer.current); a3rbRetryTimer.current = null; }
+  }, [episodeUrl, retryServersNonce]);
+  useEffect(() => () => { if (a3rbRetryTimer.current) clearTimeout(a3rbRetryTimer.current); }, []);
+
+  useEffect(() => {
+    if (currentEpNumber == null) return;        // can't construct an episode URL
+    if (a3rbServerCount > 0) return;            // already enriched successfully
+    if (a3rbInFlightRef.current) return;        // a run is already going
+    if (a3rbStartedAtRef.current && Date.now() - a3rbStartedAtRef.current > A3RB_RETRY_DEADLINE_MS) return;
+    // Slug-derived title lets this fire on mount; the effect re-runs with the
+    // real title once the scrape reports it (and the resolution caches by
+    // title, so the re-run is a different cache key — both stay cheap).
+    const title = meta.animeTitle || animeTitleFromDetail || slugTitle;
+    if (!title) return;
+    const epAtStart = episodeUrl;
+    // Same staleness rule as the anime4up enrichment: only the user actually
+    // leaving this episode makes the result unwanted — a dep-change re-fire
+    // bails on the in-flight latch, so the settled handler must still merge.
+    const leftEpisode = () => unmountedRef.current || episodeUrlRef.current !== epAtStart;
+    a3rbInFlightRef.current = true;
+    if (!a3rbStartedAtRef.current) a3rbStartedAtRef.current = Date.now();
+    a3rbAttemptsRef.current += 1;
+    const attempt = a3rbAttemptsRef.current;
+    console.info(`[player] resolving anime3rb servers for "${title}" ep ${currentEpNumber} (attempt ${attempt})`);
+    const scheduleRetry = () => {
+      if (leftEpisode()) return;
+      if (Date.now() - a3rbStartedAtRef.current > A3RB_RETRY_DEADLINE_MS) {
+        console.warn(`[player] anime3rb enrichment gave up after ${attempt} attempts`);
+        return;
+      }
+      const delay = Math.min(4000 * attempt, 15000);
+      if (a3rbRetryTimer.current) clearTimeout(a3rbRetryTimer.current);
+      a3rbRetryTimer.current = setTimeout(() => setA3rbNonce((n) => n + 1), delay);
+    };
+    fetchAnime3rbServers(title, currentEpNumber)
+      .then((found) => {
+        a3rbInFlightRef.current = false;
+        if (leftEpisode()) return;
+        if (found.length === 0) { scheduleRetry(); return; }
+        setServers((prev) => {
+          const have = new Set(prev.map((s) => s.iframeUrl));
+          const additions = found
+            .filter((s) => !have.has(s.iframeUrl))
+            .map((s, i) => ({ ...s, id: `a3rb_${prev.length + i}`, source: "anime3rb" }));
+          if (additions.length === 0) return prev;
+          console.info(`[player] enriched: +${additions.length} anime3rb server(s) (${prev.length + additions.length} total)`);
+          return [...prev, ...additions];
+        });
+      })
+      .catch((e) => {
+        a3rbInFlightRef.current = false;
+        if (leftEpisode()) return;
+        console.warn(`[player] anime3rb enrichment threw (attempt ${attempt}), scheduling retry`, e);
+        scheduleRetry();
+      });
+    // No cleanup — same rationale as the anime4up enrichment effect above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentEpNumber, a3rbServerCount, episodeUrl, retryServersNonce, meta.animeTitle, animeTitleFromDetail, slugTitle, a3rbNonce]);
 
   // Auto-pick the highest-ranked NON-broken server (highlight only).
   useEffect(() => {
@@ -330,6 +667,25 @@ export function WatchPage() {
       setActiveIdx(firstGood);
     }
   }, [sortedServers, brokenIds, activeIdx]);
+
+  // Pre-resolve the auto-picked server the moment it's known, so the user's
+  // Play click serves a cached stream URL instantly instead of kicking off
+  // extraction. resolveVideo caches by embed URL (RESOLVE_TTL), so the click
+  // path reuses this result or the still-in-flight promise. Capped at 2
+  // distinct servers per episode (the pick can shift as anime4up servers
+  // stream in) so we never burn scraper slots speculatively.
+  const prefetchedRef = useRef<Set<string>>(new Set());
+  useEffect(() => { prefetchedRef.current = new Set(); }, [episodeUrl]);
+  useEffect(() => {
+    if (userActivated) return;            // real resolve flow has taken over
+    if (activeIdx === null) return;
+    const srv = sortedServers[activeIdx];
+    if (!srv) return;
+    if (prefetchedRef.current.has(srv.iframeUrl) || prefetchedRef.current.size >= 2) return;
+    prefetchedRef.current.add(srv.iframeUrl);
+    console.info(`[player] prefetching resolve for ${srv.provider}`);
+    resolveVideo(srv.iframeUrl, srv.provider).catch(() => {});
+  }, [sortedServers, activeIdx, userActivated, episodeUrl]);
 
   const activateServer = useCallback((idx: number) => {
     setActiveIdx(idx);
@@ -359,11 +715,26 @@ export function WatchPage() {
         console.info(`[player] ignoring post-load iframe failure (embed already loaded): ${url}`);
         return;
       }
-      console.info(`[player] main process reports iframe failure, advancing: ${url}`);
-      iframeFailedRef.current = true;
-      advanceToNext();
+      // Don't advance instantly — the embed may fail its first navigation and
+      // then load. Wait a grace window; if onLoad fires meanwhile (which clears
+      // this timer) we keep the embed. Only a still-unloaded iframe advances.
+      if (pendingAdvanceTimer.current) return; // already scheduled
+      console.info(`[player] main process reports iframe failure, scheduling advance: ${url}`);
+      pendingAdvanceTimer.current = setTimeout(() => {
+        pendingAdvanceTimer.current = null;
+        if (iframeLoadedRef.current) {
+          console.info(`[player] iframe recovered during grace window, not advancing: ${url}`);
+          return;
+        }
+        console.info(`[player] iframe failure confirmed, advancing: ${url}`);
+        iframeFailedRef.current = true;
+        advanceToNext();
+      }, 3000);
     });
-    return () => { off(); };
+    return () => {
+      off();
+      if (pendingAdvanceTimer.current) { clearTimeout(pendingAdvanceTimer.current); pendingAdvanceTimer.current = null; }
+    };
   }, [advanceToNext]);
 
   // Tell the main process which iframe URL is currently active so
@@ -374,6 +745,8 @@ export function WatchPage() {
     // New embed mounting — it hasn't loaded yet, so honor did-fail-load until
     // its onLoad fires (a genuine "can't connect" failure happens pre-load).
     if (url) iframeLoadedRef.current = false;
+    // Drop any failure-advance scheduled for the previous embed.
+    if (pendingAdvanceTimer.current) { clearTimeout(pendingAdvanceTimer.current); pendingAdvanceTimer.current = null; }
     window.pantoufa.setActiveIframe(url);
   }, [resolved?.url, resolved?.type]);
 
@@ -387,30 +760,61 @@ export function WatchPage() {
     setResolved(null);
     setStatus("resolving");
 
-    // Single attempt per server. The scraper's own poll loop already
-    // retries internally; a second renderer-side attempt mostly just
-    // burns time the user sees as "stuck loading". If the first one
-    // can't get a URL, advance.
+    // Extraction is intermittently flaky: a transient Cloudflare check or a
+    // slow embed can make a provider we CAN normally extract come back as an
+    // iframe fallback (or throw). That used to silently drop the custom player
+    // to the embed / advance, so the user had to manually re-click until
+    // extraction happened to succeed. For cheap-to-extract providers we now
+    // re-extract once automatically (busting the cache first) so the direct
+    // stream lands on its own.
     (async () => {
-      try {
-        const r = await resolveVideo(srv.iframeUrl, srv.provider);
-        if (cancelled) return;
-        if (r.success && r.data?.videoUrl) {
-          console.info(`[player] ${srv.provider}: ${r.data.type} → ${r.data.videoUrl}`);
-          setResolved({
-            url: r.data.videoUrl,
-            type: r.data.type as "hls" | "mp4" | "dailymotion" | "iframe",
-            embed: srv.iframeUrl,
-          });
-          setStatus("playing");
+      const fastRetry = FAST_REEXTRACT_PROVIDERS.has(srv.provider);
+      const MAX_ATTEMPTS = fastRetry ? 2 : 1;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          const r = await resolveVideo(srv.iframeUrl, srv.provider);
+          if (cancelled) return;
+          if (r.success && r.data?.videoUrl) {
+            const gotDirect = r.data.type === "hls" || r.data.type === "mp4";
+            // Expected a direct stream but got the iframe fallback → extraction
+            // missed this round. Re-extract once before accepting the embed.
+            if (!gotDirect && fastRetry && attempt < MAX_ATTEMPTS) {
+              console.warn(`[player] ${srv.provider}: iframe fallback, re-extracting (attempt ${attempt}/${MAX_ATTEMPTS})`);
+              invalidateResolveCache(srv.iframeUrl);
+              await new Promise((res) => setTimeout(res, 800));
+              continue;
+            }
+            console.info(`[player] ${srv.provider}: ${r.data.type} → ${r.data.videoUrl}`);
+            setResolved({
+              url: r.data.videoUrl,
+              type: r.data.type as "hls" | "mp4" | "dailymotion" | "iframe",
+              embed: srv.iframeUrl,
+            });
+            setStatus("playing");
+            return;
+          }
+          // Extraction came up totally empty — retry once if cheap, else advance.
+          if (attempt < MAX_ATTEMPTS) {
+            console.warn(`[player] ${srv.provider}: extraction empty, retrying (attempt ${attempt}/${MAX_ATTEMPTS})`);
+            invalidateResolveCache(srv.iframeUrl);
+            await new Promise((res) => setTimeout(res, 800));
+            continue;
+          }
+          console.warn(`[player] ${srv.provider}: extraction empty, advancing`);
+          advanceToNext();
+          return;
+        } catch (e) {
+          if (cancelled) return;
+          if (attempt < MAX_ATTEMPTS) {
+            console.warn(`[player] ${srv.provider}: resolve threw, retrying (attempt ${attempt}/${MAX_ATTEMPTS})`, e);
+            invalidateResolveCache(srv.iframeUrl);
+            await new Promise((res) => setTimeout(res, 800));
+            continue;
+          }
+          console.warn(`[player] ${srv.provider}: resolve threw, advancing`, e);
+          advanceToNext();
           return;
         }
-        console.warn(`[player] ${srv.provider}: extraction empty, advancing`);
-        advanceToNext();
-      } catch (e) {
-        if (cancelled) return;
-        console.warn(`[player] ${srv.provider}: resolve threw, advancing`, e);
-        advanceToNext();
       }
     })();
 
@@ -691,10 +1095,24 @@ export function WatchPage() {
       // instead: Chromium's native networking streams it with Range/partial
       // content, and the onBeforeSendHeaders interceptor still forces the
       // canonical www.mp4upload.com Referer on the <video> media request.
+      //
+      // videa also plays direct, for a different reason: pantoufa-video://
+      // subresources are BLOCKED by Chromium from web (http://localhost dev)
+      // origins with ERR_UNKNOWN_URL_SCHEME — the <video> dies instantly
+      // with "Format error" (code 4) and we advance past a perfectly good
+      // stream. (Packaged builds load from file://, where the custom scheme
+      // works — which is why this only ever bit in dev.) videa's signed
+      // static URL needs no cookies and accepts any/no Referer (verified:
+      // 302 → videoN.videa.hu edge → 206 even with a localhost Referer),
+      // so native streaming works in BOTH dev and packaged builds — and
+      // skips the proxy's 4MB arrayBuffer chunking for a ~100MB file.
       // Other MP4 providers keep the proxy (they need its Referer/Origin
       // strategy racing and cookie sharing).
-      const isMp4upload = /mp4upload/i.test(resolved.url);
-      v.src = isMp4upload ? resolved.url : proxied;
+      // vid3rb also plays direct: its signed CDN URLs answer Range requests,
+      // need no Referer/cookies and aren't IP-locked (noip=yes) — while the
+      // proxy would buffer the whole ~300MB file before the first byte.
+      const playsDirect = /mp4upload|videa\.hu|vidvaita|vidit|vid3rb\.com/i.test(resolved.url);
+      v.src = playsDirect ? resolved.url : proxied;
     }
 
     return () => {
@@ -807,11 +1225,19 @@ export function WatchPage() {
     if (hideTimer.current) clearTimeout(hideTimer.current);
     hideTimer.current = setTimeout(() => setControlsVisible(false), 3500);
   }, []);
+  // Surface the skip-intro pill and (re)start its independent auto-fade timer.
+  // Called when the eligible window opens and on any mouse move / key activity.
+  const bumpSkipIntro = useCallback(() => {
+    setSkipIntroVisible(true);
+    if (skipHideTimer.current) clearTimeout(skipHideTimer.current);
+    skipHideTimer.current = setTimeout(() => setSkipIntroVisible(false), SKIP_PILL_VISIBLE_MS);
+  }, []);
   const showControls = useCallback(() => {
     setControlsVisible(true);
     scheduleHide();
-  }, [scheduleHide]);
-  useEffect(() => { scheduleHide(); return () => { if (hideTimer.current) clearTimeout(hideTimer.current); }; }, [scheduleHide]);
+    bumpSkipIntro();
+  }, [scheduleHide, bumpSkipIntro]);
+  useEffect(() => { scheduleHide(); return () => { if (hideTimer.current) clearTimeout(hideTimer.current); if (skipHideTimer.current) clearTimeout(skipHideTimer.current); }; }, [scheduleHide]);
 
   // Fullscreen tracking — DOM event for our custom video player,
   // IPC for iframe-embed players (streamwish, mp4upload, etc.) where
@@ -896,6 +1322,12 @@ export function WatchPage() {
     const v = videoRef.current; if (!v) return;
     v.currentTime = Math.max(0, Math.min((v.duration || 0), v.currentTime + delta));
   }, []);
+  const skipIntro = useCallback(() => {
+    const v = videoRef.current; if (!v) return;
+    const target = v.currentTime + INTRO_SKIP_SECONDS;
+    v.currentTime = v.duration ? Math.min(v.duration - 1, target) : target;
+    showControls();
+  }, [showControls]);
   const toggleFs = useCallback(() => {
     const el = playerRef.current; if (!el) return;
     if (document.fullscreenElement) document.exitFullscreen();
@@ -935,6 +1367,24 @@ export function WatchPage() {
   const active = activeIdx !== null ? sortedServers[activeIdx] : null;
   const allBroken = sortedServers.length > 0 && sortedServers.every((s) => brokenIds.has(s.id));
   const animeTitle = meta.animeTitle || animeTitleFromDetail;
+  // We expect anime4up servers (cross-source) but haven't landed any yet and
+  // the retry loop hasn't given up — show a subtle "still searching" hint so
+  // the user knows more servers are on the way.
+  const searchingMoreServers =
+    !!effectiveUp4 && !/anime4up/i.test(episodeUrl) && up4ServerCount === 0 && !enrichExhausted;
+  // The "Skip Intro" affordance is eligible only in the custom player, during
+  // the opening window (wide enough to catch cold-open/late openings), and only
+  // for episodes long enough that an 85s jump won't overshoot the whole thing.
+  // Actual visibility is gated by the auto-fade timer (skipIntroVisible).
+  const showSkipIntroEligible =
+    !!resolved && resolved.type !== "iframe" && resolved.type !== "dailymotion" &&
+    duration > INTRO_WINDOW_END_SECONDS && currentTime > 1 && currentTime < INTRO_WINDOW_END_SECONDS;
+  // Pop the pill up when the eligible window opens (and tuck it away when it
+  // closes) without waiting for a mouse move.
+  useEffect(() => {
+    if (showSkipIntroEligible) bumpSkipIntro();
+    else setSkipIntroVisible(false);
+  }, [showSkipIntroEligible, bumpSkipIntro]);
 
   return (
     <div className="mx-auto max-w-4xl space-y-4">
@@ -1001,6 +1451,11 @@ export function WatchPage() {
                    console.info(`[player] iframe loaded: ${resolved.url}`);
                    iframeLoadedRef.current = true;
                    setIframeLoaded(true);
+                   // Cancel any pending failure-advance — the embed is alive.
+                   if (pendingAdvanceTimer.current) {
+                     clearTimeout(pendingAdvanceTimer.current);
+                     pendingAdvanceTimer.current = null;
+                   }
                  }}
                  onError={() => {
                    console.warn(`[player] iframe failed to load: ${resolved.url}`);
@@ -1057,30 +1512,67 @@ export function WatchPage() {
                 if (code === 3 || code === 4) advanceToNext();
               }}
             />
+            {/* Top title bar — fades with the controls */}
+            <div
+              className={`pointer-events-none absolute inset-x-0 top-0 flex items-start gap-3 bg-gradient-to-b from-black/80 via-black/25 to-transparent px-5 pb-12 pt-4 transition-opacity duration-300 ${
+                controlsVisible || !isPlaying ? "opacity-100" : "opacity-0"
+              }`}
+            >
+              <div className="min-w-0">
+                <p className="truncate text-sm font-bold text-white drop-shadow-md">
+                  {meta.episodeTitle || animeTitle || ""}
+                </p>
+                {meta.episodeTitle && animeTitle && (
+                  <p className="truncate text-xs text-white/55">{animeTitle}</p>
+                )}
+              </div>
+              {active && (
+                <span className="ms-auto shrink-0 rounded-full border border-white/10 bg-white/10 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-white/70 backdrop-blur-sm">
+                  {displayName(active)}
+                </span>
+              )}
+            </div>
+
             {/* Big play overlay when paused */}
             {!isPlaying && (
               <button
                 type="button"
                 onClick={togglePlay}
-                className="absolute inset-0 flex items-center justify-center bg-black/30"
+                className="absolute inset-0 flex items-center justify-center bg-black/40 backdrop-blur-[1px] transition"
               >
-                <span className="flex h-16 w-16 items-center justify-center rounded-full bg-accent shadow-glow">
-                  <svg width="28" height="28" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z" /></svg>
+                <span className="flex h-20 w-20 items-center justify-center rounded-full bg-accent/90 shadow-glow ring-4 ring-white/10 transition duration-200 hover:scale-105">
+                  <svg width="34" height="34" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z" /></svg>
                 </span>
               </button>
             )}
+
+            {/* Skip intro — modern pill, sits just above the control bar.
+                Eligible across the opening window, but auto-fades after a few
+                seconds (re-shows on mouse move) so it isn't glued on screen. */}
+            {showSkipIntroEligible && (
+              <button
+                onClick={(e) => { e.stopPropagation(); skipIntro(); }}
+                className={`group/skip absolute bottom-20 right-5 z-30 flex items-center gap-2 rounded-lg border border-white/25 bg-black/65 px-4 py-2.5 text-sm font-bold text-white shadow-card backdrop-blur-md transition-all duration-300 hover:-translate-y-0.5 hover:border-accent hover:bg-accent ${
+                  skipIntroVisible ? "opacity-100" : "opacity-0 pointer-events-none"
+                }`}
+              >
+                {t.skipIntro}
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" className="transition group-hover/skip:translate-x-0.5"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" /></svg>
+              </button>
+            )}
+
             {/* Controls overlay */}
             <div
-              className={`absolute inset-x-0 bottom-0 flex flex-col gap-1 bg-gradient-to-t from-black/95 via-black/55 to-transparent px-4 pb-3 pt-12 transition-opacity duration-200 ${
+              className={`absolute inset-x-0 bottom-0 flex flex-col gap-1.5 bg-gradient-to-t from-black/90 via-black/45 to-transparent px-4 pb-3 pt-16 transition-opacity duration-300 ${
                 controlsVisible || !isPlaying ? "opacity-100" : "opacity-0 pointer-events-none"
               }`}
               onClick={(e) => e.stopPropagation()}
             >
-              {/* Seek bar */}
-              <div className="relative">
-                <div className="pointer-events-none absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 overflow-hidden rounded-full bg-white/15">
-                  <div className="h-full bg-white/30" style={{ width: `${duration ? (buffered / duration) * 100 : 0}%` }} />
-                  <div className="absolute inset-y-0 left-0 bg-accent" style={{ width: `${duration ? (currentTime / duration) * 100 : 0}%` }} />
+              {/* Seek bar — track thickens and thumb appears on hover */}
+              <div className="group/seek relative flex items-center py-2">
+                <div className="pointer-events-none absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 overflow-hidden rounded-full bg-white/20 transition-all duration-150 group-hover/seek:h-1.5">
+                  <div className="absolute inset-y-0 left-0 bg-white/30" style={{ width: `${duration ? (buffered / duration) * 100 : 0}%` }} />
+                  <div className="absolute inset-y-0 left-0 bg-accent shadow-glow" style={{ width: `${duration ? (currentTime / duration) * 100 : 0}%` }} />
                 </div>
                 <input
                   type="range"
@@ -1089,67 +1581,69 @@ export function WatchPage() {
                   step="0.1"
                   value={Math.min(currentTime, duration || 0)}
                   onChange={onSeek}
-                  className="relative h-4 w-full cursor-pointer appearance-none bg-transparent [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-accent [&::-webkit-slider-thumb]:shadow-glow"
+                  aria-label="Seek"
+                  className="relative h-1.5 w-full cursor-pointer appearance-none bg-transparent [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-accent [&::-webkit-slider-thumb]:shadow-glow [&::-webkit-slider-thumb]:opacity-0 [&::-webkit-slider-thumb]:transition-opacity group-hover/seek:[&::-webkit-slider-thumb]:opacity-100"
                 />
               </div>
 
               {/* Bottom row */}
-              <div className="flex items-center gap-3 text-white">
-                <button onClick={togglePlay} title={isPlaying ? "Pause (k)" : "Play (k)"} className="rounded-full p-1.5 hover:bg-white/10">
+              <div className="flex items-center gap-1.5 text-white">
+                <button onClick={togglePlay} title={isPlaying ? "Pause (k)" : "Play (k)"} className="rounded-lg p-2 transition hover:bg-white/15">
                   {isPlaying ? (
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z" /></svg>
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z" /></svg>
                   ) : (
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
                   )}
                 </button>
-                <button onClick={() => skip(-10)} title="-10s (←)" className="rounded-full p-1.5 hover:bg-white/10">
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" /></svg>
+                <button onClick={() => skip(-10)} title="-10s (←)" className="rounded-lg p-2 transition hover:bg-white/15">
+                  <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" /></svg>
                 </button>
-                <button onClick={() => skip(10)} title="+10s (→)" className="rounded-full p-1.5 hover:bg-white/10">
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 5V1l5 5-5 5V7c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6h2c0 4.42-3.58 8-8 8s-8-3.58-8-8 3.58-8 8-8z" /></svg>
+                <button onClick={() => skip(10)} title="+10s (→)" className="rounded-lg p-2 transition hover:bg-white/15">
+                  <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M12 5V1l5 5-5 5V7c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6h2c0 4.42-3.58 8-8 8s-8-3.58-8-8 3.58-8 8-8z" /></svg>
                 </button>
                 <button
                   onClick={() => prev && navTo(prev)}
                   disabled={!prev}
                   title="Previous episode"
-                  className="rounded-full p-1.5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-transparent"
+                  className="rounded-lg p-2 transition hover:bg-white/15 disabled:opacity-30 disabled:hover:bg-transparent"
                 >
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" /></svg>
+                  <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" /></svg>
                 </button>
                 <button
                   onClick={() => next && navTo(next)}
                   disabled={!next}
                   title="Next episode"
-                  className="rounded-full p-1.5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-transparent"
+                  className="rounded-lg p-2 transition hover:bg-white/15 disabled:opacity-30 disabled:hover:bg-transparent"
                 >
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 18l8.5-6L6 6v12zM16 6h2v12h-2z" /></svg>
+                  <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M6 18l8.5-6L6 6v12zM16 6h2v12h-2z" /></svg>
                 </button>
 
                 {/* Volume */}
                 <div
-                  className="relative flex items-center gap-2"
+                  className="relative flex items-center gap-1"
                   onMouseEnter={() => setShowVolumeBar(true)}
                   onMouseLeave={() => setShowVolumeBar(false)}
                 >
-                  <button onClick={toggleMute} title="Mute (m)" className="rounded-full p-1.5 hover:bg-white/10">
+                  <button onClick={toggleMute} title="Mute (m)" className="rounded-lg p-2 transition hover:bg-white/15">
                     {muted || volume === 0 ? (
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.796 8.796 0 0021 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06a8.99 8.99 0 003.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z" /></svg>
+                      <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.796 8.796 0 0021 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06a8.99 8.99 0 003.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z" /></svg>
                     ) : (
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0014 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" /></svg>
+                      <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0014 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" /></svg>
                     )}
                   </button>
                   <input
                     type="range" min={0} max={1} step={0.05}
                     value={muted ? 0 : volume}
                     onChange={onVolumeChange}
-                    className={`h-1 cursor-pointer appearance-none rounded-full bg-white/25 transition-all ${
+                    aria-label="Volume"
+                    className={`h-1 cursor-pointer appearance-none rounded-full bg-white/25 transition-all duration-200 ${
                       showVolumeBar ? "w-20 opacity-100" : "w-0 opacity-0"
                     } [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-white`}
                   />
                 </div>
 
-                <span className="ms-1 text-xs tabular-nums text-white/80">
-                  {formatTime(currentTime)} / {formatTime(duration)}
+                <span className="ms-2 text-xs font-medium tabular-nums text-white/85">
+                  {formatTime(currentTime)} <span className="text-white/40">/ {formatTime(duration)}</span>
                 </span>
 
                 <span className="flex-1" />
@@ -1158,18 +1652,18 @@ export function WatchPage() {
                 <div className="relative">
                   <button
                     onClick={() => setShowRateMenu((v) => !v)}
-                    className="rounded-md px-2 py-1 text-xs font-semibold hover:bg-white/10"
+                    className="rounded-lg px-2.5 py-1.5 text-xs font-bold transition hover:bg-white/15"
                   >
                     {playbackRate}×
                   </button>
                   {showRateMenu && (
-                    <div className="absolute bottom-full end-0 mb-2 w-20 rounded-md border border-white/10 bg-bg/95 p-1 shadow-card backdrop-blur-md">
+                    <div className="absolute bottom-full end-0 mb-2 w-20 overflow-hidden rounded-lg border border-white/10 bg-bg/95 p-1 shadow-card backdrop-blur-md">
                       {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((r) => (
                         <button
                           key={r}
                           onClick={() => setRate(r)}
-                          className={`block w-full rounded px-2 py-1 text-xs hover:bg-white/10 ${
-                            playbackRate === r ? "text-accent" : ""
+                          className={`block w-full rounded-md px-2 py-1 text-xs transition hover:bg-white/10 ${
+                            playbackRate === r ? "font-bold text-accent" : "text-white/80"
                           }`}
                         >
                           {r}×
@@ -1179,11 +1673,11 @@ export function WatchPage() {
                   )}
                 </div>
 
-                <button onClick={toggleFs} title="Fullscreen (f)" className="rounded-full p-1.5 hover:bg-white/10">
+                <button onClick={toggleFs} title="Fullscreen (f)" className="rounded-lg p-2 transition hover:bg-white/15">
                   {isFullscreen ? (
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z" /></svg>
+                    <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z" /></svg>
                   ) : (
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" /></svg>
+                    <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" /></svg>
                   )}
                 </button>
               </div>
@@ -1268,11 +1762,34 @@ export function WatchPage() {
 
       {/* Server picker */}
       <section className="space-y-2">
-        <h2 className="font-display text-sm font-bold uppercase tracking-wider text-text-secondary">
-          {t.servers} ({sortedServers.length})
-        </h2>
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="flex items-center gap-2 font-display text-sm font-bold uppercase tracking-wider text-text-secondary">
+            {t.servers} ({sortedServers.length})
+            {(loadingServers || searchingMoreServers) && (
+              <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-accent border-t-transparent" />
+            )}
+          </h2>
+          <button
+            onClick={refreshServers}
+            disabled={loadingServers}
+            title={t.refreshServers}
+            className="flex items-center gap-1.5 rounded-full border border-white/10 bg-surface px-3 py-1.5 text-xs font-semibold text-text-secondary transition hover:border-white/30 hover:text-white disabled:opacity-40 disabled:hover:border-white/10"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" className={loadingServers ? "animate-spin" : ""}>
+              <path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
+            </svg>
+            {t.refreshServers}
+          </button>
+        </div>
+        {searchingMoreServers && sortedServers.length > 0 && (
+          <p className="text-xs text-text-muted">{t.loadingMoreServers}</p>
+        )}
         {sortedServers.length === 0 && !loadingServers ? (
-          <p className="text-text-muted">{t.noServers}</p>
+          searchingMoreServers ? (
+            <p className="text-text-muted">{t.loadingMoreServers}</p>
+          ) : (
+            <p className="text-text-muted">{t.noServers}</p>
+          )
         ) : (
           <div className="flex flex-wrap gap-2">
             {sortedServers.map((s, i) => {
@@ -1294,7 +1811,7 @@ export function WatchPage() {
                 >
                   {displayName(s)}
                   {s.source && (
-                    <span className="ms-1.5 opacity-60">· {s.source === "anime4up" ? "4up" : "wit"}</span>
+                    <span className="ms-1.5 opacity-60">· {s.source === "anime4up" ? "4up" : s.source === "anime3rb" ? "3rb" : "wit"}</span>
                   )}
                 </button>
               );
