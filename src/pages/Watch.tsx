@@ -911,6 +911,10 @@ export function WatchPage() {
     let advanced = false;
     let lastTime = 0;
     let lastTimeUpdate = Date.now();
+    // Mid-stream stalls on progressive direct streams get an in-place reload
+    // before we give up on the server (see checkStall).
+    let inPlaceRecoveries = 0;
+    const MAX_INPLACE_RECOVERIES = 2;
     // Absolute wall clock for initial load. Even if `progress` events
     // keep firing (slow CDN dripping bytes), we still hard-advance once
     // this elapses without `playing` firing. Without this the player
@@ -934,6 +938,29 @@ export function WatchPage() {
       if (isInitialLoading || isBufferingMidStream) {
         const elapsed = now - lastTimeUpdate;
         if (elapsed > STALL_THRESHOLD_MS) {
+          // Mid-stream stall on a progressive direct stream (vid3rb /
+          // mp4upload / videa): these CDNs throttle throughput to ~2.5× the
+          // file bitrate and intermittently drop connections, and Chromium
+          // sometimes never revives the dropped media request on its own.
+          // The signed URL is still valid (tokens live ~40 min), so reload
+          // the SAME source in place and seek back instead of yanking the
+          // user to a different server — vid3rb's "keeps loading" symptom.
+          if (isBufferingMidStream && resolved.type !== "hls" && inPlaceRecoveries < MAX_INPLACE_RECOVERIES) {
+            inPlaceRecoveries++;
+            const pos = v.currentTime;
+            console.warn(`[player] mid-stream stall ${elapsed}ms — in-place reload #${inPlaceRecoveries} @ ${pos.toFixed(1)}s`);
+            try {
+              v.load();
+              v.addEventListener("loadedmetadata", () => {
+                try {
+                  if (pos > 0 && v.duration > 0 && pos < v.duration) v.currentTime = pos;
+                  v.play().catch(() => {});
+                } catch {}
+              }, { once: true });
+            } catch {}
+            lastTimeUpdate = Date.now();
+            return;
+          }
           advanced = true;
           console.warn(`[player] Stalled for ${elapsed}ms (initial=${isInitialLoading}) — advancing to next server`);
           advanceToNext();
