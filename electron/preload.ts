@@ -38,6 +38,11 @@ contextBridge.exposeInMainWorld("pantoufa", {
     ipcRenderer.on("pantoufa:update-downloaded", listener);
     return () => ipcRenderer.removeListener("pantoufa:update-downloaded", listener);
   },
+  onUpdateError: (handler: (info: { message: string }) => void) => {
+    const listener = (_evt: unknown, info: { message: string }) => handler(info);
+    ipcRenderer.on("pantoufa:update-error", listener);
+    return () => ipcRenderer.removeListener("pantoufa:update-error", listener);
+  },
   onVideoCaptured: (handler: (info: { url: string }) => void) => {
     const listener = (_evt: unknown, info: { url: string }) => handler(info);
     ipcRenderer.on("pantoufa:video-captured", listener);

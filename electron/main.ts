@@ -3,8 +3,9 @@
 // Renderer (React) talks to us via IPC: `window.pantoufa.scrape(...)` is
 // exposed in preload.ts, which forwards to the IPC handler here.
 
-import { app, BrowserWindow, ipcMain, protocol, session, shell } from "electron";
+import { app, BrowserWindow, ipcMain, net, protocol, session, shell } from "electron";
 import path from "node:path";
+import fs from "node:fs";
 
 // Disable QUIC so Chromium falls back to TCP/HTTP2. Restrictive ISPs
 // often block or mangle QUIC (UDP/443), causing ERR_QUIC_PROTOCOL_ERROR
@@ -56,6 +57,49 @@ const PLAYBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
 let mainWindow: BrowserWindow | null = null;
 let pendingAuthCallback: string | null = null;
 let updateCheckInterval: ReturnType<typeof setInterval> | null = null;
+
+// File-backed logger for electron-updater. Writes to <userData>/updater.log so
+// auto-update failures are diagnosable on the user's machine (packaged builds
+// have no visible console). Implements the minimal {info,warn,error,debug}
+// shape electron-updater calls. Never throws — logging must not break startup.
+function createUpdaterLogger() {
+  let logPath = "";
+  try {
+    logPath = path.join(app.getPath("userData"), "updater.log");
+  } catch {
+    /* getPath can fail before app is ready — fall back to console only */
+  }
+  const fmt = (a: unknown) =>
+    a instanceof Error
+      ? a.stack || a.message
+      : typeof a === "object"
+        ? (() => {
+            try {
+              return JSON.stringify(a);
+            } catch {
+              return String(a);
+            }
+          })()
+        : String(a);
+  const write = (level: "info" | "warn" | "error" | "debug", args: unknown[]) => {
+    const line = `[${new Date().toISOString()}] [${level}] ${args.map(fmt).join(" ")}\n`;
+    try {
+      if (logPath) fs.appendFileSync(logPath, line);
+    } catch {
+      /* disk full / locked — ignore */
+    }
+    (level === "error" ? console.error : level === "warn" ? console.warn : console.info)(
+      "[updater]",
+      ...args,
+    );
+  };
+  return {
+    info: (...a: unknown[]) => write("info", a),
+    warn: (...a: unknown[]) => write("warn", a),
+    error: (...a: unknown[]) => write("error", a),
+    debug: (...a: unknown[]) => write("debug", a),
+  };
+}
 
 // Single-instance lock so the OS routes pantoufa:// URLs to our running app.
 const gotLock = app.requestSingleInstanceLock();
@@ -1810,6 +1854,34 @@ function registerVideoProxy() {
 }
 
 app.whenReady().then(() => {
+  // DNS-over-HTTPS. Many ISPs block the anime source domains
+  // (witanime / anime4up / anime3rb) and a few video CDNs at the DNS layer —
+  // that's the classic "works fine on mobile data, but half the servers never
+  // show up on home WiFi". The block is just the ISP's resolver lying, so we
+  // route ALL of Chromium's DNS through DoH (Cloudflare → Google → Quad9),
+  // which resolves those hostnames from an unfiltered resolver. This covers
+  // both the scraper BrowserWindows (witanime primary servers) AND the video
+  // iframes. The cross-source anime4up/anime3rb fetches go through net.fetch
+  // (see pantoufa:fetch-html), which rides this same resolver.
+  //
+  // 'automatic' (not 'secure') keeps the system resolver as a fallback when
+  // DoH itself is unreachable, so this can only ever help: a network that
+  // already worked keeps working, a network that blocks the anime domains now
+  // resolves them over HTTPS. Pairs with the QUIC disable above (same goal:
+  // surviving restrictive ISPs).
+  try {
+    app.configureHostResolver({
+      secureDnsMode: "automatic",
+      secureDnsServers: [
+        "https://cloudflare-dns.com/dns-query",
+        "https://dns.google/dns-query",
+        "https://dns.quad9.net/dns-query",
+      ],
+    });
+  } catch (e) {
+    console.warn("configureHostResolver failed:", e);
+  }
+
   const coldStartUrl = process.argv.find((a) => a.startsWith(`${PROTOCOL}://`));
   if (coldStartUrl) handleAuthCallbackUrl(coldStartUrl);
 
@@ -2165,7 +2237,12 @@ app.whenReady().then(() => {
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), PER_ATTEMPT_TIMEOUT_MS);
       try {
-        const res = await fetch(opts.url, {
+        // net.fetch (Chromium net stack) instead of global fetch (Node/undici)
+        // so this rides the DoH host resolver configured in whenReady — undici
+        // uses the system resolver and would still hit the ISP's DNS block,
+        // which is exactly why anime4up/anime3rb servers go missing on some
+        // WiFi networks but show on mobile data.
+        const res = await net.fetch(opts.url, {
           signal: controller.signal,
           headers: {
             "User-Agent":
@@ -2211,26 +2288,53 @@ app.whenReady().then(() => {
   // Auto-updater: check GitHub releases on launch + every hour. Notifies the
   // renderer when an update is available (so we can show our own popup) and
   // when it's downloaded and ready to install.
+  //
+  // Everything is logged to <userData>/updater.log so silent failures (check,
+  // download, or install) are diagnosable on the user's machine — previously
+  // errors were swallowed (.catch(() => {}) + a console.warn that goes nowhere
+  // in a packaged build), so a non-updating install looked identical to a
+  // working one. Errors are also forwarded to the renderer for a visible toast.
   if (!isDev) {
+    const log = createUpdaterLogger();
+
+    autoUpdater.logger = log as unknown as typeof autoUpdater.logger;
     autoUpdater.autoDownload = true;
     autoUpdater.autoInstallOnAppQuit = true;
+
+    log.info(`init — installed v${app.getVersion()}, feed = github:techvibedz/anime-desktop`);
+
+    autoUpdater.on("checking-for-update", () => log.info("checking for update…"));
     autoUpdater.on("update-available", (info) => {
+      log.info(`update available: v${info.version}`);
       mainWindow?.webContents.send("pantoufa:update-available", {
         version: info.version,
         releaseNotes: typeof info.releaseNotes === "string" ? info.releaseNotes : "",
       });
     });
+    autoUpdater.on("update-not-available", (info) => {
+      log.info(`no update — already on the latest (v${info?.version ?? app.getVersion()})`);
+    });
+    autoUpdater.on("download-progress", (p) => {
+      log.info(`downloading ${Math.round(p.percent)}% — ${Math.round(p.transferred / 1e6)}/${Math.round(p.total / 1e6)} MB`);
+    });
     autoUpdater.on("update-downloaded", (info) => {
+      log.info(`downloaded v${info.version} — ready to install on restart`);
       mainWindow?.webContents.send("pantoufa:update-downloaded", {
         version: info.version,
         releaseNotes: typeof info.releaseNotes === "string" ? info.releaseNotes : "",
       });
     });
     autoUpdater.on("error", (err) => {
-      console.warn("[updater] error:", err?.message || err);
+      log.error("error:", err);
+      mainWindow?.webContents.send("pantoufa:update-error", {
+        message: err?.message || String(err),
+      });
     });
-    setTimeout(() => { autoUpdater.checkForUpdates().catch(() => {}); }, 5000);
-    updateCheckInterval = setInterval(() => { autoUpdater.checkForUpdates().catch(() => {}); }, 60 * 60 * 1000);
+
+    const check = () =>
+      autoUpdater.checkForUpdates().catch((e) => log.error("checkForUpdates threw:", e));
+    setTimeout(check, 5000);
+    updateCheckInterval = setInterval(check, 60 * 60 * 1000);
   }
 
   app.on("activate", () => {

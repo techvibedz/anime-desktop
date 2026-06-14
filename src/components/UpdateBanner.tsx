@@ -7,12 +7,45 @@ import type { UpdateInfo } from "../preload-types";
  */
 export function UpdateBanner() {
   const [info, setInfo] = useState<UpdateInfo | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
 
   useEffect(() => {
-    const off = window.pantoufa?.onUpdateDownloaded?.((i) => setInfo(i));
-    return () => { off?.(); };
+    const offDownloaded = window.pantoufa?.onUpdateDownloaded?.((i) => {
+      setError(null); // a successful download supersedes any earlier error
+      setInfo(i);
+    });
+    const offError = window.pantoufa?.onUpdateError?.((e) => setError(e.message));
+    return () => {
+      offDownloaded?.();
+      offError?.();
+    };
   }, []);
+
+  // Update failed (check/download/install) — show a dismissible error toast so
+  // the failure is visible instead of silently doing nothing.
+  if (!info && error) {
+    return (
+      <div className="fixed bottom-5 end-5 z-[200] w-[min(420px,92vw)] overflow-hidden rounded-2xl border border-red-500/30 bg-surface shadow-card">
+        <div className="absolute inset-x-0 top-0 h-1 bg-red-500" />
+        <div className="flex items-start gap-3 p-4">
+          <div className="min-w-0 flex-1">
+            <p className="text-[11px] font-bold uppercase tracking-wider text-red-400">فشل التحديث</p>
+            <p className="mt-1 line-clamp-3 text-xs text-text-secondary" dir="ltr">{error}</p>
+          </div>
+          <button
+            onClick={() => setError(null)}
+            className="rounded-full p-1 text-text-muted hover:bg-white/5 hover:text-white"
+            aria-label="إغلاق"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (!info) return null;
 
