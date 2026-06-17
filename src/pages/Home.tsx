@@ -4,7 +4,8 @@ import { fetchHome, type HomeSection, type FeaturedItem, type AnimeItem, type Ep
 import { AnimeCard, EpisodeCard } from "../components/AnimeCard";
 import { EpisodeActionModal } from "../components/EpisodeActionModal";
 import { Shimmer } from "../components/Shimmer";
-import { getHistory, removeFromHistory, type WatchEntry } from "../lib/history";
+import { getContinueWatching, pullHistoryFromCloud, removeFromHistory, type WatchEntry } from "../lib/history";
+import { extractEpisodeNumber } from "../lib/episode-utils";
 import { t } from "../lib/i18n";
 
 export function HomePage() {
@@ -26,7 +27,21 @@ export function HomePage() {
       .catch((e) => setError(e?.message ?? t.failedToLoad))
       .finally(() => setLoading(false));
 
-    getHistory().then((h) => setHistory(h.filter((w) => !w.completed).slice(0, 10)));
+    // Pull the shared cloud history first so the row matches the mobile app on
+    // the same account, then read the deduped (one-per-anime) list. Pulling here
+    // closes the race where Home read local storage before App's pull finished.
+    pullHistoryFromCloud()
+      .catch(() => {})
+      .then(() => getContinueWatching())
+      .then(setHistory);
+  }, []);
+
+  // Refresh when the window regains focus (e.g. back from the Watch page), so
+  // progress made elsewhere shows up — mirrors mobile's focus refresh.
+  useEffect(() => {
+    const refresh = () => getContinueWatching().then(setHistory);
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
   }, []);
 
   useEffect(() => {
@@ -111,13 +126,20 @@ export function HomePage() {
         <section className="space-y-3">
           <h2 className="font-display text-xl font-bold text-white">{t.continueWatching}</h2>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
-            {history.map((w) => (
+            {history.map((w) => {
+              const epNum = extractEpisodeNumber(w.episodeTitle, w.episodeHref);
+              return (
               <Link
                 key={w.episodeHref}
                 to={`/watch/${encodeURIComponent(w.episodeHref)}${w.animeHref ? `?anime=${encodeURIComponent(w.animeHref)}` : ""}${w.image && !w.animeHref ? `?img=${encodeURIComponent(w.image)}` : ""}${w.url4up ? `&up4=${encodeURIComponent(w.url4up)}` : ""}`}
                 className="group block"
               >
                 <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface">
+                  {epNum != null && (
+                    <span className="absolute start-1 top-1 z-10 rounded-md bg-accent px-1.5 py-0.5 text-[10px] font-bold leading-none text-black shadow-sm">
+                      {t.episode} {epNum}
+                    </span>
+                  )}
                   <button
                     onClick={(e) => {
                       e.preventDefault();
@@ -157,7 +179,8 @@ export function HomePage() {
                   </div>
                 </div>
               </Link>
-            ))}
+              );
+            })}
           </div>
         </section>
       )}

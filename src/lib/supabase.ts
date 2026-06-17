@@ -21,6 +21,13 @@ export const supabase = createClient(
       autoRefreshToken: true,
       persistSession: true,
       detectSessionInUrl: false,
+      // PKCE (not the default implicit flow) for desktop OAuth. Implicit puts
+      // the session in the URL *fragment* (#access_token=...), which browsers
+      // routinely drop when handing a pantoufa:// custom-scheme URL to the OS,
+      // so the app never receives it. PKCE returns ?code=... in the query
+      // string instead, which survives the deep-link round-trip; auth.tsx then
+      // calls exchangeCodeForSession() using the verifier kept in localStorage.
+      flowType: "pkce",
       storage: typeof window !== "undefined" ? window.localStorage : undefined,
     },
   },

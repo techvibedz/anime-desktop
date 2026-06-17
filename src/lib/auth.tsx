@@ -9,6 +9,8 @@ interface AuthState {
   loading: boolean;
   ready: boolean;
   isConfigured: boolean;
+  authError: string | null;
+  clearAuthError: () => void;
   signInWithEmail: (email: string, password: string) => Promise<{ error?: string }>;
   signUpWithEmail: (email: string, password: string) => Promise<{ error?: string; needsConfirmation?: boolean }>;
   signInWithGoogle: () => Promise<{ error?: string }>;
@@ -22,6 +24,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [ready, setReady] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const clearAuthError = useCallback(() => setAuthError(null), []);
 
   useEffect(() => {
     if (!isSupabaseConfigured) {
@@ -45,16 +49,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const hash = url.split("#")[1] ?? "";
         const query = url.split("?")[1]?.split("#")[0] ?? "";
         const params = new URLSearchParams(hash || query);
+        // Provider/Supabase can bounce back an error instead of a session
+        // (e.g. redirect URL not allow-listed, consent denied). Surface it.
+        const errDesc = params.get("error_description") || params.get("error");
+        if (errDesc) {
+          setAuthError(decodeURIComponent(errDesc.replace(/\+/g, " ")));
+          return;
+        }
         const access_token = params.get("access_token");
         const refresh_token = params.get("refresh_token");
         const code = params.get("code");
         if (access_token && refresh_token) {
-          await supabase.auth.setSession({ access_token, refresh_token });
+          const { error } = await supabase.auth.setSession({ access_token, refresh_token });
+          if (error) setAuthError(error.message);
         } else if (code) {
-          await supabase.auth.exchangeCodeForSession(code);
+          const { error } = await supabase.auth.exchangeCodeForSession(code);
+          if (error) setAuthError(error.message);
+        } else {
+          setAuthError("Sign-in response was missing its session token.");
         }
       } catch (e) {
         console.warn("[auth] callback handling failed", e);
+        setAuthError(e instanceof Error ? e.message : "Google sign-in failed.");
       }
     });
 
@@ -76,6 +92,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signInWithGoogle = useCallback(async () => {
+    setAuthError(null);
     // Ask Supabase for the OAuth URL but DON'T navigate the Electron window
     // there. We open it in the user's system browser and wait for the
     // pantoufa:// custom-protocol callback (wired in main.ts → preload).
@@ -109,6 +126,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         loading: !ready,
         ready,
         isConfigured: isSupabaseConfigured,
+        authError,
+        clearAuthError,
         signInWithEmail,
         signUpWithEmail,
         signInWithGoogle,

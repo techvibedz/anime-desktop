@@ -101,6 +101,26 @@ export async function saveProgress(entry: Omit<WatchEntry, "updatedAt">) {
   pushToCloud(merged).catch(() => {});
 }
 
+/**
+ * One entry per anime for the "Continue Watching" row — the most recently
+ * watched episode of each series, so the user resumes where they stopped
+ * instead of seeing every episode they've watched. Mirrors the mobile app so
+ * both surfaces render the same list off the shared cloud history.
+ */
+export async function getContinueWatching(): Promise<WatchEntry[]> {
+  const list = await getHistory();
+  // list is already sorted newest-first; keep the first seen per anime.
+  const seen = new Set<string>();
+  const out: WatchEntry[] = [];
+  for (const e of list) {
+    const key = e.animeHref || e.animeTitle;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(e);
+  }
+  return out;
+}
+
 export async function getProgress(episodeHref: string): Promise<WatchEntry | null> {
   const list = await getHistory();
   return list.find((e) => e.episodeHref === episodeHref) ?? null;
