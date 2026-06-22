@@ -1,6 +1,8 @@
 import { storage } from "./storage";
+import { fuzzyScore } from "./fuzzy";
 import {
   scrapeWitanimeHome,
+  fetchWitHomeDirect,
   scrapeEpisodesPage,
   scrapeSearch,
   scrapeRecent,
@@ -10,6 +12,7 @@ import {
   scrapeAnime4upServersDirect,
   scrapeAnime4upEpisodePageDirect,
   searchAnime4upDirect,
+  searchAnime4upDirectList,
   scrapeAnime4upEpisodesDirect,
   findUp4EpisodeAcrossPages,
   findCrossSourceUrl,
@@ -52,6 +55,25 @@ export interface SearchResult { title: string; href: string; image: string; type
 function imgOrEmpty(s: string | null | undefined): string { return s ?? ""; }
 export function getProxyUrl(videoUrl: string): string { return videoUrl; }
 
+// Strip the SEO boilerplate the source sites bake into an anime page's "story"
+// field so the detail screen never shows junk like "تحميل ومشاهدة جميع حلقات …".
+// A real Arabic synopsis is kept intact; pure boilerplate collapses to "".
+const SYNOPSIS_JUNK =
+  /تحميل\s*و?\s*مشاهدة|مشاهدة\s*و?\s*تحميل|اون\s*لاين|أون\s*لاين|أونلاين|بجودة\s*عالية|جميع\s*حلقات|anime3rb|anime4up|witanime|أنمي\s*عرب|انمي\s*عرب|حصرياً\s*على/i;
+function cleanSynopsis(raw: string | null | undefined): string {
+  let s = (raw || "").replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  s = s.replace(/^\s*(?:قصة\s*(?:الأنمي|الانمي)?|القصة|story|synopsis)\s*[:：\-–]?\s*/i, "").trim();
+  if (SYNOPSIS_JUNK.test(s)) {
+    const kept = s
+      .split(/[.!؟\n]+/)
+      .map((p) => p.trim())
+      .filter((p) => p && !SYNOPSIS_JUNK.test(p));
+    s = kept.join(". ").trim();
+  }
+  return s.length < 25 ? "" : s;
+}
+
 type HomePayload = { success: boolean; data: { featured: FeaturedItem[]; sections: HomeSection[] } };
 let bgRefreshInFlight = false;
 
@@ -70,7 +92,14 @@ function buildHomePayload(wit: { featured: FeaturedItem[]; animes: any[]; episod
 }
 
 async function fetchHomeFresh(): Promise<HomePayload> {
-  const wit = await scrapeWitanimeHome();
+  // Fast path: read the home page's static HTML directly (sub-second, no headless
+  // window cold-start / Cloudflare-clear). Fall back to the headless scrape only
+  // when the direct fetch comes back empty (CF challenge / cold body).
+  let wit: { featured: any[]; animes: any[]; episodes: any[] } | null =
+    await fetchWitHomeDirect().catch(() => null);
+  if (!wit || (wit.animes.length === 0 && wit.episodes.length === 0)) {
+    wit = await scrapeWitanimeHome();
+  }
   const result = buildHomePayload(wit);
   void writeCache(HOME_CACHE_KEY, result);
   return result;
@@ -200,7 +229,7 @@ async function fetchEpisodesFresh(animeUrl: string): Promise<EpisodesPayload> {
   const d = await scrapeEpisodesPage(animeUrl);
   const payload: EpisodesPayload = {
     success: true,
-    data: { title: d.title, poster: d.poster, banner: d.poster, synopsis: d.synopsis, genres: d.genres, rating: null, metadata: {}, externalLinks: [], totalEpisodes: d.episodes.length, episodes: d.episodes, episodes4up: [], merged: null, up4Hint: d.up4Url ?? null },
+    data: { title: d.title, poster: d.poster, banner: d.poster, synopsis: cleanSynopsis(d.synopsis), genres: d.genres, rating: null, metadata: {}, externalLinks: [], totalEpisodes: d.episodes.length, episodes: d.episodes, episodes4up: [], merged: null, up4Hint: d.up4Url ?? null },
   };
   void writeCache(DETAIL_CACHE_PREFIX + animeUrl, payload);
   return payload;
@@ -251,8 +280,36 @@ export async function fetchRecent(page = 1) {
 }
 
 export async function searchAnime(query: string) {
-  const r = await scrapeSearch(query);
-  return { success: true, data: { query, totalResults: r.results.length, results: r.results.map((it) => ({ title: it.title, href: it.href, image: imgOrEmpty(it.image), type: it.type ?? undefined, status: it.status ?? undefined, synopsis: it.synopsis ?? undefined })) } };
+  // Run witanime (headless) and anime4up (direct static-HTML GET, near-instant)
+  // in parallel, merge their results de-duped by href, then fuzzy-rerank against
+  // the query so the closest title floats to the top even when a source's own
+  // search buried it (typo, spacing, dropped colon). anime4up's direct list
+  // costs ~nothing, so it widens coverage for free.
+  const [wit, up4] = await Promise.all([
+    scrapeSearch(query).catch(() => ({ results: [] as SearchResult[] })),
+    searchAnime4upDirectList(query).catch(() => null),
+  ]);
+  const merged: SearchResult[] = [];
+  const seen = new Set<string>();
+  const push = (it: { title: string; href: string; image: string | null; type: string | null; status?: string | null; synopsis?: string | null }) => {
+    if (!it.href || seen.has(it.href)) return;
+    seen.add(it.href);
+    merged.push({
+      title: it.title,
+      href: it.href,
+      image: imgOrEmpty(it.image),
+      type: it.type ?? undefined,
+      status: it.status ?? undefined,
+      synopsis: it.synopsis ?? undefined,
+    });
+  };
+  for (const it of wit.results || []) push(it as any);
+  for (const it of up4 || []) push(it as any);
+  // Stable fuzzy rerank: higher similarity first, ties keep insertion order.
+  const scored = merged.map((it, i) => ({ it, i, s: fuzzyScore(query, it.title) }));
+  scored.sort((a, b) => (b.s - a.s) || (a.i - b.i));
+  const results = scored.map((x) => x.it);
+  return { success: true, data: { query, totalResults: results.length, results } };
 }
 
 export async function fetchGenre(name: string, page = 1) {
@@ -441,6 +498,62 @@ export async function fetchAnime3rbServers(animeTitle: string, epNumber: number)
   const servers = await scrapeAnime3rbEpisodeServers(episodeUrl).catch(() => [] as RawServer[]);
   if (servers.length > 0) console.info(`[a3rb-resolve] ep ${epNumber}: ${servers.length} server(s) from ${episodeUrl}`);
   return servers;
+}
+
+/* ── downloads ──────────────────────────────────
+ * Resolve a DIRECT, progressive .mp4 URL for an episode so it can be saved to
+ * disk for offline viewing. HLS (.m3u8) sources are skipped (a playlist, not a
+ * single file), so only providers proven to hand out a progressive .mp4 are
+ * considered: vid3rb (anime3rb's first-party host, direct 1080p) first, then
+ * mp4upload. The main process performs the actual file download and forces the
+ * per-provider Referer the CDN's signed URL needs. */
+const DL_RANK: Record<string, number> = { vid3rb: 0, mp4upload: 1 };
+
+function dlQualityScore(name: string): number {
+  const n = (name || "").toLowerCase();
+  if (n.includes("fhd") || n.includes("1080")) return 3;
+  if (n.includes("hd") || n.includes("720")) return 2;
+  if (n.includes("sd") || n.includes("480") || n.includes("360")) return 0;
+  return 1;
+}
+
+export async function resolveDownloadUrl(opts: {
+  episodeHref: string;
+  url4up?: string;
+  epNum?: number | null;
+  animeTitle?: string | null;
+}): Promise<{ url: string; provider: string } | null> {
+  const { episodeHref, url4up, epNum, animeTitle } = opts;
+  const cands: { name: string; iframeUrl: string; provider: string }[] = [];
+
+  // anime3rb (vid3rb → direct 1080p .mp4) — the best download source.
+  try {
+    if (animeTitle && epNum != null) {
+      const a3 = await fetchAnime3rbServers(animeTitle, epNum);
+      for (const s of a3) cands.push({ name: s.name, iframeUrl: s.iframeUrl, provider: s.provider });
+    }
+  } catch {}
+
+  // Primary (witanime/anime4up) — for the mp4upload server.
+  try {
+    const res = await fetchVideoServers(episodeHref, url4up);
+    if (res?.success) for (const s of res.data.servers) cands.push({ name: s.name, iframeUrl: s.iframeUrl, provider: s.provider });
+  } catch {}
+
+  const downloadable = cands
+    .filter((c) => c.provider in DL_RANK && c.iframeUrl)
+    .sort((a, b) => (DL_RANK[a.provider] - DL_RANK[b.provider]) || (dlQualityScore(b.name) - dlQualityScore(a.name)));
+
+  for (const c of downloadable) {
+    const r = await resolveVideo(c.iframeUrl, c.provider).catch(() => null);
+    if (r && r.success) {
+      const { videoUrl, type } = r.data;
+      if (videoUrl && type !== "hls" && !/\.m3u8(\?|$)/i.test(videoUrl)) {
+        return { url: videoUrl, provider: c.provider };
+      }
+    }
+  }
+  return null;
 }
 
 export async function enrichServersFromUp4(servers: (VideoServer & { source?: string })[], url4up: string): Promise<(VideoServer & { source?: string })[]> {

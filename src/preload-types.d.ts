@@ -39,6 +39,11 @@ declare global {
         referer?: string,
         opts?: { attempts?: number; timeoutMs?: number },
       ) => Promise<string | null>;
+      fetchJson: (opts: { url: string; method?: string; body?: string; headers?: Record<string, string> }) => Promise<string | null>;
+      downloadStart: (opts: { id: string; url: string; provider: string }) => Promise<{ ok: boolean; total?: number }>;
+      downloadDelete: (id: string) => Promise<boolean>;
+      onDownloadProgress: (handler: (info: { id: string; bytes: number; total: number }) => void) => () => void;
+      downloadFileUrl: (id: string) => string;
     };
   }
 }

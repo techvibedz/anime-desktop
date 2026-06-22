@@ -827,3 +827,214 @@ export async function extractVideoUrl(embedUrl: string) {
     isVideoJob: true,
   });
 }
+
+/* ── Direct (no-headless) listings & card parsing ──────────────────────────
+ *
+ * Powers the source-direct home rails (lib/sourceRails) + the faster search.
+ * witanime / anime4up listing + search pages ship their cards in the static
+ * HTML, so a single privileged GET + regex parse returns them in well under a
+ * second — the headless render takes many seconds and trips anime4up's ad
+ * gates. Ported from the mobile app (lib/scraper/direct.ts). */
+
+export type WitCard = {
+  title: string; href: string; image: string | null;
+  type: string | null; status: string | null; synopsis: string | null;
+};
+
+function htmlDecodeCard(s: string): string {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Strip WordPress' resize suffix (…-323x470.jpg → ….jpg) + CDN resize params.
+function upgradeCardImg(u: string | null): string | null {
+  if (!u) return null;
+  return String(u)
+    .replace(/-\d+x\d+(\.\w+)$/, "$1")
+    .replace(/\?resize=\d+,\d+/, "")
+    .replace(/\?w=\d+/, "");
+}
+
+// Parse every .anime-card-container in a witanime listing/search page.
+function parseWitCards(html: string): WitCard[] {
+  const out: WitCard[] = [];
+  const seen = new Set<string>();
+  const blocks = html.split("anime-card-container");
+  for (let i = 1; i < blocks.length; i++) {
+    const b = blocks[i];
+    const tm = b.match(/anime-card-title[^>]*>\s*<h3[^>]*>\s*<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
+    if (!tm) continue;
+    const href = (tm[1] || "").trim();
+    if (href.indexOf("/anime/") < 0 || seen.has(href)) continue;
+    const title = htmlDecodeCard((tm[2] || "").replace(/<[^>]+>/g, ""));
+    if (!title) continue;
+    seen.add(href);
+    const im = b.match(/<img[^>]*\b(?:data-src|data-original|data-image|src)=["']([^"']+)["']/i);
+    const ty = b.match(/anime-card-type[^>]*>\s*<a[^>]*>([\s\S]*?)<\/a>/i);
+    const st = b.match(/anime-card-status[^>]*>\s*<a[^>]*>([\s\S]*?)<\/a>/i);
+    out.push({
+      title, href,
+      image: im ? upgradeCardImg(im[1]) : null,
+      type: ty ? htmlDecodeCard(ty[1].replace(/<[^>]+>/g, "")) : null,
+      status: st ? htmlDecodeCard(st[1].replace(/<[^>]+>/g, "")) : null,
+      synopsis: null,
+    });
+  }
+  return out;
+}
+
+// Fetch + parse a witanime listing page (genre / all-anime / movies).
+export async function fetchWitListingDirect(url: string): Promise<WitCard[] | null> {
+  const html = await window.pantoufa.fetchHtml?.(url, WIT_BASE + "/");
+  if (!html) return null;
+  return parseWitCards(html);
+}
+
+// witanime's full movie listing — every movie in ONE static GET.
+export async function fetchWitMoviesListing(): Promise<WitCard[] | null> {
+  return fetchWitListingDirect(`${WIT_BASE}/anime-type/movie/`);
+}
+
+// Parse anime4up's .anime-card-container cards (season / movie listing pages).
+function parseAnime4upCards(
+  html: string,
+): { title: string; href: string; image: string | null; type: string | null }[] {
+  const out: { title: string; href: string; image: string | null; type: string | null }[] = [];
+  const seen = new Set<string>();
+  const blocks = html.split("anime-card-container");
+  for (let i = 1; i < blocks.length; i++) {
+    const b = blocks[i];
+    const tm = b.match(/anime-card-title[^>]*>\s*<h3[^>]*>\s*<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
+    if (!tm) continue;
+    let href = (tm[1] || "").trim();
+    if (href.indexOf("/anime/") < 0) continue;
+    if (href.indexOf("http") !== 0) href = UP4_BASE + (href.charAt(0) === "/" ? "" : "/") + href;
+    if (seen.has(href)) continue;
+    const title = htmlDecodeCard((tm[2] || "").replace(/<[^>]+>/g, ""));
+    if (!title) continue;
+    seen.add(href);
+    const im = b.match(/<img[^>]*\b(?:data-src|data-original|data-image|src)=["']([^"']+)["']/i);
+    const ty = b.match(/anime-card-type[^>]*>\s*<a[^>]*>([\s\S]*?)<\/a>/i);
+    out.push({ title, href, image: im ? upgradeCardImg(im[1]) : null, type: ty ? htmlDecodeCard(ty[1].replace(/<[^>]+>/g, "")) : null });
+  }
+  return out;
+}
+
+// The anime4up current-season catalogue, scraped directly. The site's main menu
+// links the live season page (e.g. "ربيع 2026" → /anime-season/<slug>/), and the
+// site's notion of "current" tracks the airing calendar, so read the link off
+// the home page rather than constructing the slug.
+export async function fetchAnime4upSeasonListing(): Promise<
+  { title: string; href: string; image: string | null; type: string | null }[] | null
+> {
+  const home = await window.pantoufa.fetchHtml?.(UP4_BASE + "/", UP4_BASE + "/");
+  if (!home) return null;
+  const m = home.match(/href=["'](https?:\/\/[^"']*\/anime-season\/[^"']+)["']/i);
+  if (!m) return null;
+  const html = await window.pantoufa.fetchHtml?.(m[1], UP4_BASE + "/");
+  if (!html) return null;
+  const cards = parseAnime4upCards(html);
+  return cards.length ? cards : null;
+}
+
+/* ── witanime: direct static-HTML HOME ──
+ *
+ * The home page is the SAME static-HTML shape as the listing pages — featured
+ * slider, anime cards, and recent-episode cards all ship in the initial
+ * response (a residential IP passes Cloudflare). Rendering it in a headless
+ * window pays the ~10-15s cold-start + CF-clear tax on every launch (the single
+ * slowest screen). A plain GET + regex parse reads the whole page in well under
+ * a second, so this is the fast path; the headless scrape stays as the fallback.
+ * Ported from the mobile app (lib/scraper/direct.ts). */
+
+type HomeFeatured = { title: string; href: string; image: string | null; description: string | null; genres: string[] };
+type HomeAnime = { title: string; href: string; image: string | null; type: string | null; status: string | null; description: string | null; isNew: boolean; rating: string | null };
+type HomeEpisode = { title: string; href: string; image: string | null; animeTitle: string; animeHref: string; isNew: boolean };
+export type WitHomeDirect = { featured: HomeFeatured[]; animes: HomeAnime[]; episodes: HomeEpisode[] };
+
+function parseWitFeatured(html: string): HomeFeatured[] {
+  const out: HomeFeatured[] = [];
+  const seen = new Set<string>();
+  const re = /<a\b([^>]*\bclass=["'][^"']*lucodeia-slider-slide-item[^"']*["'][^>]*)>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    const tag = m[1] || "";
+    const hrefM = tag.match(/\bhref=["']([^"']+)["']/i);
+    const href = hrefM ? hrefM[1].trim() : "";
+    if (!href || seen.has(href)) continue;
+    seen.add(href);
+    const titleM = tag.match(/\btitle=["']([^"']*)["']/i);
+    const bgM = tag.match(/url\(\s*['"]?([^'")]+)['"]?\s*\)/i);
+    out.push({
+      title: titleM ? htmlDecodeCard(titleM[1]) : "",
+      href,
+      image: bgM ? upgradeCardImg(bgM[1].trim()) : null,
+      description: null,
+      genres: [],
+    });
+  }
+  return out.slice(0, 5);
+}
+
+function parseWitHomeAnimes(html: string): HomeAnime[] {
+  return parseWitCards(html).map((c) => ({
+    title: c.title, href: c.href, image: c.image, type: c.type, status: c.status,
+    description: null,
+    isNew: (c.status || "").indexOf("مستمر") >= 0,
+    rating: null,
+  }));
+}
+
+function parseWitHomeEpisodes(html: string): HomeEpisode[] {
+  const out: HomeEpisode[] = [];
+  const seen = new Set<string>();
+  const blocks = html.split("episodes-card-container");
+  for (let i = 1; i < blocks.length; i++) {
+    const b = blocks[i];
+    const epM = b.match(/episodes-card-title[^>]*>\s*<h3[^>]*>\s*<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
+    if (!epM) continue;
+    const href = (epM[1] || "").trim();
+    if (!href || seen.has(href)) continue;
+    seen.add(href);
+    const title = htmlDecodeCard((epM[2] || "").replace(/<[^>]+>/g, ""));
+    const imM = b.match(/<img[^>]*\b(?:data-src|data-original|data-image|src)=["']([^"']+)["']/i);
+    const anM = b.match(/ep-card-anime-title[^>]*>\s*<h3[^>]*>\s*<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
+    out.push({
+      title, href,
+      image: imM ? upgradeCardImg(imM[1]) : null,
+      animeTitle: anM ? htmlDecodeCard((anM[2] || "").replace(/<[^>]+>/g, "")) : "",
+      animeHref: anM ? (anM[1] || "").trim() : "",
+      isNew: true,
+    });
+  }
+  return out;
+}
+
+// Fetch + parse the witanime home page directly (no headless window). Returns
+// null on a fetch failure OR when the page yielded no cards (CF challenge / cold
+// body), so the caller falls back to the headless home scrape.
+export async function fetchWitHomeDirect(): Promise<WitHomeDirect | null> {
+  const html = await window.pantoufa.fetchHtml?.(WIT_BASE + "/", WIT_BASE + "/");
+  if (!html) return null;
+  const animes = parseWitHomeAnimes(html);
+  const episodes = parseWitHomeEpisodes(html);
+  if (animes.length === 0 && episodes.length === 0) return null;
+  return { featured: parseWitFeatured(html), animes, episodes };
+}
+
+// Search anime4up via a direct GET and return the FULL card list (not just the
+// best match). Used as the fast path by the search screen.
+export async function searchAnime4upDirectList(query: string): Promise<WitCard[] | null> {
+  if (!query) return null;
+  const url = `${UP4_BASE}/?search_param=animes&s=${encodeURIComponent(query)}`;
+  const html = await window.pantoufa.fetchHtml?.(url, UP4_BASE + "/");
+  if (!html) return null;
+  const cards = parseAnime4upCards(html);
+  return cards.map((c) => ({ ...c, status: null, synopsis: null }));
+}

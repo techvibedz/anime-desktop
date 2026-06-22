@@ -6,6 +6,7 @@
 import { app, BrowserWindow, ipcMain, net, protocol, session, shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
 
 // Disable QUIC so Chromium falls back to TCP/HTTP2. Restrictive ISPs
 // often block or mangle QUIC (UDP/443), causing ERR_QUIC_PROTOCOL_ERROR
@@ -43,6 +44,20 @@ const DEV_URL = "http://localhost:5173";
 let activeIframeUrl: string | null = null;
 const PROTOCOL = "pantoufa";
 const VIDEO_PROTOCOL = "pantoufa-video";
+// Offline-downloads scheme + on-disk directory (resolved lazily — app.getPath
+// is unavailable before ready).
+const FILE_PROTOCOL = "pantoufa-file";
+function downloadsDir(): string {
+  const dir = path.join(app.getPath("userData"), "downloads");
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  return dir;
+}
+function downloadPathFor(id: string): string {
+  // Sanitize the id to a safe filename segment (the renderer derives it from a
+  // URL hash, but never trust it for a filesystem path).
+  const safe = (id || "").replace(/[^a-z0-9_-]/gi, "").slice(0, 64) || "dl";
+  return path.join(downloadsDir(), `${safe}.mp4`);
+}
 // Mobile UA for video CDNs — matches what the mobile app uses and what
 // most providers expect from real users. mp4upload + streamwish refuse
 // some desktop UAs.
@@ -56,6 +71,8 @@ const PLAYBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
 
 let mainWindow: BrowserWindow | null = null;
 let pendingAuthCallback: string | null = null;
+// In-flight offline downloads, keyed by item id, so a delete can abort one.
+const activeDownloads = new Map<string, AbortController>();
 let updateCheckInterval: ReturnType<typeof setInterval> | null = null;
 
 // File-backed logger for electron-updater. Writes to <userData>/updater.log so
@@ -133,6 +150,13 @@ protocol.registerSchemesAsPrivileged([
       // CORS headers we set manually on the response. Leaving it off and
       // adding ACAO:* ourselves is more reliable across providers.
     },
+  },
+  {
+    // Offline downloads playback. Streams a saved .mp4 from <userData>/downloads
+    // so a completed download plays in the custom <video> player (with seeking)
+    // in both dev (http://localhost) and packaged (file://) builds.
+    scheme: FILE_PROTOCOL,
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, bypassCSP: true },
   },
 ]);
 
@@ -1882,6 +1906,23 @@ app.whenReady().then(() => {
     console.warn("configureHostResolver failed:", e);
   }
 
+  // Offline-download playback: stream a saved .mp4 from <userData>/downloads.
+  // URL shape: pantoufa-file://x/<id>. net.fetch on the file: URL streams the
+  // bytes with Range support so the <video> element can seek.
+  protocol.handle(FILE_PROTOCOL, async (request) => {
+    try {
+      const id = new URL(request.url).pathname.split("/").filter(Boolean).pop() || "";
+      const p = downloadPathFor(decodeURIComponent(id));
+      if (!fs.existsSync(p)) return new Response("not found", { status: 404 });
+      return net.fetch(pathToFileURL(p).href, {
+        headers: request.headers, // forward Range so seeking works
+      });
+    } catch (e) {
+      console.warn("[pantoufa-file] failed:", e);
+      return new Response("error", { status: 500 });
+    }
+  });
+
   const coldStartUrl = process.argv.find((a) => a.startsWith(`${PROTOCOL}://`));
   if (coldStartUrl) handleAuthCallbackUrl(coldStartUrl);
 
@@ -2208,6 +2249,34 @@ app.whenReady().then(() => {
     return true;
   });
 
+  // Privileged JSON/text fetch from the main process. Used for AniList (schedule,
+  // seasons, upcoming, title detail) and the translate endpoint: net.fetch rides
+  // the DoH resolver and has NO CORS, so it works where the renderer's
+  // cross-origin fetch (from a file:// / localhost origin, or on a network that
+  // DNS-blocks these hosts) silently fails. Returns the body text, or null.
+  ipcMain.handle("pantoufa:fetch-json", async (
+    _evt,
+    opts: { url: string; method?: string; body?: string; headers?: Record<string, string> },
+  ): Promise<string | null> => {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 15000);
+    try {
+      const res = await net.fetch(opts.url, {
+        method: opts.method || "GET",
+        headers: opts.headers || {},
+        body: opts.body,
+        signal: controller.signal,
+        redirect: "follow",
+      });
+      clearTimeout(t);
+      if (!res.ok) return null;
+      return await res.text();
+    } catch {
+      clearTimeout(t);
+      return null;
+    }
+  });
+
   // Privileged HTML fetch from the main process (no CORS, any port). Used to
   // read anime4up episode pages directly: their server list lives in the
   // static HTML (<li data-watch>), so a plain GET is far faster and more
@@ -2267,6 +2336,72 @@ app.whenReady().then(() => {
       await new Promise((r) => setTimeout(r, 600 * attempt));
     }
     return null;
+  });
+
+  // ── Offline downloads ──
+  // Stream a resolved progressive .mp4 to <userData>/downloads/<id>.mp4 with the
+  // per-provider Referer the signed URL needs, emitting throttled progress to
+  // the renderer. The renderer resolves the URL (lib/api resolveDownloadUrl) and
+  // owns the metadata index (lib/downloads) — this handler only moves bytes.
+  ipcMain.handle("pantoufa:download-start", async (
+    _evt,
+    opts: { id: string; url: string; provider: string },
+  ): Promise<{ ok: boolean; total?: number }> => {
+    const { id, url, provider } = opts;
+    if (!id || !url) return { ok: false };
+    if (activeDownloads.has(id)) return { ok: false };
+    const dest = downloadPathFor(id);
+    const controller = new AbortController();
+    activeDownloads.set(id, controller);
+    const headers: Record<string, string> = { "User-Agent": VIDEO_UA };
+    if (provider === "mp4upload") headers.Referer = "https://www.mp4upload.com/";
+    else if (provider === "vid3rb") headers.Referer = "https://anime3rb.com/";
+    let ws: fs.WriteStream | null = null;
+    try {
+      try { fs.unlinkSync(dest); } catch {}
+      const resp = await session.defaultSession.fetch(url, {
+        method: "GET",
+        headers,
+        redirect: "follow",
+        signal: controller.signal,
+        cache: "no-store",
+      });
+      if (!resp.ok || !resp.body) { activeDownloads.delete(id); return { ok: false }; }
+      const total = parseInt(resp.headers.get("content-length") || "0", 10) || 0;
+      ws = fs.createWriteStream(dest);
+      const reader = (resp.body as ReadableStream<Uint8Array>).getReader();
+      let bytes = 0;
+      let lastEmit = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          bytes += value.byteLength;
+          await new Promise<void>((res, rej) => ws!.write(Buffer.from(value), (e) => (e ? rej(e) : res())));
+          const now = Date.now();
+          if (now - lastEmit > 400) {
+            lastEmit = now;
+            mainWindow?.webContents.send("pantoufa:download-progress", { id, bytes, total });
+          }
+        }
+      }
+      await new Promise<void>((res) => ws!.end(res));
+      activeDownloads.delete(id);
+      mainWindow?.webContents.send("pantoufa:download-progress", { id, bytes, total: total || bytes });
+      return { ok: true, total: total || bytes };
+    } catch (e) {
+      activeDownloads.delete(id);
+      try { ws?.end(); } catch {}
+      try { fs.unlinkSync(dest); } catch {}
+      return { ok: false };
+    }
+  });
+
+  ipcMain.handle("pantoufa:download-delete", async (_evt, id: string): Promise<boolean> => {
+    const ctrl = activeDownloads.get(id);
+    if (ctrl) { try { ctrl.abort(); } catch {} activeDownloads.delete(id); }
+    try { fs.unlinkSync(downloadPathFor(id)); } catch {}
+    return true;
   });
 
   // Kept for backwards compatibility; no-op now that we proxy.

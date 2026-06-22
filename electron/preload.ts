@@ -69,4 +69,20 @@ contextBridge.exposeInMainWorld("pantoufa", {
   // anime4up episode pages directly instead of rendering them headless.
   fetchHtml: (url: string, referer?: string, opts?: { attempts?: number; timeoutMs?: number }) =>
     ipcRenderer.invoke("pantoufa:fetch-html", { url, referer, ...opts }) as Promise<string | null>,
+  // Privileged JSON/text fetch (AniList, translate) from the main process.
+  fetchJson: (opts: { url: string; method?: string; body?: string; headers?: Record<string, string> }) =>
+    ipcRenderer.invoke("pantoufa:fetch-json", opts) as Promise<string | null>,
+
+  // ── Offline downloads ──
+  downloadStart: (opts: { id: string; url: string; provider: string }) =>
+    ipcRenderer.invoke("pantoufa:download-start", opts) as Promise<{ ok: boolean; total?: number }>,
+  downloadDelete: (id: string) =>
+    ipcRenderer.invoke("pantoufa:download-delete", id) as Promise<boolean>,
+  onDownloadProgress: (handler: (info: { id: string; bytes: number; total: number }) => void) => {
+    const listener = (_evt: unknown, info: { id: string; bytes: number; total: number }) => handler(info);
+    ipcRenderer.on("pantoufa:download-progress", listener);
+    return () => ipcRenderer.removeListener("pantoufa:download-progress", listener);
+  },
+  // Playback URL for a completed download (served by the pantoufa-file scheme).
+  downloadFileUrl: (id: string) => `pantoufa-file://x/${encodeURIComponent(id)}`,
 });

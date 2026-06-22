@@ -9,6 +9,10 @@ import {
 } from "../lib/api";
 import { saveProgress, getProgress } from "../lib/history";
 import { toAnimeUrl } from "../lib/favorites";
+import {
+  startDownload, subscribeDownloads, getDownloadByEpisode,
+  type DownloadStatus,
+} from "../lib/downloads";
 import { t } from "../lib/i18n";
 
 type ServerWithSource = VideoServer & { source?: string };
@@ -1322,6 +1326,37 @@ export function WatchPage() {
     navigate(`/watch/${encodeURIComponent(ep.href)}${qs ? `?${qs}` : ""}`);
   }, [up4Siblings, animeParam, navigate]);
 
+  // ── Offline download of the current episode ──
+  const [dlStatus, setDlStatus] = useState<DownloadStatus | null>(null);
+  const [dlProgress, setDlProgress] = useState(0);
+  useEffect(() => {
+    if (!episodeUrl) { setDlStatus(null); setDlProgress(0); return; }
+    let cancelled = false;
+    const sync = () => {
+      getDownloadByEpisode(episodeUrl).then((d) => {
+        if (cancelled) return;
+        setDlStatus(d?.status ?? null);
+        setDlProgress(d?.progress ?? 0);
+      });
+    };
+    sync();
+    const unsub = subscribeDownloads(sync);
+    return () => { cancelled = true; unsub(); };
+  }, [episodeUrl]);
+
+  const startEpisodeDownload = useCallback(() => {
+    if (!episodeUrl) return;
+    startDownload({
+      animeTitle: meta.animeTitle || animeTitleFromDetail || "",
+      episodeTitle: meta.episodeTitle || (currentEpNumber != null ? `${t.episode} ${currentEpNumber}` : ""),
+      epNum: currentEpNumber,
+      image: imgParam || posterFromDetail || "",
+      animeHref: resolvedAnimeHref || "",
+      episodeHref: episodeUrl,
+      url4up: effectiveUp4 || undefined,
+    });
+  }, [episodeUrl, meta, animeTitleFromDetail, currentEpNumber, imgParam, posterFromDetail, resolvedAnimeHref, effectiveUp4]);
+
   const togglePlay = useCallback(() => {
     const v = videoRef.current; if (!v) return;
     if (v.paused) v.play().catch(() => {}); else v.pause();
@@ -1414,7 +1449,8 @@ export function WatchPage() {
   }, [showSkipIntroEligible, bumpSkipIntro]);
 
   return (
-    <div className="mx-auto max-w-4xl space-y-4">
+    <div className="mx-auto flex max-w-6xl flex-col gap-5 lg:flex-row lg:items-start">
+      <div className="min-w-0 flex-1 space-y-4">
       {/* Top breadcrumb */}
       <div className="flex items-center gap-3">
         <Link to="/" className="text-text-muted hover:text-white">→ {t.home}</Link>
@@ -1777,14 +1813,30 @@ export function WatchPage() {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z" /></svg>
           </button>
         </div>
-        {resolvedAnimeHref && (
-          <Link
-            to={`/anime/${encodeURIComponent(resolvedAnimeHref)}`}
-            className="flex items-center gap-1.5 rounded-full border border-accent/30 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent hover:bg-accent/20"
+        <div className="flex items-center gap-2">
+          {/* Offline download */}
+          <button
+            onClick={startEpisodeDownload}
+            disabled={dlStatus === "downloading" || dlStatus === "resolving" || dlStatus === "completed"}
+            title={t.downloadEpisode}
+            className="flex items-center gap-1.5 rounded-full border border-white/10 bg-surface px-3 py-1.5 text-xs font-semibold text-white transition hover:border-white/30 disabled:opacity-60"
           >
-            {t.openAnimePage}
-          </Link>
-        )}
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3v10.55l3.3-3.3 1.4 1.4L12 17.4l-4.7-4.75 1.4-1.4 3.3 3.3V3h2zM5 19h14v2H5z" /></svg>
+            {dlStatus === "completed" ? t.downloaded
+              : dlStatus === "downloading" ? `${t.downloading} ${Math.round(dlProgress * 100)}%`
+              : dlStatus === "resolving" ? t.downloadResolving
+              : dlStatus === "failed" ? t.downloadRetry
+              : t.download}
+          </button>
+          {resolvedAnimeHref && (
+            <Link
+              to={`/anime/${encodeURIComponent(resolvedAnimeHref)}`}
+              className="flex items-center gap-1.5 rounded-full border border-accent/30 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent hover:bg-accent/20"
+            >
+              {t.openAnimePage}
+            </Link>
+          )}
+        </div>
       </div>
 
       {/* Server picker */}
@@ -1846,6 +1898,38 @@ export function WatchPage() {
           </div>
         )}
       </section>
+      </div>
+
+      {/* Episode list sidebar — all episodes, selectable. Highlights the one
+          currently playing and scrolls/jumps the player on click. */}
+      {siblings.length > 0 && (
+        <aside className="w-full shrink-0 lg:sticky lg:top-20 lg:max-h-[calc(100vh-6rem)] lg:w-72">
+          <h2 className="mb-2 font-display text-sm font-bold uppercase tracking-wider text-text-secondary">
+            {t.allEpisodes} ({siblings.length})
+          </h2>
+          <div className="grid grid-cols-5 gap-1.5 overflow-y-auto pe-1 lg:grid-cols-4 lg:max-h-[calc(100vh-9rem)]">
+            {[...siblings]
+              .sort((a, b) => (a.number ?? 0) - (b.number ?? 0))
+              .map((ep) => {
+                const isCurrent = currentEpNumber != null && ep.number === currentEpNumber;
+                return (
+                  <button
+                    key={ep.href || ep.number}
+                    onClick={() => !isCurrent && navTo(ep)}
+                    title={ep.title}
+                    className={`rounded-md border px-2 py-2 text-center text-xs font-semibold tabular-nums transition ${
+                      isCurrent
+                        ? "border-accent bg-accent text-white shadow-glow"
+                        : "border-white/10 bg-surface text-text-secondary hover:border-white/30 hover:text-white"
+                    }`}
+                  >
+                    {ep.number ?? "•"}
+                  </button>
+                );
+              })}
+          </div>
+        </aside>
+      )}
     </div>
   );
 }

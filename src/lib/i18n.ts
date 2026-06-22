@@ -91,6 +91,76 @@ export const ar = {
 
   // Refresh
   refresh: "تحديث الصفحة",
+
+  // Source-direct home rails
+  railThisSeason: "أنمي هذا الموسم",
+  railMovies: "أفلام الأنمي",
+
+  // Downloads
+  downloadsTitle: "التنزيلات",
+  download: "تنزيل",
+  downloadEpisode: "تنزيل الحلقة",
+  downloadStarted: "بدأ التنزيل",
+  downloading: "جارٍ التنزيل…",
+  downloaded: "تم التنزيل",
+  downloadQueued: "في قائمة الانتظار",
+  downloadFailed: "فشل التنزيل",
+  downloadRetry: "إعادة التنزيل",
+  watchOffline: "مشاهدة بدون إنترنت",
+  playDownload: "تشغيل",
+  removeDownload: "حذف التنزيل",
+  confirmRemoveDownload: "هل تريد حذف هذه الحلقة المُنزَّلة؟",
+  downloadsEmpty: "لا توجد تنزيلات",
+  downloadsEmptySub: "نزّل الحلقات لمشاهدتها لاحقًا بدون إنترنت.",
+  downloadNoServer: "تعذّر العثور على مصدر قابل للتنزيل لهذه الحلقة.",
+  downloadResolving: "جارٍ تحضير التنزيل…",
+  downloadOffline: "حلقة مُنزَّلة — تُشغَّل بدون إنترنت",
+  storageUsed: (s: string) => `المساحة المستخدمة: ${s}`,
+
+  // Upcoming anime
+  upcomingTitle: "أنميات قادمة",
+  upcomingSub: "أبرز الأنميات المنتظرة التي ستتوفّر في مصادرنا فور صدورها.",
+  upcomingSoon: "قريبًا",
+  upcomingFilterPopular: "الأكثر شعبية",
+  upcomingFilterSoon: "الأقرب صدورًا",
+  upcomingInDays: (n: number) => (n === 1 ? "بعد يوم" : n === 2 ? "بعد يومين" : n <= 10 ? `بعد ${n} أيام` : `بعد ${n} يومًا`),
+
+  // Seasons browser
+  seasonsTitle: "المواسم",
+  seasonsEmpty: "لا أنميات متوفّرة",
+  seasonsEmptySub: "لم نعثر على أنميات من هذا الموسم في مصادرنا. جرّب موسمًا آخر.",
+
+  // Schedule
+  scheduleTitle: "جدول الحلقات",
+  scheduleEmpty: "لا حلقات مجدولة لهذا اليوم.",
+  scheduleToday: "اليوم",
+  scheduleAt: (s: string) => `الساعة ${s}`,
+  scheduleEp: (n: number) => `الحلقة ${n}`,
+
+  // AniList title detail (Upcoming detail page)
+  titleStory: "القصة",
+  titleDetails: "تفاصيل",
+  titleLinks: "روابط وأخبار",
+  titleRelated: "أعمال ذات صلة",
+  watchTrailer: "مشاهدة الإعلان",
+  searchOnSources: "ابحث في مصادرنا",
+  translating: "جارٍ ترجمة القصة…",
+  titleNotReleased: "لم يصدر بعد",
+  titleAirsOn: (d: string) => `يبدأ العرض: ${d}`,
+  titleEpisodes: (n: number) => `${n} حلقة`,
+  titleStudio: "الاستوديو",
+  titleStatus: "الحالة",
+  titleFormat: "النوع",
+  titleAirDate: "موعد العرض",
+  titleDuration: (n: number) => `${n} دقيقة`,
+  statusReleasing: "يُعرض حالياً",
+  statusFinished: "مكتمل",
+  statusNotYet: "لم يُعرض بعد",
+  statusCancelled: "أُلغي",
+  statusHiatus: "متوقّف مؤقتاً",
+
+  // Watch — episode list sidebar
+  allEpisodes: "كل الحلقات",
 };
 
 export const t = ar;

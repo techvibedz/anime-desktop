@@ -4,6 +4,7 @@ import { fetchHome, type HomeSection, type FeaturedItem, type AnimeItem, type Ep
 import { AnimeCard, EpisodeCard } from "../components/AnimeCard";
 import { EpisodeActionModal } from "../components/EpisodeActionModal";
 import { Shimmer } from "../components/Shimmer";
+import { SourceRail } from "../components/SourceRail";
 import { getContinueWatching, pullHistoryFromCloud, removeFromHistory, type WatchEntry } from "../lib/history";
 import { extractEpisodeNumber } from "../lib/episode-utils";
 import { t } from "../lib/i18n";
@@ -188,6 +189,10 @@ export function HomePage() {
       {sections.map((s) => (
         <Section key={s.id} section={s} onOpenEpisode={setEpisodePopup} />
       ))}
+
+      {/* Source-direct rails (scraped from our own sources, no AniList) */}
+      <SourceRail kind="season" title={t.railThisSeason} />
+      <SourceRail kind="movies" title={t.railMovies} />
 
       <EpisodeActionModal episode={episodePopup} onClose={() => setEpisodePopup(null)} />
     </div>

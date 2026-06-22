@@ -7,6 +7,10 @@ import { t } from "../lib/i18n";
 const tabs = [
   { to: "/", label: t.home, end: true },
   { to: "/search", label: t.search },
+  { to: "/schedule", label: t.scheduleTitle },
+  { to: "/seasons", label: t.seasonsTitle },
+  { to: "/upcoming", label: t.upcomingTitle },
+  { to: "/downloads", label: t.downloadsTitle },
   { to: "/mylist", label: t.myList },
 ];
 
@@ -51,7 +55,8 @@ export function Layout() {
       <header className="sticky top-0 z-50 border-b border-white/5 bg-bg/85 backdrop-blur-xl">
         <div className="mx-auto flex max-w-[1600px] items-center gap-6 px-6 py-3">
           <Link to="/" className="flex items-center gap-2 font-display text-xl font-extrabold tracking-tight text-white">
-            <span className="text-accent">●</span> {t.appName}
+            <img src="/logo.png" alt="" className="h-8 w-8 rounded-lg" />
+            {t.appName}
           </Link>
           <nav className="flex items-center gap-1">
             {tabs.map((tab) => (
