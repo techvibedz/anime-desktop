@@ -609,6 +609,10 @@ function a3rbSlugVariants(title: string): string[] {
     // Laravel's Str::slug DROPS a colon that touches both words instead of
     // dashing it: "Re:Zero kara…" lives at rezero-kara-…, not re-zero-kara-….
     add(cleaned.replace(/(\S)[:：](\S)/g, "$1$2"));
+    // Dotted acronyms slugify letter-by-letter ("A.I.C.O." → a-i-c-o) but
+    // anime3rb collapses them ("aico-incarnation"). Strip the dots inside any
+    // run of single letters so the collapsed slug ("aico") is also probed.
+    add(cleaned.replace(/\b[a-z](?:\.[a-z]){1,}\.?/gi, (m) => m.replace(/\./g, "")));
     add(cleaned.split(/\s*[:：]\s*/)[0]);
     const seasonM =
       cleaned.match(/\b(\d+)(?:st|nd|rd|th)\s+season\b/i) ||
