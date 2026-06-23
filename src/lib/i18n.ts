@@ -55,6 +55,8 @@ export const ar = {
   failedToLoad: "تعذّر التحميل",
   notFound: "غير موجود",
   watchedBadge: "مُشاهَدة",
+  completedBadge: "مكتمل",
+  caughtUpBadge: "آخر حلقة",
   addToList: "أضف إلى قائمتي",
   saved: "محفوظ",
   bothSources: "المصدران",

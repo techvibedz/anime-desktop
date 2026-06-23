@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { getFavorites, removeFavorite, type FavoriteAnime, type FavoriteList } from "../lib/favorites";
 import { getHistory, type WatchEntry, isCompleted, progressPercent } from "../lib/history";
 import { extractEpisodeNumber } from "../lib/episode-utils";
+import { CompletionBadge } from "../components/CompletionBadge";
 import { t } from "../lib/i18n";
 
 const TABS: { id: FavoriteList | "history"; label: string }[] = [
@@ -70,6 +71,7 @@ function FavRow({ fav, onRemove }: { fav: FavoriteAnime; onRemove: () => void })
         <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface">
           {fav.image && <img src={fav.image} alt={fav.title} className="h-full w-full object-cover" />}
           <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/90 to-transparent" />
+          <CompletionBadge hrefs={[fav.href]} titles={[fav.title]} className="absolute bottom-9 end-2" />
           <div className="absolute inset-x-0 bottom-0 p-2.5">
             <h3 className="line-clamp-2 text-[13px] font-semibold leading-tight text-white">{fav.title}</h3>
           </div>

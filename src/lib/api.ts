@@ -74,6 +74,22 @@ function cleanSynopsis(raw: string | null | undefined): string {
   return s.length < 25 ? "" : s;
 }
 
+// Strip the SEO/source decoration the sites bake into an anime's TITLE — a
+// leading "أنمي" word, a trailing "مترجم"/"مدبلج", a site-name suffix — so the
+// detail page shows just the anime's name (and the downstream Jikan/AniList
+// lookups resolve to the right entry). Clean titles pass through unchanged.
+function cleanAnimeTitle(raw: string | null | undefined): string {
+  let s = (raw || "").replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  s = s.replace(/\s*[|–—\-]\s*(?:anime3rb|anime4up|witanime)\b.*$/i, "").trim();
+  s = s.replace(/^(?:مشاهدة|تحميل|جميع\s*(?:حلقات|الحلقات)|أنمي|انمي|انيمي)\s+/g, "").trim();
+  s = s.replace(/^(?:أنمي|انمي|انيمي)\s+/g, "").trim();
+  for (let i = 0; i < 3; i++) {
+    s = s.replace(/\s*(?:مترجمة?|مدبلجة?|اون\s*لاين|أون\s*لاين|أونلاين|بجودة\s*عالية|كامل[ةه]?)\s*$/g, "").trim();
+  }
+  return s.replace(/\s+/g, " ").trim();
+}
+
 type HomePayload = { success: boolean; data: { featured: FeaturedItem[]; sections: HomeSection[] } };
 let bgRefreshInFlight = false;
 
@@ -229,16 +245,22 @@ async function fetchEpisodesFresh(animeUrl: string): Promise<EpisodesPayload> {
   const d = await scrapeEpisodesPage(animeUrl);
   const payload: EpisodesPayload = {
     success: true,
-    data: { title: d.title, poster: d.poster, banner: d.poster, synopsis: cleanSynopsis(d.synopsis), genres: d.genres, rating: null, metadata: {}, externalLinks: [], totalEpisodes: d.episodes.length, episodes: d.episodes, episodes4up: [], merged: null, up4Hint: d.up4Url ?? null },
+    data: { title: cleanAnimeTitle(d.title), poster: d.poster, banner: d.poster, synopsis: cleanSynopsis(d.synopsis), genres: d.genres, rating: null, metadata: {}, externalLinks: [], totalEpisodes: d.episodes.length, episodes: d.episodes, episodes4up: [], merged: null, up4Hint: d.up4Url ?? null },
   };
   void writeCache(DETAIL_CACHE_PREFIX + animeUrl, payload);
   return payload;
 }
 
 export async function fetchEpisodes(animeUrl: string): Promise<EpisodesPayload> {
+  // Re-clean the title on every return so entries cached by an older build (with
+  // the "أنمي … مترجم" decoration) display cleanly too.
+  const clean = (p: EpisodesPayload): EpisodesPayload => {
+    if (p?.data) p.data.title = cleanAnimeTitle(p.data.title);
+    return p;
+  };
   const cached = await readCache<EpisodesPayload>(DETAIL_CACHE_PREFIX + animeUrl, DETAIL_CACHE_TTL);
-  if (cached) { void fetchEpisodesFresh(animeUrl).catch(() => {}); return cached; }
-  return fetchEpisodesFresh(animeUrl);
+  if (cached) { void fetchEpisodesFresh(animeUrl).catch(() => {}); return clean(cached); }
+  return clean(await fetchEpisodesFresh(animeUrl));
 }
 
 export async function fetchEpisodesUp4(animeUrl: string, title: string | null, up4Hint?: string | null): Promise<{ merged: { anime4up: string } | null; episodes4up: Episode[] }> {

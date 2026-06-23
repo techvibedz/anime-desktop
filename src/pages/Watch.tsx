@@ -1245,6 +1245,7 @@ export function WatchPage() {
         positionMs: Math.floor(v.currentTime * 1000),
         durationMs: Math.floor(v.duration * 1000),
         url4up: up4Param || undefined,
+        epNum: currentEpNumber ?? undefined,
       }).catch(() => {});
     };
     v.addEventListener("timeupdate", onTime);

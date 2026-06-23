@@ -2,6 +2,7 @@
 // the home SourceRail. Matches AnimeCard's visual language (2:3 poster, gradient
 // scrim, accent badges). Ported from the mobile app (components/CatalogCard.tsx).
 
+import { CompletionBadge } from "./CompletionBadge";
 import { t } from "../lib/i18n";
 
 export interface CatalogCardData {
@@ -56,6 +57,7 @@ export function CatalogCard({
             <div className="h-7 w-7 animate-spin rounded-full border-2 border-accent border-t-transparent" />
           </div>
         )}
+        <CompletionBadge hrefs={[item.href]} titles={[item.title]} className="absolute bottom-9 end-2" />
         <div className="absolute inset-x-0 bottom-0 p-2.5">
           <h3 className="line-clamp-2 text-[13px] font-semibold leading-tight text-white">{item.title}</h3>
         </div>

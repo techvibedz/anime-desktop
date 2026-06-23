@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { useAuth } from "./lib/auth";
 import { pullFavoritesFromCloud } from "./lib/favorites";
 import { pullHistoryFromCloud } from "./lib/history";
+import { pullCompletionFromCloud, CompletionProvider } from "./lib/completion";
 import { Layout } from "./components/Layout";
 import { HomePage } from "./pages/Home";
 import { SearchPage } from "./pages/Search";
@@ -38,6 +39,7 @@ export default function App() {
     if (user) {
       pullFavoritesFromCloud().catch(() => {});
       pullHistoryFromCloud().catch(() => {});
+      pullCompletionFromCloud().catch(() => {});
     }
   }, [user?.id]);
 
@@ -50,7 +52,7 @@ export default function App() {
   }
 
   return (
-    <>
+    <CompletionProvider>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
@@ -71,6 +73,6 @@ export default function App() {
         </Route>
       </Routes>
       <UpdateBanner />
-    </>
+    </CompletionProvider>
   );
 }

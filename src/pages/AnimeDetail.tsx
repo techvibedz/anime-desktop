@@ -5,7 +5,9 @@ import {
   type AnimeDetail, type Episode,
 } from "../lib/api";
 import { addFavorite, removeFavorite, favoriteListOf, type FavoriteList } from "../lib/favorites";
-import { getWatchedHrefsForAnime, toggleWatched } from "../lib/history";
+import { getCompletedSets, isEpisodeWatched, toggleWatched, type CompletedSets } from "../lib/history";
+import { recordAnimeCompletion } from "../lib/completion";
+import { fetchNextAiring } from "../lib/airing";
 import { Shimmer } from "../components/Shimmer";
 import { t } from "../lib/i18n";
 
@@ -19,7 +21,7 @@ export function AnimeDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [bookmarkList, setBookmarkList] = useState<FavoriteList | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [watched, setWatched] = useState<Set<string>>(new Set());
+  const [completed, setCompleted] = useState<CompletedSets>({ hrefs: new Set(), numbersByTitle: new Map() });
 
   useEffect(() => {
     if (!id) return;
@@ -27,7 +29,7 @@ export function AnimeDetailPage() {
     setData(null); setLoading(true); setError(null);
     setEpisodes4up([]); setMerged(null);
     favoriteListOf(animeHref).then(setBookmarkList);
-    getWatchedHrefsForAnime(animeHref).then(setWatched);
+    getCompletedSets().then(setCompleted);
 
     // Kick off the primary scrape. As soon as it returns the up4Hint
     // (from a direct link on the wit page) we start the up4 scrape with
@@ -71,19 +73,50 @@ export function AnimeDetailPage() {
 
   const onToggleWatched = useCallback(async (ep: Episode) => {
     if (!data || !ep.href) return;
-    const next = await toggleWatched(ep.href, {
+    await toggleWatched(ep.href, {
       episodeTitle: ep.title || `${t.episode} ${ep.number}`,
       animeTitle: data.title,
       animeHref,
       image: data.poster,
       url4up: pickUp4ForEpisode(ep, episodes4up) ?? undefined,
+      epNum: ep.number ?? undefined,
     });
-    setWatched((prev) => {
-      const c = new Set(prev);
-      if (next) c.add(ep.href!); else c.delete(ep.href!);
-      return c;
-    });
+    // Re-read the index so both the href and per-title number sets reflect the toggle.
+    getCompletedSets().then(setCompleted);
   }, [data, animeHref, episodes4up]);
+
+  // Record this anime's completion state (caught-up / finished) for the
+  // poster-card badges — synced to the cloud so the mobile app sees it too.
+  // Recomputed whenever the episode lists or the watched-set change; "finished"
+  // is gated on the series no longer airing (so a still-running show's latest
+  // episode reads as "caught up", not "completed").
+  useEffect(() => {
+    if (!data || !animeHref) return;
+    const all = [...data.episodes, ...episodes4up];
+    if (all.length === 0) return;
+    let maxNum = 0;
+    let hasNum = false;
+    for (const e of all) {
+      if (e.number != null && e.number > maxNum) { maxNum = e.number; hasNum = true; }
+    }
+    if (!hasNum) return;
+    const lastHrefs = all.filter((e) => e.number === maxNum).map((e) => e.href).filter(Boolean) as string[];
+    const caughtUp = isEpisodeWatched(completed, { hrefs: lastHrefs, epNum: maxNum, animeTitle: data.title });
+    let cancelled = false;
+    (async () => {
+      let airing = false;
+      try { airing = !!(await fetchNextAiring(data.title)); } catch {}
+      if (cancelled) return;
+      await recordAnimeCompletion({
+        hrefs: [animeHref, merged?.anime4up],
+        titles: [data.title],
+        lastEpNum: maxNum,
+        caughtUp,
+        finished: caughtUp && !airing,
+      }).catch(() => {});
+    })();
+    return () => { cancelled = true; };
+  }, [data, episodes4up, merged, completed, animeHref]);
 
   if (loading) {
     const provisionalTitle = titleFromSlug(animeHref);
@@ -179,7 +212,7 @@ export function AnimeDetailPage() {
         </div>
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8">
           {data.episodes.map((ep) => {
-            const isDone = ep.href ? watched.has(ep.href) : false;
+            const isDone = isEpisodeWatched(completed, { hrefs: [ep.href], epNum: ep.number, animeTitle: data.title });
             const up4 = pickUp4ForEpisode(ep, episodes4up);
             return (
               <div key={ep.href ?? `e${ep.number}`} className="relative">

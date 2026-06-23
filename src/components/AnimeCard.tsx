@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 import type { AnimeItem, SearchResult, EpisodeItem } from "../lib/api";
 import { extractEpisodeNumber } from "../lib/episode-utils";
+import { CompletionBadge } from "./CompletionBadge";
 import { t } from "../lib/i18n";
 
 type Item = AnimeItem | SearchResult;
@@ -32,6 +33,9 @@ export function AnimeCard({ item }: { item: Item }) {
             {item.type}
           </span>
         )}
+        {/* Top-start: free of the "new" (top-end) and type (top-start only when
+            set) pills in practice — a caught-up anime has no pending new episode. */}
+        <CompletionBadge hrefs={[item.href]} titles={[item.title]} className="absolute bottom-9 end-2" />
         <div className="absolute inset-x-0 bottom-0 p-2.5">
           <h3 className="line-clamp-2 text-[13px] font-semibold leading-tight text-white">{item.title}</h3>
         </div>
@@ -78,6 +82,11 @@ export function EpisodeCard({
             {t.episode} {num}
           </span>
         )}
+        <CompletionBadge
+          hrefs={[episode.animeHref]}
+          titles={[episode.animeTitle]}
+          className="absolute start-2 top-2"
+        />
         <div className="absolute inset-0 flex items-center justify-center opacity-0 transition-opacity group-hover:opacity-100">
           <div className="flex h-14 w-14 items-center justify-center rounded-full bg-accent shadow-glow">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z" /></svg>
