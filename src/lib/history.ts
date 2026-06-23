@@ -182,19 +182,28 @@ const TITLE_DECORATION = new Set([
  * + episode number lets a "watched" flag set in one source light up in the
  * others — the episode URLs themselves differ per source and can't be compared.
  */
+// Memo cache — animeTitleKey runs NFKD + regex tokenization, wasteful when
+// called repeatedly for the SAME titles (the episode grid asks once per card).
+const titleKeyCache = new Map<string, string>();
+
 export function animeTitleKey(s: string | null | undefined): string {
-  const tokens = (s || "")
+  const raw = s || "";
+  const cached = titleKeyCache.get(raw);
+  if (cached !== undefined) return cached;
+  const key = raw
     .toLowerCase()
     .replace(/[^a-z0-9؀-ۿ]+/g, " ")
     .trim()
     .split(" ")
-    .filter((tok) => tok && !TITLE_DECORATION.has(tok));
-  return tokens
+    .filter((tok) => tok && !TITLE_DECORATION.has(tok))
     .join(" ")
     .normalize("NFKD")
     .replace(/[̀-ͯ]/g, "")
     .replace(/\s+/g, " ")
     .trim();
+  if (titleKeyCache.size > 2000) titleKeyCache.clear();
+  titleKeyCache.set(raw, key);
+  return key;
 }
 
 /** Pull an episode number out of a history entry — the stored epNum when

@@ -1,11 +1,11 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import { useParams, Link } from "react-router-dom";
 import {
   fetchEpisodes, fetchEpisodesUp4,
   type AnimeDetail, type Episode,
 } from "../lib/api";
 import { addFavorite, removeFavorite, favoriteListOf, type FavoriteList } from "../lib/favorites";
-import { getCompletedSets, isEpisodeWatched, toggleWatched, type CompletedSets } from "../lib/history";
+import { getCompletedSets, isEpisodeWatched, animeTitleKey, normHref, toggleWatched, type CompletedSets } from "../lib/history";
 import { recordAnimeCompletion } from "../lib/completion";
 import { fetchNextAiring } from "../lib/airing";
 import { Shimmer } from "../components/Shimmer";
@@ -90,18 +90,31 @@ export function AnimeDetailPage() {
   // Recomputed whenever the episode lists or the watched-set change; "finished"
   // is gated on the series no longer airing (so a still-running show's latest
   // episode reads as "caught up", not "completed").
-  useEffect(() => {
-    if (!data || !animeHref) return;
+  // Derive last episode number + caught-up state. Memoized so the recording
+  // effect depends on PRIMITIVES, not the `completed` object (new ref per load),
+  // and toggling a non-final episode doesn't re-fire the AniList airing check.
+  const { maxNum, caughtUp } = useMemo(() => {
+    if (!data) return { maxNum: 0, caughtUp: false };
     const all = [...data.episodes, ...episodes4up];
-    if (all.length === 0) return;
-    let maxNum = 0;
+    let mx = 0;
     let hasNum = false;
     for (const e of all) {
-      if (e.number != null && e.number > maxNum) { maxNum = e.number; hasNum = true; }
+      if (e.number != null && e.number > mx) { mx = e.number; hasNum = true; }
     }
-    if (!hasNum) return;
-    const lastHrefs = all.filter((e) => e.number === maxNum).map((e) => e.href).filter(Boolean) as string[];
-    const caughtUp = isEpisodeWatched(completed, { hrefs: lastHrefs, epNum: maxNum, animeTitle: data.title });
+    if (!hasNum) return { maxNum: 0, caughtUp: false };
+    const lastHrefs = all.filter((e) => e.number === mx).map((e) => e.href).filter(Boolean) as string[];
+    return { maxNum: mx, caughtUp: isEpisodeWatched(completed, { hrefs: lastHrefs, epNum: mx, animeTitle: data.title }) };
+  }, [data, episodes4up, completed]);
+
+  // The set of episode numbers watched for THIS anime (cross-source), resolved
+  // ONCE instead of re-deriving the title key (NFKD + regex) inside every card.
+  const watchedNumbers = useMemo(
+    () => (data ? completed.numbersByTitle.get(animeTitleKey(data.title)) ?? null : null),
+    [completed, data],
+  );
+
+  useEffect(() => {
+    if (!data || !animeHref || maxNum === 0) return;
     let cancelled = false;
     (async () => {
       let airing = false;
@@ -116,7 +129,7 @@ export function AnimeDetailPage() {
       }).catch(() => {});
     })();
     return () => { cancelled = true; };
-  }, [data, episodes4up, merged, completed, animeHref]);
+  }, [data?.title, animeHref, merged?.anime4up, maxNum, caughtUp]);
 
   if (loading) {
     const provisionalTitle = titleFromSlug(animeHref);
@@ -212,7 +225,11 @@ export function AnimeDetailPage() {
         </div>
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8">
           {data.episodes.map((ep) => {
-            const isDone = isEpisodeWatched(completed, { hrefs: [ep.href], epNum: ep.number, animeTitle: data.title });
+            // Cheap per-card check (no NFKD): href membership OR the precomputed
+            // cross-source episode-number set.
+            const isDone =
+              (!!ep.href && completed.hrefs.has(normHref(ep.href))) ||
+              (ep.number != null && !!watchedNumbers?.has(ep.number));
             const up4 = pickUp4ForEpisode(ep, episodes4up);
             return (
               <div key={ep.href ?? `e${ep.number}`} className="relative">
