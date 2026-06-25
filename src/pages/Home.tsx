@@ -6,6 +6,7 @@ import { EpisodeActionModal } from "../components/EpisodeActionModal";
 import { Shimmer } from "../components/Shimmer";
 import { SourceRail } from "../components/SourceRail";
 import { getContinueWatching, pullHistoryFromCloud, removeFromHistory, type WatchEntry } from "../lib/history";
+import { reconcileCompletionFromEpisodes } from "../lib/completion";
 import { extractEpisodeNumber } from "../lib/episode-utils";
 import { t } from "../lib/i18n";
 
@@ -24,6 +25,18 @@ export function HomePage() {
       .then((r) => {
         setFeatured(r.data.featured);
         setSections(r.data.sections.filter((s) => s.id !== "tv_series"));
+        // Clear stale "caught up"/"finished" badges the instant a new episode
+        // drops, without waiting for the user to reopen the anime's detail page.
+        const recent = r.data.sections.find((s) => s.id === "recently_updated");
+        if (recent) {
+          reconcileCompletionFromEpisodes(
+            (recent.items as EpisodeItem[]).map((ep) => ({
+              animeHref: ep.animeHref,
+              animeTitle: ep.animeTitle,
+              epNum: extractEpisodeNumber(ep.title),
+            })),
+          ).catch(() => {});
+        }
       })
       .catch((e) => setError(e?.message ?? t.failedToLoad))
       .finally(() => setLoading(false));

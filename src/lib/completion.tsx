@@ -12,6 +12,8 @@
 
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { storage } from "./storage";
+import { animeTitleKey, getCompletedSets, type CompletedSets } from "./history";
+import { fetchNextAiring } from "./airing";
 import { supabase, isSupabaseConfigured } from "./supabase";
 
 const KEY = "anime_completion_v2";
@@ -165,6 +167,116 @@ export async function pullCompletionFromCloud(): Promise<void> {
 export async function countCompletedAnime(): Promise<number> {
   const map = await getCompletionMap();
   return Object.values(map).filter((r) => r.finished).length;
+}
+
+/**
+ * Reconcile tracked completion records against a freshly-fetched list of
+ * recently-updated episodes (the home feed). Completion is otherwise only
+ * recomputed on the detail page, so a "caught up" / "finished" badge goes stale
+ * the moment a new episode drops — it keeps claiming the user is up to date
+ * until they reopen that anime. Here we catch the new episode at the source.
+ *
+ * For each tracked anime that the feed shows a HIGHER episode number for than we
+ * recorded, we bump `lastEpNum` and recompute `caughtUp` from the watch history
+ * (did the user already watch that newest episode?). `finished` drops to false:
+ * a series appearing in the "recently updated" feed with a new episode isn't
+ * actually over — the detail page re-establishes `finished` via AniList on the
+ * next visit. We never UPGRADE a badge here (that needs the detail page's full
+ * episode list); we only clear one that a new episode has invalidated.
+ */
+export async function reconcileCompletionFromEpisodes(
+  items: { animeHref?: string | null; animeTitle?: string | null; epNum: number | null }[],
+): Promise<void> {
+  if (!items || items.length === 0) return;
+  const map = await getCompletionMap();
+  if (Object.keys(map).length === 0) return;
+  const lookup = buildLookup(map);
+
+  // Highest episode number now available per matched record (by record key).
+  const newestByKey = new Map<string, number>();
+  for (const it of items) {
+    if (it.epNum == null || it.epNum <= 0) continue;
+    const rec = lookup.get({ hrefs: [it.animeHref], titles: [it.animeTitle] });
+    if (!rec) continue;
+    const cur = newestByKey.get(rec.key) || 0;
+    if (it.epNum > cur) newestByKey.set(rec.key, it.epNum);
+  }
+  if (newestByKey.size === 0) return;
+
+  let changed = false;
+  let sets: CompletedSets | null = null; // history loaded lazily, only if needed
+  for (const [key, newest] of newestByKey) {
+    const rec = map[key];
+    if (!rec || newest <= rec.lastEpNum) continue; // nothing newer than recorded
+
+    if (!sets) sets = await getCompletedSets();
+    let watchedNewest = false;
+    for (const tt of rec.titles) {
+      const nums = sets.numbersByTitle.get(animeTitleKey(tt));
+      if (nums && nums.has(newest)) { watchedNewest = true; break; }
+    }
+
+    if (rec.lastEpNum === newest && rec.caughtUp === watchedNewest && !rec.finished) continue;
+    map[key] = {
+      ...rec,
+      lastEpNum: newest,
+      caughtUp: watchedNewest,
+      finished: false,
+      updatedAt: Date.now(),
+    };
+    changed = true;
+    pushToCloud(map[key]).catch(() => {});
+  }
+
+  if (changed) {
+    await saveCompletionMap(map);
+    notify();
+  }
+}
+
+/**
+ * Mark an anime caught-up/finished the instant its LATEST episode is watched —
+ * called from the player when an episode crosses the "completed" threshold, so
+ * the badge updates without reopening the detail page.
+ *
+ * Only acts when a completion record already exists (the detail page is what
+ * establishes the highest-available episode number, `lastEpNum`) AND the
+ * just-watched episode is that latest one. It then re-checks AniList for finale
+ * status: `finished` when the series is no longer airing, else `caughtUp`.
+ * Never downgrades — a non-final episode (epNum < lastEpNum) is a no-op here;
+ * the detail page owns the full recompute.
+ */
+export async function recordEpisodeWatched(opts: {
+  animeHref?: string | null;
+  animeTitle?: string | null;
+  epNum: number | null;
+}): Promise<void> {
+  if (opts.epNum == null || opts.epNum <= 0) return;
+  const map = await getCompletionMap();
+  if (Object.keys(map).length === 0) return;
+  const rec = buildLookup(map).get({ hrefs: [opts.animeHref], titles: [opts.animeTitle] });
+  if (!rec) return;                       // detail page hasn't tracked this anime yet
+  if (opts.epNum < rec.lastEpNum) return; // not the latest available episode
+  if (rec.caughtUp && rec.finished) return; // already fully marked
+
+  // Finale is out when AniList reports no upcoming episode. A network miss
+  // defaults to "finished" — an anime watched to its last available episode is
+  // overwhelmingly a completed series (mirrors the detail page's default).
+  let airing = false;
+  try { airing = !!(await fetchNextAiring(opts.animeTitle || rec.titles[0] || "")); } catch {}
+
+  const next: AnimeCompletion = {
+    ...rec,
+    lastEpNum: Math.max(rec.lastEpNum, opts.epNum),
+    caughtUp: true,
+    finished: !airing,
+    updatedAt: Date.now(),
+  };
+  if (next.caughtUp === rec.caughtUp && next.finished === rec.finished && next.lastEpNum === rec.lastEpNum) return;
+  map[next.key] = next;
+  await saveCompletionMap(map);
+  notify();
+  pushToCloud(next).catch(() => {});
 }
 
 /* ── Lookup + context ───────────────────────────────── */
