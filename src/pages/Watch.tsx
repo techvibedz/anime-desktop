@@ -8,6 +8,7 @@ import {
   type VideoServer, type Episode,
 } from "../lib/api";
 import { saveProgress, getProgress } from "../lib/history";
+import { recordEpisodeWatched } from "../lib/completion";
 import { toAnimeUrl } from "../lib/favorites";
 import {
   startDownload, subscribeDownloads, getDownloadByEpisode,
@@ -1018,8 +1019,15 @@ export function WatchPage() {
         lowLatencyMode: false,
         startLevel: -1,
         backBufferLength: 90,
-        maxBufferLength: 60,
-        maxMaxBufferLength: 300,
+        // Bigger forward cushion to mask the throttled anime3rb/vid3rb CDN —
+        // accumulate surplus during the throttled download so a delayed or
+        // dropped fragment never surfaces as a mid-stream stall. (Mirrors the
+        // mobile expo-video 300s forward-buffer change.)
+        maxBufferLength: 90,
+        maxMaxBufferLength: 600,
+        // Don't let the 60MB default byte cap clip the 1080p cushion before the
+        // time target is reached — let buffer time win over size.
+        maxBufferSize: 120 * 1000 * 1000,
         // Generous timeouts.
         manifestLoadingTimeOut: 20000,
         manifestLoadingMaxRetry: 3,
@@ -1226,6 +1234,11 @@ export function WatchPage() {
     };
   }, [resolved]);
 
+  // Marks the completion badge once per episode when the LAST episode crosses
+  // the 80% watched bar — so it flips without a detail-page revisit.
+  const completionMarkedRef = useRef(false);
+  useEffect(() => { completionMarkedRef.current = false; }, [episodeUrl]);
+
   // Save progress every 10s (and at unmount).
   useEffect(() => {
     if (!videoRef.current || !episodeUrl) return;
@@ -1233,6 +1246,19 @@ export function WatchPage() {
     let last = 0;
     const onTime = () => {
       const now = Date.now();
+      // Mark the anime caught-up/finished the moment this episode crosses the
+      // 80% watched threshold (same bar history uses). If it's the latest
+      // available episode, the poster badge flips immediately instead of
+      // waiting for the user to reopen the detail page. recordEpisodeWatched is
+      // a no-op unless a completion record exists and this is the last episode.
+      if (!completionMarkedRef.current && isFinite(v.duration) && v.duration > 0 && v.currentTime / v.duration >= 0.8) {
+        completionMarkedRef.current = true;
+        recordEpisodeWatched({
+          animeHref: resolvedAnimeHref || animeParam || "",
+          animeTitle: meta.animeTitle || animeTitleFromDetail,
+          epNum: currentEpNumber ?? null,
+        }).catch(() => {});
+      }
       if (now - last < 10000) return;
       last = now;
       if (!isFinite(v.duration)) return;
@@ -1250,7 +1276,7 @@ export function WatchPage() {
     };
     v.addEventListener("timeupdate", onTime);
     return () => v.removeEventListener("timeupdate", onTime);
-  }, [episodeUrl, meta, up4Param, resolved, animeParam, imgParam, posterFromDetail, animeTitleFromDetail]);
+  }, [episodeUrl, meta, up4Param, resolved, animeParam, imgParam, posterFromDetail, animeTitleFromDetail, resolvedAnimeHref, currentEpNumber]);
 
   // Auto-hide controls
   const scheduleHide = useCallback(() => {

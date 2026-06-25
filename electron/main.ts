@@ -1734,19 +1734,29 @@ function registerVideoProxy() {
       const lastSeg = target.split("?")[0].split("#")[0].split("/").pop() || "";
       const hasExtension = /\.[a-z0-9]{2,5}$/i.test(lastSeg);
       const isLargeMedia = isMp4 || isHlsSegment || (!isManifest && !hasExtension);
-      const CHUNK_SIZE = isMp4 ? 1 * 1024 * 1024 : 4 * 1024 * 1024;
+      // Small opening chunk for fast first picture, but big chunks once
+      // playback is rolling: a 1MB cap on every request means a fresh CDN
+      // round-trip every ~2-4s of mp4, and that per-chunk latency IS the
+      // mid-playback stutter (vid3rb/anime3rb especially — its CDN answers
+      // Range fine and isn't IP-locked, so the only cost was our tiny cap).
+      // 4MB matches the proven HLS-segment cap: enough to amortize latency
+      // without the long per-chunk arrayBuffer waits (and 4-way cold-start
+      // strategy races) that made 8MB stall and fail.
+      const FIRST_CHUNK = 1 * 1024 * 1024;
+      const STEADY_CHUNK = 4 * 1024 * 1024;
       let range = request.headers.get("range");
       if (isLargeMedia) {
         if (!range) {
-          range = `bytes=0-${CHUNK_SIZE - 1}`;
+          range = `bytes=0-${FIRST_CHUNK - 1}`;
         } else {
           // bytes=START- (open-ended) → bytes=START-(START+CHUNK-1)
           const m = range.match(/^bytes=(\d+)-(\d*)$/);
           if (m) {
             const start = parseInt(m[1], 10);
             const end = m[2] ? parseInt(m[2], 10) : NaN;
-            if (!isFinite(end) || end - start > CHUNK_SIZE - 1) {
-              range = `bytes=${start}-${start + CHUNK_SIZE - 1}`;
+            const cap = start === 0 ? FIRST_CHUNK : STEADY_CHUNK;
+            if (!isFinite(end) || end - start > cap - 1) {
+              range = `bytes=${start}-${start + cap - 1}`;
             }
           }
         }
@@ -2110,6 +2120,18 @@ app.whenReady().then(() => {
         } else if (/share4max|megamax/.test(host)) {
           ref = "https://share4max.com/";
           ori = "https://share4max.com";
+        } else if (/vid3rb/.test(host)) {
+          // anime3rb's CDN (video.vid3rb.com) hotlink-checks the Referer: it
+          // accepts the anime3rb.com SITE Referer (same value the extractor and
+          // download path send) but tarpits anything else. Without this branch
+          // the generic root-domain fallback below stamps https://vid3rb.com/
+          // onto the direct <video> request, the CDN hangs the connection, and
+          // it surfaces as "video stalled → Initial load exceeded 22000ms".
+          // Force it (the request inherits the app's file://-/localhost Referer)
+          // and send NO Origin — a cross-origin Origin trips the same check.
+          ref = "https://anime3rb.com/";
+          ori = "";
+          force = true;
         } else if (/videa|vidvaita|vidit/.test(host)) {
           ref = "https://videa.hu/";
           ori = "https://videa.hu";
@@ -2153,7 +2175,10 @@ app.whenReady().then(() => {
             }
           }
           hdrs["Referer"] = ref;
-          hdrs["Origin"] = ori;
+          // Some CDNs (vid3rb) reject a cross-origin Origin — only set it when
+          // a branch actually provides one (force already deleted any inherited
+          // Origin above, so omitting it sends a bare, Origin-less request).
+          if (ori) hdrs["Origin"] = ori;
         }
       } catch {}
       callback({ requestHeaders: hdrs });
