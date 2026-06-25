@@ -1593,13 +1593,16 @@ export function WatchPage() {
                 const err = (e.target as HTMLVideoElement).error;
                 const code = err?.code;
                 console.warn(`[player] <video> error code=${code} message=${err?.message || ""}`);
-                // Code 2 (MEDIA_ERR_NETWORK): proxy returned 410/403 → signed
-                // URL expired. Re-extract a fresh URL instead of advancing.
-                if (code === 2 && resolved.url) {
-                  triggerReextract(`mp4 network error code=${code}`);
+                // Code 2 (MEDIA_ERR_NETWORK): proxy returned 410/403 → signed URL expired.
+                // Code 3 (MEDIA_ERR_DECODE): a transient mid-stream proxy 502 / dropped chunk
+                // often surfaces here, NOT as a true decode failure — so try one re-extract
+                // before abandoning the server (triggerReextract is budgeted and falls back
+                // to the iframe / advances once its retry budget is spent, so this can't loop).
+                if ((code === 2 || code === 3) && resolved.url) {
+                  triggerReextract(`mp4 ${code === 2 ? "network" : "decode"} error code=${code}`);
                   return;
                 }
-                if (code === 3 || code === 4) advanceToNext();
+                if (code === 4) advanceToNext();
               }}
             />
             {/* Top title bar — fades with the controls */}

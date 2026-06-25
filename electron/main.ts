@@ -1762,7 +1762,38 @@ function registerVideoProxy() {
         }
       }
 
-      let { upstream, strategy } = await tryFetch(target, referer, range, request.method, request.signal);
+      // Progressive media is chunked, so a single transient chunk failure (a CDN
+      // connection drop or one timed-out strategy race — NOT an expired token) must
+      // not 502 the whole stream the way it used to. HLS gets per-fragment retries;
+      // give progressive MP4 the same courtesy with a small bounded retry here. Auth
+      // failures (all strategies 401/403/410) are NOT transient — the token is dead —
+      // so we re-throw immediately and let the catch block return its 410 +
+      // X-Pantoufa-Reextract so the renderer re-extracts a fresh URL.
+      let fetched: Awaited<ReturnType<typeof tryFetch>> | undefined;
+      {
+        const MAX_CHUNK_ATTEMPTS = 3;
+        let lastErr: any;
+        for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt++) {
+          try {
+            fetched = await tryFetch(target, referer, range, request.method, request.signal);
+            break;
+          } catch (err: any) {
+            lastErr = err;
+            const codes: number[] = Array.isArray(err?.statusCodes) ? err.statusCodes : [];
+            const authDead = codes.length > 0 && codes.every((s) => s === 401 || s === 403 || s === 410);
+            // Don't retry a dead token or a caller-aborted request (renderer moved on).
+            if (authDead || request.signal?.aborted) throw err;
+            if (attempt < MAX_CHUNK_ATTEMPTS) {
+              console.warn(`[pantoufa-video] chunk fetch failed (attempt ${attempt}/${MAX_CHUNK_ATTEMPTS}), retrying: ${target}${range ? " " + range : ""}`);
+              await new Promise((res) => setTimeout(res, 600 * attempt));
+              continue;
+            }
+          }
+        }
+        if (!fetched) throw lastErr;
+      }
+      // upstream/strategy stay `let` — the mp4upload bytes=0- block below reassigns them.
+      let { upstream, strategy } = fetched;
 
       // mp4upload CDN sometimes only accepts Range requests — if the
       // initial GET fails without Range, retry with bytes=0-.
