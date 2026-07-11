@@ -95,12 +95,12 @@ export function TitlePage() {
             <img src={detail.cover} alt={detail.title} className="hidden h-40 w-28 shrink-0 rounded-lg border border-white/10 object-cover shadow-card sm:block" />
           )}
           <div className="min-w-0">
-            <h1 className="font-display text-2xl font-extrabold text-white drop-shadow">{detail.title}</h1>
+            <h1 className="text-2xl font-bold text-white drop-shadow">{detail.title}</h1>
             {detail.titleEnglish && detail.titleEnglish !== detail.title && (
               <p className="text-sm text-text-secondary">{detail.titleEnglish}</p>
             )}
             {detail.score != null && detail.score > 0 && (
-              <span className="mt-2 inline-block rounded-md bg-black/50 px-2 py-0.5 text-xs font-bold text-amber-300">★ {(detail.score / 10).toFixed(1)}</span>
+              <span className="mt-2 inline-block rounded-md bg-black/50 px-2 py-0.5 text-xs font-bold text-gold">★ {(detail.score / 10).toFixed(1)}</span>
             )}
           </div>
         </div>
@@ -110,7 +110,7 @@ export function TitlePage() {
       <div className="flex flex-wrap gap-3">
         <button
           onClick={() => navigate(`/search?q=${encodeURIComponent(detail.title)}`)}
-          className="rounded-full bg-accent px-5 py-2 text-sm font-bold text-white shadow-glow transition hover:bg-accent/80"
+          className="rounded-full bg-accent px-5 py-2.5 text-sm font-bold text-black transition-colors hover:bg-accent-bright"
         >
           {t.searchOnSources}
         </button>

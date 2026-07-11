@@ -38,7 +38,7 @@ export function PopularPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="font-display text-2xl font-extrabold text-white">{titleFor(kind as RailKind)}</h1>
+      <h1 className="text-2xl font-bold text-white">{titleFor(kind as RailKind)}</h1>
       {items === null ? (
         <div className="grid grid-cols-6 gap-4">
           {Array.from({ length: 18 }).map((_, i) => <Shimmer key={i} className="aspect-[2/3]" />)}

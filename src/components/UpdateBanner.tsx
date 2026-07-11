@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { UpdateInfo } from "../preload-types";
 
 /**
- * Floating bottom-right toast that appears when electron-updater
+ * Floating bottom toast that appears when electron-updater
  * has downloaded a new release. Tapping the button installs + restarts.
  */
 export function UpdateBanner() {
@@ -26,11 +26,10 @@ export function UpdateBanner() {
   // the failure is visible instead of silently doing nothing.
   if (!info && error) {
     return (
-      <div className="fixed bottom-5 end-5 z-[200] w-[min(420px,92vw)] overflow-hidden rounded-2xl border border-red-500/30 bg-surface shadow-card">
-        <div className="absolute inset-x-0 top-0 h-1 bg-red-500" />
+      <div className="fixed bottom-5 end-5 z-toast w-[min(420px,92vw)] overflow-hidden rounded-2xl border border-red-500/30 bg-raised shadow-card">
         <div className="flex items-start gap-3 p-4">
           <div className="min-w-0 flex-1">
-            <p className="text-[11px] font-bold uppercase tracking-wider text-red-400">فشل التحديث</p>
+            <p className="text-xs font-bold text-red-400">فشل التحديث</p>
             <p className="mt-1 line-clamp-3 text-xs text-text-secondary" dir="ltr">{error}</p>
           </div>
           <button
@@ -50,18 +49,17 @@ export function UpdateBanner() {
   if (!info) return null;
 
   return (
-    <div className="fixed bottom-5 end-5 z-[200] w-[min(420px,92vw)] overflow-hidden rounded-2xl border border-accent/30 bg-surface shadow-card">
-      <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-accent to-violet" />
+    <div className="fixed bottom-5 end-5 z-toast w-[min(420px,92vw)] overflow-hidden rounded-2xl border border-accent/25 bg-raised shadow-card">
       <div className="space-y-3 p-4">
         <div className="flex items-start gap-3">
-          <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-accent shadow-glow">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="white">
+          <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-accent">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="black">
               <path d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
             </svg>
           </div>
           <div className="min-w-0 flex-1">
-            <p className="text-[11px] font-bold uppercase tracking-wider text-accent">تحديث متاح</p>
-            <h3 className="font-display text-base font-bold text-white">
+            <p className="text-xs font-bold text-accent">تحديث متاح</p>
+            <h3 className="text-base font-bold text-white">
               النسخة {info.version} جاهزة
             </h3>
             {info.releaseNotes && (
@@ -87,13 +85,13 @@ export function UpdateBanner() {
               try { await window.pantoufa.installUpdate(); } catch { setInstalling(false); }
             }}
             disabled={installing}
-            className="flex-1 rounded-lg bg-accent py-2.5 text-sm font-semibold text-white shadow-glow hover:brightness-110 disabled:opacity-60"
+            className="flex-1 rounded-full bg-accent py-2.5 text-sm font-bold text-black transition-colors hover:bg-accent-bright disabled:opacity-60"
           >
             {installing ? "جارٍ التثبيت…" : "أعد التشغيل وتحديث"}
           </button>
           <button
             onClick={() => setInfo(null)}
-            className="rounded-lg border border-white/10 bg-bg px-4 py-2.5 text-sm font-medium text-white hover:bg-white/5"
+            className="rounded-full border border-white/10 bg-white/5 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-white/10"
           >
             لاحقًا
           </button>

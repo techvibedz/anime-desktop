@@ -2,6 +2,7 @@ import { storage } from "./storage";
 import { supabase, isSupabaseConfigured } from "./supabase";
 
 const KEY = "watch_history";
+const DISMISSED_KEY = "watch_history_dismissed_desktop";
 const MAX_ITEMS = 200;
 
 export interface WatchEntry {
@@ -76,6 +77,21 @@ export async function pullHistoryFromCloud() {
   await storage.setItem(KEY, JSON.stringify(local));
 }
 
+async function getDismissedHrefs(): Promise<Set<string>> {
+  const raw = await storage.getItem(DISMISSED_KEY);
+  if (!raw) return new Set();
+  try {
+    const arr = JSON.parse(raw);
+    return new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+async function setDismissedHrefs(hrefs: Set<string>): Promise<void> {
+  await storage.setItem(DISMISSED_KEY, JSON.stringify([...hrefs]));
+}
+
 export async function getHistory(): Promise<WatchEntry[]> {
   const raw = await storage.getItem(KEY);
   return raw ? JSON.parse(raw) : [];
@@ -101,6 +117,8 @@ export async function saveProgress(entry: Omit<WatchEntry, "updatedAt">) {
   }
   list.sort((a, b) => b.updatedAt - a.updatedAt);
   await storage.setItem(KEY, JSON.stringify(list));
+  const dismissed = await getDismissedHrefs();
+  if (dismissed.delete(entry.episodeHref)) await setDismissedHrefs(dismissed);
   pushToCloud(merged).catch(() => {});
 }
 
@@ -112,6 +130,7 @@ export async function saveProgress(entry: Omit<WatchEntry, "updatedAt">) {
  */
 export async function getContinueWatching(): Promise<WatchEntry[]> {
   const list = await getHistory();
+  const dismissed = await getDismissedHrefs();
   // list is already sorted newest-first; keep the first seen per anime.
   const seen = new Set<string>();
   const out: WatchEntry[] = [];
@@ -119,6 +138,7 @@ export async function getContinueWatching(): Promise<WatchEntry[]> {
     const key = e.animeHref || e.animeTitle;
     if (seen.has(key)) continue;
     seen.add(key);
+    if (dismissed.has(e.episodeHref)) continue;
     out.push(e);
   }
   return out;
@@ -133,6 +153,12 @@ export async function removeFromHistory(episodeHref: string) {
   const list = await getHistory();
   await storage.setItem(KEY, JSON.stringify(list.filter((e) => e.episodeHref !== episodeHref)));
   deleteFromCloud(episodeHref).catch(() => {});
+}
+
+export async function dismissFromContinue(episodeHref: string) {
+  const dismissed = await getDismissedHrefs();
+  dismissed.add(episodeHref);
+  await setDismissedHrefs(dismissed);
 }
 
 export function formatProgress(entry: WatchEntry): string {
@@ -165,6 +191,24 @@ export function normHref(u: string | null | undefined): string {
   if (!u) return "";
   try { return decodeURIComponent(u).replace(/\/+$/, "").toLowerCase(); }
   catch { return u.replace(/\/+$/, "").toLowerCase(); }
+}
+
+// Stabilize a per-anime key across witanime's rotating TLD (.life/.you/...).
+// Collapses the host to its second-level label (drop the TLD) + path, so the
+// SAME anime keyed while the app resolved a different TLD folds to one identity.
+// Used by completion badges so a record stored under witanime.life still matches
+// a lookup resolved under witanime.you. Mirrors mobile lib/history.ts.
+export function normAnimeKey(k: string): string {
+  if (!k) return "";
+  try {
+    const u = new URL(k);
+    const host = u.hostname.replace(/^www\./, "");
+    const labels = host.split(".");
+    const sld = labels.length >= 2 ? labels[labels.length - 2] : host;
+    return (sld + u.pathname).replace(/\/+$/, "").toLowerCase();
+  } catch {
+    return k.trim().toLowerCase();
+  }
 }
 
 // Source/SEO decoration words dropped from a title key so a decorated title

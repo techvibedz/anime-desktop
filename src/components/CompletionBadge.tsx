@@ -1,6 +1,6 @@
 // Poster-card badge marking an anime the user has finished or caught up on.
-//   • finished  → emerald "مكتمل" pill (watched the real finale)
-//   • caught up → cyan "آخر حلقة" pill (watched the latest available episode)
+//   • finished  → green "مكتمل" pill (watched the real finale)
+//   • caught up → violet "آخر حلقة" pill (watched the latest available episode)
 // Reads the shared completion lookup (lib/completion); renders nothing when the
 // anime isn't tracked, so it's safe to drop onto every card.
 
@@ -21,8 +21,8 @@ export function CompletionBadge({
   const finished = rec.finished;
   return (
     <span
-      className={`z-10 flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold text-white shadow ${
-        finished ? "bg-emerald-500" : "bg-cyan-500"
+      className={`z-10 flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-bold ${
+        finished ? "bg-accent text-black" : "bg-violet text-white"
       } ${className}`}
     >
       <span aria-hidden>{finished ? "✓✓" : "✓"}</span>

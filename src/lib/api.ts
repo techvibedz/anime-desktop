@@ -11,16 +11,24 @@ import {
   scrapeVideoServers,
   scrapeAnime4upServersDirect,
   scrapeAnime4upEpisodePageDirect,
+  scrapeWitanimeEpisodePageDirect,
   searchAnime4upDirect,
   searchAnime4upDirectList,
+  searchWitanimeDirectList,
   scrapeAnime4upEpisodesDirect,
   findUp4EpisodeAcrossPages,
   findCrossSourceUrl,
   searchAnime3rbDirect,
   searchAnime3rbCatalog,
+  searchAnime3rbCatalogFuzzy,
   scrapeAnime3rbEpisodeServers,
+  scrapeAnime3rbTitlePage,
+  anime3rbExactSlugs,
+  tm_seasonNum,
   type RawServer,
 } from "./scraper";
+import { getAltTitles } from "./altTitles";
+import { animeTitleKey } from "./history";
 
 const HOME_CACHE_KEY = "@home_cache_v1";
 const HOME_CACHE_TTL = 30 * 60 * 1000;
@@ -93,7 +101,16 @@ function cleanAnimeTitle(raw: string | null | undefined): string {
 type HomePayload = { success: boolean; data: { featured: FeaturedItem[]; sections: HomeSection[] } };
 let bgRefreshInFlight = false;
 
-function buildHomePayload(wit: { featured: FeaturedItem[]; animes: any[]; episodes: any[] }): HomePayload {
+function normalizeHomeSource(wit: { featured?: any[]; animes?: any[]; episodes?: any[] } | null | undefined) {
+  return {
+    featured: Array.isArray(wit?.featured) ? wit.featured : [],
+    animes: Array.isArray(wit?.animes) ? wit.animes : [],
+    episodes: Array.isArray(wit?.episodes) ? wit.episodes : [],
+  };
+}
+
+function buildHomePayload(witRaw: { featured?: FeaturedItem[]; animes?: any[]; episodes?: any[] } | null | undefined): HomePayload {
+  const wit = normalizeHomeSource(witRaw);
   const merged: MergedAnimeItem[] = wit.animes.map((w: any) => ({ ...w, image: imgOrEmpty(w.image), sources: ["witanime"], sourceHrefs: { witanime: w.href } }));
   const featured: FeaturedItem[] = wit.featured;
   const recentEpisodes: EpisodeItem[] = wit.episodes.map((e: any) => ({ title: e.title, href: e.href, image: imgOrEmpty(e.image), animeTitle: e.animeTitle, animeHref: e.animeHref, isNew: e.isNew }));
@@ -111,10 +128,12 @@ async function fetchHomeFresh(): Promise<HomePayload> {
   // Fast path: read the home page's static HTML directly (sub-second, no headless
   // window cold-start / Cloudflare-clear). Fall back to the headless scrape only
   // when the direct fetch comes back empty (CF challenge / cold body).
-  let wit: { featured: any[]; animes: any[]; episodes: any[] } | null =
-    await fetchWitHomeDirect().catch(() => null);
+  let wit = normalizeHomeSource(await fetchWitHomeDirect().catch(() => null));
   if (!wit || (wit.animes.length === 0 && wit.episodes.length === 0)) {
-    wit = await scrapeWitanimeHome();
+    wit = normalizeHomeSource(await scrapeWitanimeHome().catch(() => null));
+  }
+  if (wit.animes.length === 0 && wit.episodes.length === 0) {
+    throw new Error("Home content unavailable");
   }
   const result = buildHomePayload(wit);
   void writeCache(HOME_CACHE_KEY, result);
@@ -242,6 +261,41 @@ function titleFromSlug(url: string): string {
 type EpisodesPayload = { success: boolean; data: AnimeDetail & { episodes4up?: Episode[]; merged?: { anime4up: string } | null; up4Hint?: string | null; }; };
 
 async function fetchEpisodesFresh(animeUrl: string): Promise<EpisodesPayload> {
+  // anime3rb anime pages aren't witanime/anime4up shaped, so they're scraped via
+  // the static title-page parser. This lets anime that live ONLY on anime3rb
+  // (surfaced by search) open as a first-class detail page with a playable list.
+  if (/anime3rb\.com/i.test(animeUrl)) {
+    const a = await scrapeAnime3rbTitlePage(animeUrl);
+    // An anime3rb-only search hit whose title page won't parse (Cloudflare, or a
+    // catalog entry with no episodes uploaded yet) would otherwise render a blank
+    // detail — the "shows in search but the page is empty" symptom. Resolve the
+    // same title to its witanime page instead: that page merges all three
+    // sources' episodes (matches the mobile app, which never dead-ends on an
+    // anime3rb-only card). Only pay this lookup when anime3rb yields nothing.
+    if (!a || a.episodes.length === 0) {
+      const lookupTitle = cleanAnimeTitle(a?.title) || titleFromSlug(animeUrl);
+      const witUrl = lookupTitle
+        ? await findCrossSourceUrl(lookupTitle, "anime4up").catch(() => null)
+        : null;
+      if (witUrl) {
+        const p = await fetchEpisodesFresh(witUrl);
+        // Cache under the anime3rb key too so revisits skip the headless lookup.
+        void writeCache(DETAIL_CACHE_PREFIX + animeUrl, p);
+        return p;
+      }
+    }
+    const payload: EpisodesPayload = {
+      success: !!a,
+      data: {
+        title: cleanAnimeTitle(a?.title), poster: a?.poster || "", banner: a?.poster || "",
+        synopsis: cleanSynopsis(a?.synopsis), genres: a?.genres || [], rating: null,
+        metadata: {}, externalLinks: [], totalEpisodes: a?.episodes.length || 0,
+        episodes: a?.episodes || [], episodes4up: [], merged: null, up4Hint: null,
+      },
+    };
+    if (a) void writeCache(DETAIL_CACHE_PREFIX + animeUrl, payload);
+    return payload;
+  }
   const d = await scrapeEpisodesPage(animeUrl);
   const payload: EpisodesPayload = {
     success: true,
@@ -301,21 +355,57 @@ export async function fetchRecent(page = 1) {
   return { success: true, data: { page, episodes: r.episodes.map((e) => ({ title: e.title, href: e.href, image: imgOrEmpty(e.image), animeTitle: e.animeTitle, animeHref: e.animeHref, isNew: e.isNew })), hasNext: r.episodes.length > 0 } };
 }
 
-export async function searchAnime(query: string) {
-  // Run witanime (headless) and anime4up (direct static-HTML GET, near-instant)
-  // in parallel, merge their results de-duped by href, then fuzzy-rerank against
-  // the query so the closest title floats to the top even when a source's own
-  // search buried it (typo, spacing, dropped colon). anime4up's direct list
-  // costs ~nothing, so it widens coverage for free.
-  const [wit, up4] = await Promise.all([
-    scrapeSearch(query).catch(() => ({ results: [] as SearchResult[] })),
-    searchAnime4upDirectList(query).catch(() => null),
-  ]);
+// Dedup-by-title-key + stable fuzzy rerank for the multi-source search union.
+// Each source pushes its raw cards in; snapshot() returns the reranked list.
+//
+// CROSS-SOURCE DEDUP: the three sources (witanime / anime4up / anime3rb) index
+// the SAME anime under different hrefs (witanime.you/anime/X vs
+// w1.anime4up.rest/anime/X vs anime3rb.com/titles/X), so deduping by href left
+// the same anime on screen up to 3× — and the late-arriving witanime copy
+// re-rendered with a fresh (slow) image load. animeTitleKey (the codebase's
+// cross-source identity helper, already used by history) collapses them to one
+// card. On collision the first-seen card wins (the fast phase paints first),
+// but its image/title are upgraded when a later source offers a better one
+// (anime3rb cards carry a lowercase slug-derived title + sitemap poster; a
+// later witanime/anime4up card supplies the real mixed-case / Arabic title).
+type SearchSeed = {
+  title: string; href: string; image: string | null;
+  type?: string | null; status?: string | null; synopsis?: string | null;
+};
+function makeSearchSink(query: string) {
   const merged: SearchResult[] = [];
-  const seen = new Set<string>();
-  const push = (it: { title: string; href: string; image: string | null; type: string | null; status?: string | null; synopsis?: string | null }) => {
-    if (!it.href || seen.has(it.href)) return;
-    seen.add(it.href);
+  const seenHrefs = new Set<string>();
+  const seenKeys = new Map<string, number>(); // titleKey → index in merged
+  const push = (it: SearchSeed) => {
+    if (!it.href || seenHrefs.has(it.href)) return;
+    seenHrefs.add(it.href);
+    const key = animeTitleKey(it.title) || it.href;
+    const idx = seenKeys.get(key);
+    if (idx !== undefined) {
+      const cur = merged[idx];
+      // Upgrade image only when the existing card has none — never swap a
+      // loaded image for another (that re-triggers a slow fresh fetch).
+      if (!cur.image && it.image) cur.image = imgOrEmpty(it.image);
+      // Upgrade title when the existing one is a bare lowercase slug form
+      // (anime3rb) and the new one is a richer real title (mixed-case/Arabic).
+      if (isSlugTitle(cur.title) && !isSlugTitle(it.title) && it.title) {
+        cur.title = it.title;
+      }
+      // Prefer a witanime/anime4up href over anime3rb: an anime3rb-primary
+      // detail page returns ONLY anime3rb episodes, while a witanime/anime4up
+      // primary page merges all three sources' episodes. So when a richer
+      // source's card collides, point the surviving card at its href.
+      if (hrefRank(it.href) < hrefRank(cur.href)) {
+        cur.href = it.href;
+        if (it.type && !cur.type) cur.type = it.type ?? undefined;
+        if (it.status && !cur.status) cur.status = it.status ?? undefined;
+      } else {
+        if (it.type && !cur.type) cur.type = it.type ?? undefined;
+        if (it.status && !cur.status) cur.status = it.status ?? undefined;
+      }
+      return;
+    }
+    seenKeys.set(key, merged.length);
     merged.push({
       title: it.title,
       href: it.href,
@@ -325,12 +415,100 @@ export async function searchAnime(query: string) {
       synopsis: it.synopsis ?? undefined,
     });
   };
-  for (const it of wit.results || []) push(it as any);
-  for (const it of up4 || []) push(it as any);
-  // Stable fuzzy rerank: higher similarity first, ties keep insertion order.
-  const scored = merged.map((it, i) => ({ it, i, s: fuzzyScore(query, it.title) }));
-  scored.sort((a, b) => (b.s - a.s) || (a.i - b.i));
-  const results = scored.map((x) => x.it);
+  const snapshot = (): SearchResult[] => {
+    const scored = merged.map((it, i) => ({ it, i, s: fuzzyScore(query, it.title) }));
+    scored.sort((a, b) => (b.s - a.s) || (a.i - b.i));
+    return scored.map((x) => x.it);
+  };
+  return { push, snapshot };
+}
+
+// A "slug title" is a lowercase ASCII-only string derived from a URL slug
+// (anime3rb search cards build their title from the slug). Prefer a real
+// title — one carrying uppercase or non-Latin characters — when a later
+// source provides one, so the card reads "One Piece" not "one piece".
+function isSlugTitle(s: string | null | undefined): boolean {
+  if (!s) return false;
+  return s === s.toLowerCase() && /^[a-z0-9 ]+$/.test(s);
+}
+
+// Detail-page richness ranking for a card's href. A witanime or anime4up
+// primary href merges ALL three sources' episodes on the detail page; an
+// anime3rb primary href returns only anime3rb episodes. Lower = richer.
+function hrefRank(href: string): number {
+  if (/anime3rb\.com/i.test(href)) return 3;
+  if (/anime4up/i.test(href)) return 2;
+  return 1; // witanime (or anything else) — richest merge
+}
+
+// witanime-primary progressive search. witanime is the authoritative source, so
+// its results are shown FIRST and alone; anime4up + anime3rb are a FALLBACK that
+// only surfaces titles witanime has nothing for. Two-stage witanime lookup keeps
+// the common case fast: a direct static-HTML GET paints in well under a second,
+// and the slow headless scrape (which overlaps in the background) fills anything
+// the direct parse missed and recovers a Cloudflare block on the direct fetch.
+export async function searchAnimeStream(
+  query: string,
+  onPartial?: (results: SearchResult[], phase: "fast" | "full") => void,
+): Promise<SearchResult[]> {
+  const sink = makeSearchSink(query);
+
+  // Headless witanime overlaps the direct GET so we never serialize the two.
+  const witHeadlessP = scrapeSearch(query).catch(() => ({ results: [] as SearchResult[] }));
+
+  // PRIMARY, fast: witanime direct static search — paint the moment it lands.
+  const witDirect = await searchWitanimeDirectList(query).catch(() => null);
+  for (const it of witDirect || []) sink.push(it);
+  if (sink.snapshot().length > 0) onPartial?.(sink.snapshot(), "fast");
+
+  // Merge the headless witanime pass (fills gaps / recovers a blocked direct GET).
+  const witH = await witHeadlessP;
+  for (const it of witH.results || []) sink.push(it);
+
+  // Cross-language bridge: witanime often indexes an anime ONLY under its romaji
+  // name (King's Game → Ousama Game). Still on witanime, just under an alt title,
+  // so try that BEFORE reaching for the other sources.
+  if (sink.snapshot().length === 0) {
+    const alts = await getAltTitles(query).catch(() => [] as string[]);
+    for (const alt of alts.slice(0, 2)) {
+      if (alt.toLowerCase().trim() === query.toLowerCase().trim()) continue;
+      const [wd, wh] = await Promise.all([
+        searchWitanimeDirectList(alt).catch(() => null),
+        scrapeSearch(alt).catch(() => ({ results: [] as SearchResult[] })),
+      ]);
+      for (const it of wd || []) sink.push(it);
+      for (const it of wh.results || []) sink.push(it);
+      if (sink.snapshot().length > 0) break;
+    }
+  }
+
+  // FALLBACK sources — anime4up + anime3rb — only when witanime (direct, headless,
+  // and alt-title) found NOTHING for the query. This keeps witanime the primary
+  // source and stops the looser anime3rb fuzzy match from polluting normal results.
+  if (sink.snapshot().length === 0) {
+    const up4 = await searchAnime4upDirectList(query).catch(() => null);
+    for (const it of up4 || []) sink.push(it);
+    const fuzzy = await searchAnime3rbCatalogFuzzy(query, 6)
+      .catch(() => [] as { slug: string; score: number; poster: string }[]);
+    for (const { slug, poster } of fuzzy) {
+      sink.push({
+        title: slug.replace(/[-_]+/g, " ").trim(),
+        href: `https://anime3rb.com/titles/${slug}`,
+        image: poster || "",
+        type: undefined, status: undefined, synopsis: undefined,
+      });
+    }
+  }
+
+  const results = sink.snapshot();
+  onPartial?.(results, "full");
+  return results;
+}
+
+// Backwards-compatible single-payload wrapper. New callers should prefer
+// searchAnimeStream for progressive results.
+export async function searchAnime(query: string) {
+  const results = await searchAnimeStream(query);
   return { success: true, data: { query, totalResults: results.length, results } };
 }
 
@@ -376,13 +554,27 @@ async function doFetchVideoServers(episodeUrl: string, url4up?: string) {
   // second — the headless render takes many seconds and often trips
   // anime4up's ad gates. Fall back to the headless scrape only when the
   // direct parse yields nothing.
-  let primary: { source: "anime4up" | "witanime"; servers: any[]; episodeTitle: string; animeTitle: string; up4EpisodeUrl: string | null } | null = null;
+  let primary: { source: "anime4up" | "witanime"; servers: any[]; episodeTitle: string; animeTitle: string; up4EpisodeUrl: string | null; direct?: boolean } | null = null;
   if (primaryIsUp4) {
     try {
       const direct = await scrapeAnime4upEpisodePageDirect(episodeUrl);
       if (direct) {
         console.info(`[servers] direct anime4up parse: ${direct.servers.length} servers`);
-        primary = { source: "anime4up", servers: direct.servers, episodeTitle: direct.episodeTitle, animeTitle: direct.animeTitle, up4EpisodeUrl: null };
+        primary = { source: "anime4up", servers: direct.servers, episodeTitle: direct.episodeTitle, animeTitle: direct.animeTitle, up4EpisodeUrl: null, direct: true };
+      }
+    } catch { /* fall through to headless */ }
+  } else if (/witanime/i.test(episodeUrl)) {
+    // Fast lane for witanime-primary episodes: witanime hides its server embeds
+    // in an obfuscated _zX/_zK registry that only its gh100.js decodes on click.
+    // The headless render depends on those clicks firing past witanime's
+    // Cloudflare gate and frequently comes back empty — so decode the registry
+    // straight from the static HTML. Falls back to headless when the direct
+    // decode yields nothing (older pages that still ship plain iframes).
+    try {
+      const direct = await scrapeWitanimeEpisodePageDirect(episodeUrl);
+      if (direct) {
+        console.info(`[servers] direct witanime parse: ${direct.servers.length} servers`);
+        primary = { source: "witanime", servers: direct.servers, episodeTitle: direct.episodeTitle, animeTitle: direct.animeTitle, up4EpisodeUrl: null, direct: true };
       }
     } catch { /* fall through to headless */ }
   }
@@ -391,16 +583,54 @@ async function doFetchVideoServers(episodeUrl: string, url4up?: string) {
   }
   const seen = new Set<string>();
   const merged: (VideoServer & { source?: string })[] = [];
-  function add(arr: any[] | undefined, source: string) {
+  function add(arr: any[] | undefined, source: string, keepGeneric = false) {
     if (!arr) return;
-    for (const s of arr) { if (!s.iframeUrl || seen.has(s.iframeUrl)) continue; seen.add(s.iframeUrl); merged.push({ id: String(merged.length), name: s.name, iframeUrl: s.iframeUrl, provider: s.provider, source }); }
+    for (const s of arr) {
+      if (!s.iframeUrl || seen.has(s.iframeUrl)) continue;
+      // Drop unclassifiable "generic" servers from the HEADLESS witanime scrape —
+      // they're the site's own placeholder player (junk). Keep anime4up's
+      // generic-classified ones (their embed hosts often aren't in the provider
+      // list but are real), and keep the DIRECT-decoded ones (keepGeneric): those
+      // are validated real embeds, so a brand-new witanime host still plays via
+      // the iframe fallback instead of silently vanishing.
+      if (s.provider === "generic" && source !== "anime4up" && !keepGeneric) continue;
+      seen.add(s.iframeUrl);
+      merged.push({ id: String(merged.length), name: s.name, iframeUrl: s.iframeUrl, provider: s.provider, source });
+    }
   }
-  if (primary) add(primary.servers, primary.source);
+  if (primary) add(primary.servers, primary.source, !!primary.direct);
   // A direct anime4up episode link harvested off the witanime page lets the
   // watch screen enrich anime4up servers immediately, skipping the slow
   // cross-source search. Prefer an explicit ?up4= but fall back to it.
   const harvestedUp4 = (!primaryIsUp4 && primary?.up4EpisodeUrl && /\/episode\/|الحلقة/i.test(primary.up4EpisodeUrl)) ? primary.up4EpisodeUrl : null;
   return { success: true, data: { episodeTitle: primary?.episodeTitle || "", animeTitle: primary?.animeTitle || "", animeHref: "", serverCount: merged.length, servers: merged, up4EpisodeUrl: harvestedUp4, navigation: { prev: null, next: null } } };
+}
+
+// ── definitive-negative memory ──
+// A source can report a title/episode as *definitively* absent: the site was
+// reachable, its content parsed, and the thing genuinely isn't there. That
+// verdict won't change on a retry, so the watch screen's enrichment loops
+// consult this to STOP retrying (the "resolving … (attempt 9)" storm). Beyond
+// the console/request spam, the anime3rb retries re-probe slugs that tarpit the
+// edge — a title with no anime3rb entry could blackhole the site for OTHER
+// titles. Session-scoped only (not persisted): a newly-uploaded episode should
+// re-check on the next app run, and a manual refresh clears it (see below).
+const definitiveMiss = new Set<string>();
+const missKey = (source: string, title: string, ep?: number) =>
+  `${source}:${title.toLowerCase().trim()}${ep != null ? "#" + ep : ""}`;
+export function isDefinitiveMiss(source: "anime4up" | "anime3rb", title: string, ep?: number): boolean {
+  if (!title) return false;
+  return definitiveMiss.has(missKey(source, title, ep));
+}
+// Drop a title's definitive-miss verdicts (both sources, any episode) so a
+// manual "refresh servers" genuinely re-queries instead of short-circuiting.
+export function clearDefinitiveMiss(title: string): void {
+  if (!title) return;
+  const suffix = `:${title.toLowerCase().trim()}`;
+  for (const k of definitiveMiss) {
+    const rest = k.slice(k.indexOf(":"));
+    if (rest === suffix || rest.startsWith(suffix + "#")) definitiveMiss.delete(k);
+  }
 }
 
 // Resolve the anime4up episode URL for a given anime title + episode number
@@ -442,11 +672,17 @@ export async function resolveUp4EpisodeUrl(animeTitle: string, epNumber: number)
   // catch-up watching. findUp4EpisodeAcrossPages walks the pagination toward
   // the requested number instead.
   let url: string | null = null;
+  let definitive = false;
   try {
-    url = await findUp4EpisodeAcrossPages(animeUrl, epNumber);
+    const r = await findUp4EpisodeAcrossPages(animeUrl, epNumber);
+    url = r.url;
+    definitive = r.definitive;
   } catch (e) { console.warn(`[up4-resolve] episode lookup threw:`, e); }
   if (url) console.info(`[up4-resolve] found ep ${epNumber}: ${url}`);
-  else console.warn(`[up4-resolve] ep ${epNumber} not found on anime4up pages`);
+  else if (definitive) {
+    definitiveMiss.add(missKey("anime4up", animeTitle, epNumber));
+    console.warn(`[up4-resolve] ep ${epNumber} is definitively absent from anime4up — not retrying`);
+  } else console.warn(`[up4-resolve] ep ${epNumber} not found on anime4up pages (transient)`);
   // Only cache a successful resolution. anime4up's search / episode list is
   // intermittently empty (ad gates, rate-limited request bursts on page load);
   // caching a null for 24h would permanently block retries — including the
@@ -468,40 +704,88 @@ export async function resolveUp4EpisodeUrl(animeTitle: string, epNumber: number)
 // anime4up lesson: only successful resolutions are cached — caching a miss
 // for 24h would permanently block retries while the site is briefly flaky.
 const a3rbTitleCache = new Map<string, { url: string; ts: number }>();
-const A3RB_TITLE_PREFIX = "@a3rb_title_v1:";
+// v2: bumped to discard slug mappings written by the pre-Roman-season build,
+// which resolved later seasons ("Mushoku Tensei III") to season 1's page and
+// re-wrote that wrong slug on every hit so it never aged out. A fresh key forces
+// re-resolution with the season-aware logic (which correctly returns nothing
+// when a later season isn't on anime3rb).
+const A3RB_TITLE_PREFIX = "@a3rb_title_v2:";
+// Titles whose Jikan alt-name bridge has already been attempted this session.
+// The bridge hits Jikan + probes anime3rb with each alt name; a fundamental
+// name mismatch won't change between the watch screen's retries, so run it at
+// most once per title (the cheap catalog/slug probes still retry every call).
+const a3rbBridgeTried = new Set<string>();
 
-async function resolveAnime3rbTitleUrl(animeTitle: string): Promise<string | null> {
-  if (!animeTitle) return null;
+// Cache-only lookup of an anime's resolved anime3rb title URL — no network.
+async function peekAnime3rbTitleUrl(animeTitle: string): Promise<string | null> {
   const key = animeTitle.toLowerCase().trim();
   const hit = a3rbTitleCache.get(key);
   if (hit && Date.now() - hit.ts < UP4_CACHE_TTL) return hit.url;
   const stored = await readCache<string>(A3RB_TITLE_PREFIX + key, UP4_CACHE_TTL);
   if (stored) { a3rbTitleCache.set(key, { url: stored, ts: Date.now() }); return stored; }
+  return null;
+}
+
+// Persist a confirmed title URL so later episodes of the same anime are instant.
+function rememberAnime3rbTitleUrl(animeTitle: string, url: string) {
+  const key = animeTitle.toLowerCase().trim();
+  a3rbTitleCache.set(key, { url, ts: Date.now() });
+  void writeCache(A3RB_TITLE_PREFIX + key, url);
+}
+
+async function resolveAnime3rbTitleUrl(animeTitle: string): Promise<string | null> {
+  if (!animeTitle) return null;
+  const key = animeTitle.toLowerCase().trim();
+  const cached = await peekAnime3rbTitleUrl(animeTitle);
+  if (cached) return cached;
   // Catalog (sitemap) matching FIRST: one plain GET (cached 6h in memory)
   // plus one verification probe of a slug that's KNOWN to exist — both fast
-  // 200s. Slug guessing used to run first, but anime3rb's edge TARPITS
-  // unknown /titles/<slug> paths instead of 404ing them: every missed guess
-  // hung for the full fetch timeout (~27s) and the probe burst got the whole
-  // site temporarily blackholed — which is why the anime3rb server never
-  // appeared for seasonal titles ("4th Season" etc.) whose slug isn't an
-  // exact first guess.
+  // 200s. On desktop the slug guess goes second (anime3rb's edge TARPITS
+  // unknown /titles/<slug> paths rather than 404ing them, so a missed guess
+  // burst can blackhole the site — the catalog avoids that).
   let url = await searchAnime3rbCatalog(animeTitle).catch(() => null);
   if (!url) {
-    // Capped slug probing as last resort (covers a stale/failed sitemap).
     console.info(`[a3rb-resolve] catalog miss for "${animeTitle}", probing top slug guesses`);
     url = await searchAnime3rbDirect(animeTitle).catch(() => null);
   }
-  // NOTE: no headless /search fallback. anime3rb's /search sits behind a
-  // Cloudflare managed challenge that never completes inside the hidden
-  // scraper window (verified: it idles on the interstitial until timeout), so
-  // the old fallback could never succeed — it just pinned the in-flight latch
-  // for 45s, which BLOCKED the quick re-run with the better scraped title.
-  // Failing fast here lets the watch screen's retry loop converge instead.
+  if (!url && !a3rbBridgeTried.has(key)) {
+    // Cross-language bridge — the main reason anime3rb "sometimes doesn't show".
+    // witanime/anime4up may hand us an Arabic title, or a romanization anime3rb
+    // doesn't index under (King's Game ↔ Ousama Game, Re:Zero ↔ rezero). Ask
+    // Jikan for the anime's other names and retry the catalog + slug match with
+    // each Latin one (anime3rb's slugs are Latin). getAltTitles caches its
+    // result so retries are free.
+    a3rbBridgeTried.add(key);
+    // getAltTitles cleans the season off the query, so its names are the BASE
+    // franchise names. Bridging them as-is for a later season would match the
+    // WRONG season's page (numbering restarts), so detect the wanted season and
+    // RE-ATTACH it for season >= 2 — the matchers' own season check keeps the
+    // result locked to that season.
+    // Pass the ORIGINAL-case title so Roman-numeral seasons ("Mushoku Tensei
+    // III") are detected — the lowercased `key` would hide the uppercase-roman
+    // discriminator that keeps a stray "v"/"x" from being read as a season.
+    const seasonNum = tm_seasonNum(animeTitle);
+    const alts = await getAltTitles(animeTitle).catch(() => [] as string[]);
+    for (const alt of alts) {
+      if (!/[a-z]/i.test(alt)) continue;            // need Latin script for the slug
+      const altQ = seasonNum >= 2 ? `${alt} season ${seasonNum}` : alt;
+      if (altQ.toLowerCase().trim() === key) continue; // already tried as the primary
+      url =
+        (await searchAnime3rbCatalog(altQ).catch(() => null)) ||
+        (await searchAnime3rbDirect(altQ).catch(() => null));
+      if (url) break;
+    }
+  }
   if (url) {
     console.info(`[a3rb-resolve] matched title page: ${url}`);
-    a3rbTitleCache.set(key, { url, ts: Date.now() });
-    void writeCache(A3RB_TITLE_PREFIX + key, url);
+    rememberAnime3rbTitleUrl(animeTitle, url);
   } else {
+    // Catalog + slug + Jikan alt-name bridge all exhausted with no match → the
+    // title genuinely isn't on anime3rb this session. Mark it definitive so the
+    // watch loop stops retrying AND later fetchAnime3rbServers calls skip the
+    // slug probes that tarpit the edge. Only after the bridge ran, so a purely
+    // transient catalog fetch failure (bridge not yet attempted) still retries.
+    if (a3rbBridgeTried.has(key)) definitiveMiss.add(missKey("anime3rb", animeTitle));
     console.warn(`[a3rb-resolve] no anime3rb match for "${animeTitle}"`);
   }
   return url;
@@ -510,16 +794,104 @@ async function resolveAnime3rbTitleUrl(animeTitle: string): Promise<string | nul
 // Servers for an episode by anime title + episode number. Returns [] on any
 // miss (unknown anime, episode not yet uploaded, transient fetch failure) —
 // the watch screen's retry loop decides whether to try again.
+// Built anime3rb server lists, keyed by `${titleKey}#${epNum}`. The playerUrl in
+// each server carries a token (~expires), so the TTL is short. Re-opening an
+// episode — or a PREFETCHED next episode while binge-watching — plays instantly.
+const a3rbServersMem = new Map<string, { servers: RawServer[]; ts: number }>();
+const A3RB_SERVERS_TTL = 12 * 60 * 1000;
+function a3rbServersKey(animeTitle: string, epNumber: number) {
+  return `${animeTitle.toLowerCase().trim()}#${epNumber}`;
+}
+
+// Warm the caches for an episode the user is LIKELY to watch next (called from
+// the watch screen for epNum±1 while the current one plays). Fire-and-forget.
+export function prefetchAnime3rbServers(animeTitle: string, epNumber: number): void {
+  if (!animeTitle || epNumber == null || epNumber < 1) return;
+  if (a3rbServersMem.has(a3rbServersKey(animeTitle, epNumber))) return;
+  void fetchAnime3rbServers(animeTitle, epNumber).catch(() => {});
+}
+
 export async function fetchAnime3rbServers(animeTitle: string, epNumber: number): Promise<RawServer[]> {
   if (!animeTitle || epNumber == null) return [];
+  const epUrlFor = (slug: string) => `https://anime3rb.com/episode/${slug}/${epNumber}`;
+  const memKey = a3rbServersKey(animeTitle, epNumber);
+
+  // 0) Already built (re-open or prefetch hit) — instant, no network.
+  const mem = a3rbServersMem.get(memKey);
+  if (mem && Date.now() - mem.ts < A3RB_SERVERS_TTL) return mem.servers;
+  // Title already proven absent from anime3rb this session — skip the slug
+  // probes (they tarpit the edge) entirely.
+  if (isDefinitiveMiss("anime3rb", animeTitle)) return [];
+  const remember = (servers: RawServer[]) => {
+    if (servers.length) a3rbServersMem.set(memKey, { servers, ts: Date.now() });
+    return servers;
+  };
+
+  // 1) Known slug (cache hit) — one episode-page fetch, straight to servers.
+  const cachedTitle = await peekAnime3rbTitleUrl(animeTitle);
+  if (cachedTitle) {
+    const slug = cachedTitle.replace(/\/+$/, "").split("/").pop();
+    if (slug) {
+      const servers = await scrapeAnime3rbEpisodeServers(epUrlFor(slug)).catch(() => [] as RawServer[]);
+      if (servers.length) return remember(servers);
+      // Cached slug yielded nothing — fall through to the guess/resolve paths.
+    }
+  }
+
+  // 2) Fast direct-slug path: try the EXACT slug guesses' episode URLs directly.
+  // The episode page itself proves the slug, so this skips a separate title-page
+  // fetch. ponytail: capped to the top 2 exact slugs — a miss on anime3rb
+  // tarpits (~12s) rather than 404ing, so an uncapped guess chain could stall;
+  // raise the cap if exact slugs routinely miss the correct anime.
+  for (const slug of anime3rbExactSlugs(animeTitle).slice(0, 2)) {
+    const servers = await scrapeAnime3rbEpisodeServers(epUrlFor(slug)).catch(() => [] as RawServer[]);
+    if (servers.length) {
+      rememberAnime3rbTitleUrl(animeTitle, `https://anime3rb.com/titles/${slug}`);
+      return remember(servers);
+    }
+  }
+
+  // 3) Full resolver (catalog sitemap + Jikan cross-language bridge) for anime
+  // whose slug can't be guessed. Verifies the title page, then builds the URL.
   const titleUrl = await resolveAnime3rbTitleUrl(animeTitle);
   if (!titleUrl) return [];
   const slug = titleUrl.replace(/\/+$/, "").split("/").pop();
   if (!slug) return [];
-  const episodeUrl = `https://anime3rb.com/episode/${slug}/${epNumber}`;
-  const servers = await scrapeAnime3rbEpisodeServers(episodeUrl).catch(() => [] as RawServer[]);
-  if (servers.length > 0) console.info(`[a3rb-resolve] ep ${epNumber}: ${servers.length} server(s) from ${episodeUrl}`);
-  return servers;
+  const servers = await scrapeAnime3rbEpisodeServers(epUrlFor(slug)).catch(() => [] as RawServer[]);
+  if (servers.length > 0) console.info(`[a3rb-resolve] ep ${epNumber}: ${servers.length} server(s) from ${epUrlFor(slug)}`);
+  return remember(servers);
+}
+
+// Servers for a KNOWN anime3rb episode URL (no title/number resolution needed).
+// Used when an anime3rb episode is the primary source on the watch screen.
+export async function fetchAnime3rbServersByUrl(episodeUrl: string): Promise<RawServer[]> {
+  if (!episodeUrl) return [];
+  return scrapeAnime3rbEpisodeServers(episodeUrl).catch(() => [] as RawServer[]);
+}
+
+// Public resolver for an anime's anime3rb /titles/<slug> page (or null).
+export async function findAnime3rbAnimeUrl(animeTitle: string): Promise<string | null> {
+  return resolveAnime3rbTitleUrl(animeTitle).catch(() => null);
+}
+
+// anime3rb's full episode list for an anime, for the detail page's cross-source
+// union — so episodes missing from witanime/anime4up still appear (and stay
+// playable, since each href is a real anime3rb episode URL). Cached 6h.
+const A3RB_EPS_PREFIX = "@a3rb_eps_v2:"; // v2: discard episode lists keyed by pre-fix (wrong-season) title URLs
+const A3RB_EPS_TTL = 6 * 60 * 60 * 1000;
+export async function fetchAnime3rbEpisodes(animeTitle: string): Promise<Episode[]> {
+  if (!animeTitle || !animeTitle.trim()) return [];
+  const titleUrl = await resolveAnime3rbTitleUrl(animeTitle);
+  if (!titleUrl) return [];
+  const cacheKey = A3RB_EPS_PREFIX + titleUrl;
+  const cached = await readCache<Episode[]>(cacheKey, A3RB_EPS_TTL);
+  if (cached) return cached;
+  const detail = await scrapeAnime3rbTitlePage(titleUrl).catch(() => null);
+  const eps: Episode[] = (detail?.episodes || []).map((e) => ({
+    title: e.title, number: e.number, type: e.type, screenshot: e.screenshot, href: e.href,
+  }));
+  if (eps.length > 0) void writeCache(cacheKey, eps);
+  return eps;
 }
 
 /* ── downloads ──────────────────────────────────

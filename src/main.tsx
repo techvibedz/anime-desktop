@@ -1,6 +1,7 @@
 import ReactDOM from "react-dom/client";
 import { HashRouter } from "react-router-dom";
 import App from "./App";
+import { AutoReloadErrorBoundary } from "./components/AutoReloadErrorBoundary";
 import { AuthProvider } from "./lib/auth";
 import "./global.css";
 
@@ -11,8 +12,10 @@ import "./global.css";
 // removes the visible flicker on Watch.tsx.
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <HashRouter>
-    <AuthProvider>
-      <App />
-    </AuthProvider>
+    <AutoReloadErrorBoundary>
+      <AuthProvider>
+        <App />
+      </AuthProvider>
+    </AutoReloadErrorBoundary>
   </HashRouter>,
 );

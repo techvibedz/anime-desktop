@@ -1,7 +1,8 @@
-// Poster grid/rail cell shared by the Seasons, Upcoming and Popular screens and
-// the home SourceRail. Matches AnimeCard's visual language (2:3 poster, gradient
-// scrim, accent badges). Ported from the mobile app (components/CatalogCard.tsx).
+// Poster grid/rail cell shared by the Seasons, Upcoming and Popular screens.
+// Matches AnimeCard's visual language (clean 2:3 poster, title below, green
+// hover ring). Ported from the mobile app (components/CatalogCard.tsx).
 
+import { memo } from "react";
 import { CompletionBadge } from "./CompletionBadge";
 import { t } from "../lib/i18n";
 
@@ -10,13 +11,13 @@ export interface CatalogCardData {
   title: string;
   image: string | null;
   score: number | null;
-  /** Small pill text pinned to the poster's bottom (e.g. air date / format). */
+  /** Small pill text pinned to the poster (e.g. air date / format). */
   badge?: string | null;
   /** Resolved source URL — when set, the card can open the detail page directly. */
   href?: string | null;
 }
 
-export function CatalogCard({
+export const CatalogCard = memo(function CatalogCard({
   item,
   onClick,
   loading,
@@ -30,25 +31,25 @@ export function CatalogCard({
 }) {
   return (
     <button type="button" onClick={onClick} className={`group block w-full text-start ${className}`}>
-      <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface">
+      <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface ring-1 ring-transparent transition-shadow duration-200 group-hover:shadow-glow group-hover:ring-accent/50">
         {item.image ? (
           <img
             src={item.image}
             alt={item.title}
-            className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+            className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.04]"
             loading="lazy"
+            decoding="async"
           />
         ) : (
           <div className="h-full w-full shimmer" />
         )}
-        <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/85 to-transparent" />
         {item.score != null && item.score > 0 && (
-          <span className="absolute end-2 top-2 flex items-center gap-0.5 rounded-md bg-black/65 px-1.5 py-0.5 text-[10px] font-bold text-amber-300 backdrop-blur-sm">
+          <span className="absolute end-2 top-2 rounded-md bg-black/70 px-1.5 py-0.5 text-[10px] font-bold text-gold">
             ★ {(item.score / 10).toFixed(1)}
           </span>
         )}
         {item.badge && (
-          <span className="absolute start-2 top-2 rounded-md bg-accent/85 px-2 py-0.5 text-[10px] font-semibold text-white backdrop-blur-sm">
+          <span className="absolute start-2 top-2 rounded-md bg-accent px-1.5 py-0.5 text-[10px] font-bold text-black">
             {item.badge}
           </span>
         )}
@@ -57,14 +58,14 @@ export function CatalogCard({
             <div className="h-7 w-7 animate-spin rounded-full border-2 border-accent border-t-transparent" />
           </div>
         )}
-        <CompletionBadge hrefs={[item.href]} titles={[item.title]} className="absolute bottom-9 end-2" />
-        <div className="absolute inset-x-0 bottom-0 p-2.5">
-          <h3 className="line-clamp-2 text-[13px] font-semibold leading-tight text-white">{item.title}</h3>
-        </div>
+        <CompletionBadge hrefs={[item.href]} titles={[item.title]} className="absolute bottom-2 end-2" />
       </div>
+      <h3 className="mt-2 line-clamp-2 text-[13px] font-semibold leading-snug text-text-secondary transition-colors group-hover:text-white">
+        {item.title}
+      </h3>
     </button>
   );
-}
+});
 
 // Tiny helper so screens can label a "no source" empty grid consistently.
 export const catalogEmpty = { title: t.seasonsEmpty, sub: t.seasonsEmptySub };

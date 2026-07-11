@@ -46,7 +46,7 @@ export function SchedulePage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="font-display text-2xl font-extrabold text-white">{t.scheduleTitle}</h1>
+      <h1 className="text-2xl font-bold text-white">{t.scheduleTitle}</h1>
 
       {!days ? (
         <Shimmer className="h-10 w-full rounded-full" />
@@ -58,7 +58,7 @@ export function SchedulePage() {
               onClick={() => setSelected(i)}
               className={`rounded-full border px-4 py-1.5 text-sm font-semibold transition ${
                 selected === i
-                  ? "border-accent bg-accent text-white shadow-glow"
+                  ? "border-accent bg-accent text-black"
                   : "border-white/10 bg-surface text-text-secondary hover:border-white/30 hover:text-white"
               }`}
             >
@@ -99,7 +99,7 @@ export function SchedulePage() {
                 </p>
               </div>
               {it.score != null && it.score > 0 && (
-                <span className="shrink-0 rounded-md bg-black/40 px-2 py-0.5 text-xs font-bold text-amber-300">★ {(it.score / 10).toFixed(1)}</span>
+                <span className="shrink-0 rounded-md bg-black/40 px-2 py-0.5 text-xs font-bold text-gold">★ {(it.score / 10).toFixed(1)}</span>
               )}
             </button>
           ))}

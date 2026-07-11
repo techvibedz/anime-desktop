@@ -512,7 +512,7 @@ function provider(url) {
   url = (url || '').toLowerCase();
   if (/mp4upload/.test(url)) return 'mp4upload';
   if (/dailymotion|dai\\.ly/.test(url)) return 'dailymotion';
-  if (/streamwish|hlswish|wishembed|wishfast|hgcloud|jwembed|vibuxer|audinifer|masukestin|hanerix/.test(url)) return 'streamwish';
+  if (/streamwish|hlswish|wishembed|wishfast|hgcloud|jwembed|vibuxer|audinifer|masukestin|hanerix|playerwish/.test(url)) return 'streamwish';
   if (/voe\\./.test(url)) return 'voe';
   if (/share4max|megamax/.test(url)) return 'share4max';
   if (/rubyvidhub|streamruby|rubystm|ruby/.test(url)) return 'streamruby';
@@ -521,6 +521,8 @@ function provider(url) {
   if (/ok\\.ru/.test(url)) return 'okru';
   if (/videa\\.|vidvaita|vidit/.test(url)) return 'videa';
   if (/vk\\.com/.test(url)) return 'vk';
+  if (/luluvdo|lulustream|luluvid/.test(url)) return 'luluvdo';
+  if (/yonaplay/.test(url)) return 'yonaplay';
   return 'generic';
 }
 function badIframe(src) {

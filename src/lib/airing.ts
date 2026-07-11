@@ -19,6 +19,8 @@ const QUERY = `query ($search: String) {
     media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
       title { romaji english native }
       synonyms
+      status
+      episodes
       nextAiringEpisode { airingAt episode }
     }
   }
@@ -92,6 +94,24 @@ function pickAiring(cands: any[], queries: string[]): NextAiring | null {
   return null;
 }
 
+function rankedCandidates(cands: any[], queries: string[]): any[] {
+  const ranked = cands.map((c) => ({ c, s: titleScore(c, queries) })).sort((a, b) => b.s - a.s);
+  const good = ranked.filter((x) => x.s >= 500);
+  return (good.length ? good : ranked).map((x) => x.c);
+}
+
+function pickFinished(cands: any[], queries: string[], lastKnownEp?: number | null): boolean | null {
+  for (const c of rankedCandidates(cands, queries)) {
+    if (validAiring(c.nextAiringEpisode) || c.status === "RELEASING") return false;
+    if (c.status === "FINISHED") {
+      const total = typeof c.episodes === "number" ? c.episodes : null;
+      if (total && lastKnownEp && lastKnownEp < total) return false;
+      return true;
+    }
+  }
+  return null;
+}
+
 async function search(s: string): Promise<any[]> {
   const json = await anilistPost({ search: s.trim() });
   return json?.data?.Page?.media || [];
@@ -118,4 +138,18 @@ export async function fetchNextAiring(title: string): Promise<NextAiring | null>
   }
   try { await storage.setItem(CACHE_PREFIX + key, JSON.stringify({ ts: Date.now(), data: pick })); } catch {}
   return pick;
+}
+
+/** True only when AniList explicitly says the matching series is finished. */
+export async function fetchSeriesFinished(title: string, lastKnownEp?: number | null): Promise<boolean> {
+  if (!title || !title.trim()) return false;
+  const base = baseTitle(title);
+  const queries = [norm(title), norm(base)].filter(Boolean);
+  let pick = pickFinished(await search(title), queries, lastKnownEp);
+  if (pick != null) return pick;
+  if (base && base !== title.trim().toLowerCase()) {
+    pick = pickFinished(await search(base), queries, lastKnownEp);
+    if (pick != null) return pick;
+  }
+  return false;
 }

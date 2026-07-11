@@ -163,6 +163,31 @@ export const ar = {
 
   // Watch — episode list sidebar
   allEpisodes: "كل الحلقات",
+
+  // Watch Party — "شاهد معاً"
+  wpTitle: "المشاهدة المشتركة",
+  wpSub: "أنشئ غرفة وشاهد الأنمي مع أصدقائك في نفس اللحظة.",
+  wpCreate: "إنشاء غرفة",
+  wpCreating: "جارٍ الإنشاء…",
+  wpJoin: "انضمام",
+  wpJoinPlaceholder: "أدخل رمز الغرفة",
+  wpRoomCode: "رمز الغرفة",
+  wpShareHint: "شارك هذا الرمز مع أصدقائك لينضموا.",
+  wpWaiting: "بانتظار انضمام الأصدقاء…",
+  wpInRoom: (n: number) => `${n} في الغرفة`,
+  wpHost: "المضيف",
+  wpYou: "أنت",
+  wpHostPicking: "بانتظار أن يختار المضيف حلقة…",
+  wpStartWatching: "ابدأ المشاهدة",
+  wpStartWatchingHint: "افتح أي حلقة الآن لبثها إلى ضيوفك.",
+  wpLeave: "مغادرة الغرفة",
+  wpLeaveParty: "إنهاء المشاركة",
+  wpInvalidCode: "رمز غير صالح",
+  wpSignInRequired: "سجّل الدخول لاستخدام المشاهدة المشتركة.",
+  wpHostPaused: "أوقف المضيف التشغيل",
+  wpHostPlaying: "يتحكم المضيف بالتشغيل",
+  wpFollowing: "تتابع المضيف",
+  wpPartyBtn: "شاهد معاً",
 };
 
 export const t = ar;

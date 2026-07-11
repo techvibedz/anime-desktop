@@ -7,7 +7,7 @@ import {
 import { addFavorite, removeFavorite, favoriteListOf, type FavoriteList } from "../lib/favorites";
 import { getCompletedSets, isEpisodeWatched, animeTitleKey, normHref, toggleWatched, type CompletedSets } from "../lib/history";
 import { recordAnimeCompletion } from "../lib/completion";
-import { fetchNextAiring } from "../lib/airing";
+import { fetchSeriesFinished } from "../lib/airing";
 import { Shimmer } from "../components/Shimmer";
 import { t } from "../lib/i18n";
 
@@ -106,6 +106,27 @@ export function AnimeDetailPage() {
     return { maxNum: mx, caughtUp: isEpisodeWatched(completed, { hrefs: lastHrefs, epNum: mx, animeTitle: data.title }) };
   }, [data, episodes4up, completed]);
 
+  // Displayed episode list = the primary source's episodes UNION the anime4up
+  // episodes it's missing. anime4up frequently uploads newer episodes before
+  // witanime/anime3rb, so rendering only `data.episodes` left the latest ones
+  // hidden ("not full episodes"). Merge by number, keep ascending order (the
+  // scrapers already sort ascending), and let anime4up-only episodes carry their
+  // own href/screenshot so they open + resolve servers like any other.
+  const displayEpisodes = useMemo(() => {
+    if (!data) return [] as Episode[];
+    const byNum = new Map<number, Episode>();
+    const noNum: Episode[] = [];
+    for (const e of data.episodes) {
+      if (e.number != null) { if (!byNum.has(e.number)) byNum.set(e.number, e); }
+      else noNum.push(e);
+    }
+    for (const e of episodes4up) {
+      if (e.number != null && !byNum.has(e.number)) byNum.set(e.number, e);
+    }
+    const merged = [...byNum.values()].sort((a, b) => (a.number ?? 0) - (b.number ?? 0));
+    return [...merged, ...noNum];
+  }, [data, episodes4up]);
+
   // The set of episode numbers watched for THIS anime (cross-source), resolved
   // ONCE instead of re-deriving the title key (NFKD + regex) inside every card.
   const watchedNumbers = useMemo(
@@ -117,15 +138,14 @@ export function AnimeDetailPage() {
     if (!data || !animeHref || maxNum === 0) return;
     let cancelled = false;
     (async () => {
-      let airing = false;
-      try { airing = !!(await fetchNextAiring(data.title)); } catch {}
+      const finished = caughtUp ? await fetchSeriesFinished(data.title, maxNum) : false;
       if (cancelled) return;
       await recordAnimeCompletion({
         hrefs: [animeHref, merged?.anime4up],
         titles: [data.title],
         lastEpNum: maxNum,
         caughtUp,
-        finished: caughtUp && !airing,
+        finished,
       }).catch(() => {});
     })();
     return () => { cancelled = true; };
@@ -134,13 +154,13 @@ export function AnimeDetailPage() {
   if (loading) {
     const provisionalTitle = titleFromSlug(animeHref);
     return (
-      <div className="space-y-6">
-        <div className="relative h-[400px] w-full overflow-hidden rounded-2xl bg-surface">
+      <div className="space-y-8">
+        <div className="relative -mx-8 -mt-7 h-[440px] overflow-hidden">
           <div className="shimmer absolute inset-0" />
-          <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-bg via-bg/60 to-transparent p-8 lg:p-12">
-            <p className="text-xs font-bold uppercase tracking-[0.2em] text-accent">{t.loading}</p>
+          <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-bg via-bg/60 to-transparent px-8 pb-8 pt-24">
+            <p className="text-xs font-semibold text-accent">{t.loading}</p>
             {provisionalTitle && (
-              <h1 className="mt-2 font-display text-3xl font-extrabold leading-tight text-white lg:text-4xl">
+              <h1 className="mt-2 text-3xl font-bold leading-tight text-white lg:text-4xl">
                 {provisionalTitle}
               </h1>
             )}
@@ -154,77 +174,76 @@ export function AnimeDetailPage() {
     );
   }
   if (error || !data) {
-    return <p className="text-center text-accent">{error ?? t.notFound}</p>;
+    return <p className="py-20 text-center text-text-secondary">{error ?? t.notFound}</p>;
   }
 
   return (
-    <div className="space-y-8">
-      <div className="relative overflow-hidden rounded-2xl">
-        <div className="relative h-[400px] w-full">
-          {data.banner && (
-            <img src={data.banner} alt="" className="h-full w-full object-cover" />
+    <div className="space-y-10">
+      {/* Full-bleed backdrop — the artwork owns the top of the screen */}
+      <div className="relative -mx-8 -mt-7">
+        <div className="relative h-[440px] w-full overflow-hidden">
+          {(data.banner || data.poster) && (
+            <img
+              src={data.banner || data.poster || ""}
+              alt=""
+              className="h-full w-full scale-105 object-cover blur-[2px]"
+            />
           )}
-          <div className="absolute inset-0 bg-gradient-to-t from-bg via-bg/60 to-bg/30" />
-          <div className="absolute inset-0 bg-gradient-to-r from-bg via-bg/40 to-transparent" />
+          <div className="absolute inset-0 bg-gradient-to-t from-bg via-bg/55 to-bg/20" />
+          <div className="absolute inset-0 bg-gradient-to-l from-bg/85 via-bg/30 to-transparent" />
         </div>
-        <div className="absolute inset-0 flex items-end p-8 lg:p-12">
-          <div className="flex flex-col gap-6 lg:flex-row lg:items-end">
-            {data.poster && (
-              <img
-                src={data.poster}
-                alt={data.title}
-                className="h-60 w-40 flex-shrink-0 rounded-lg object-cover shadow-card"
-              />
-            )}
-            <div className="flex flex-col gap-3">
-              <h1 className="font-display text-4xl font-extrabold leading-tight text-white lg:text-5xl">
-                {data.title}
-              </h1>
-              {data.genres.length > 0 && (
-                <div className="flex flex-wrap gap-1.5">
-                  {data.genres.map((g) => (
-                    <span key={g} className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[11px] text-white/80">
-                      {g}
-                    </span>
-                  ))}
-                </div>
-              )}
-              <p className="max-w-2xl text-sm leading-relaxed text-text-secondary line-clamp-4">
-                {data.synopsis}
-              </p>
-              <div className="flex flex-wrap items-center gap-3">
-                {bookmarkList ? (
-                  <button
-                    onClick={onUnbookmark}
-                    className="flex items-center gap-2 rounded-full bg-accent px-5 py-2 text-sm font-semibold text-white shadow-glow"
-                  >
-                    ♥ {t.saved} ({bookmarkList === "watching" ? t.currentlyWatching : t.planToWatch})
-                  </button>
-                ) : (
-                  <button
-                    onClick={() => setPickerOpen(true)}
-                    className="flex items-center gap-2 rounded-full border border-white/15 bg-surface px-5 py-2 text-sm font-semibold text-white hover:border-accent"
-                  >
-                    ♡ {t.addToList}
-                  </button>
-                )}
-                {merged?.anime4up && (
-                  <span className="rounded-full border border-violet/40 bg-violet/10 px-3 py-1 text-[11px] font-semibold text-violet">
-                    {t.bothSources}
-                  </span>
-                )}
+        <div className="absolute inset-x-0 bottom-0 flex items-end gap-6 px-8 pb-6">
+          {data.poster && (
+            <img
+              src={data.poster}
+              alt={data.title}
+              className="hidden h-64 w-44 flex-shrink-0 rounded-xl object-cover shadow-card md:block"
+            />
+          )}
+          <div className="flex min-w-0 flex-col gap-3 pb-1">
+            <h1 className="text-3xl font-bold leading-tight text-white lg:text-5xl">
+              {data.title}
+            </h1>
+            {data.genres.length > 0 && (
+              <div className="flex flex-wrap gap-x-3 gap-y-1">
+                {data.genres.map((g) => (
+                  <span key={g} className="text-xs font-medium text-text-secondary">{g}</span>
+                ))}
               </div>
+            )}
+            <p className="line-clamp-3 max-w-[65ch] text-sm leading-relaxed text-text-secondary">
+              {data.synopsis}
+            </p>
+            <div className="flex flex-wrap items-center gap-3">
+              {bookmarkList ? (
+                <button
+                  onClick={onUnbookmark}
+                  className="flex items-center gap-2 rounded-full bg-accent px-5 py-2.5 text-sm font-bold text-black transition-colors hover:bg-accent-bright"
+                >
+                  ♥ {t.saved} ({bookmarkList === "watching" ? t.currentlyWatching : t.planToWatch})
+                </button>
+              ) : (
+                <button
+                  onClick={() => setPickerOpen(true)}
+                  className="flex items-center gap-2 rounded-full border border-white/15 bg-black/40 px-5 py-2.5 text-sm font-bold text-white transition-colors hover:border-accent hover:text-accent"
+                >
+                  ♡ {t.addToList}
+                </button>
+              )}
+              {merged?.anime4up && (
+                <span className="rounded-full bg-violet/20 px-3 py-1 text-[11px] font-semibold text-white">
+                  {t.bothSources}
+                </span>
+              )}
             </div>
           </div>
         </div>
       </div>
 
-      <section className="space-y-3">
-        <div className="flex items-end justify-between">
-          <h2 className="font-display text-2xl font-bold">{t.episodes} ({data.episodes.length})</h2>
-        </div>
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8">
-          {data.episodes.map((ep) => {
+      <section className="space-y-4">
+        <h2 className="text-xl font-bold text-white">{t.episodes} ({displayEpisodes.length})</h2>
+        <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4 lg:grid-cols-8">
+          {displayEpisodes.map((ep) => {
             // Cheap per-card check (no NFKD): href membership OR the precomputed
             // cross-source episode-number set.
             const isDone =
@@ -232,7 +251,7 @@ export function AnimeDetailPage() {
               (ep.number != null && !!watchedNumbers?.has(ep.number));
             const up4 = pickUp4ForEpisode(ep, episodes4up);
             return (
-              <div key={ep.href ?? `e${ep.number}`} className="relative">
+              <div key={ep.href ?? `e${ep.number}`} className="group relative">
                 <Link
                   to={(() => {
                     const params = new URLSearchParams();
@@ -242,26 +261,26 @@ export function AnimeDetailPage() {
                     const q = params.toString();
                     return `/watch/${encodeURIComponent(ep.href ?? "")}${q ? `?${q}` : ""}`;
                   })()}
-                  className={`group relative block aspect-video overflow-hidden rounded-md border ${
-                    isDone ? "border-violet/40 opacity-70" : "border-white/10 hover:border-accent"
-                  } bg-surface`}
+                  className={`relative block aspect-video overflow-hidden rounded-lg bg-surface ring-1 transition ${
+                    isDone ? "opacity-60 ring-accent/40" : "ring-white/5 hover:ring-accent/60"
+                  }`}
                 >
                   {ep.screenshot ? (
-                    <img src={ep.screenshot} alt="" className="h-full w-full object-contain bg-black" />
+                    <img src={ep.screenshot} alt="" loading="lazy" decoding="async" className="h-full w-full object-cover" />
                   ) : (
-                    <div className="h-full w-full bg-gradient-to-br from-surface to-bg" />
+                    <div className="h-full w-full bg-gradient-to-br from-raised to-surface" />
                   )}
-                  <div className="absolute inset-0 bg-gradient-to-t from-black/85 to-transparent" />
-                  <div className="absolute inset-x-1 bottom-1 flex items-center justify-between">
-                    <span className="rounded bg-black/60 px-1.5 py-0.5 text-[11px] font-bold">
+                  <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent" />
+                  <div className="absolute inset-x-1.5 bottom-1.5 flex items-center justify-between">
+                    <span className="rounded bg-black/60 px-1.5 py-0.5 text-[11px] font-bold text-white">
                       {t.episode} {ep.number}
                     </span>
-                    {isDone && <span className="rounded bg-violet px-1.5 py-0.5 text-[10px] font-bold">✓</span>}
+                    {isDone && <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-bold text-black">✓</span>}
                   </div>
                 </Link>
                 <button
                   onClick={() => onToggleWatched(ep)}
-                  className="absolute end-1 top-1 hidden h-6 w-6 items-center justify-center rounded-full bg-black/70 text-[11px] text-white hover:bg-accent group-hover:flex"
+                  className="absolute end-1.5 top-1.5 hidden h-6 w-6 items-center justify-center rounded-full bg-black/70 text-[11px] text-white transition-colors hover:bg-accent hover:text-black group-hover:flex"
                   title={isDone ? "Mark unwatched" : "Mark watched"}
                 >
                   {isDone ? "↶" : "✓"}
@@ -276,7 +295,7 @@ export function AnimeDetailPage() {
           overflow-hidden doesn't clip it. */}
       {pickerOpen && (
         <div
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 backdrop-blur-sm"
+          className="fixed inset-0 z-modal flex items-center justify-center bg-black/75"
           onClick={() => setPickerOpen(false)}
         >
           <div
@@ -284,13 +303,13 @@ export function AnimeDetailPage() {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="border-b border-white/5 px-5 py-4">
-              <h3 className="font-display text-base font-bold text-white">{t.addToList}</h3>
+              <h3 className="text-base font-bold text-white">{t.addToList}</h3>
               <p className="mt-0.5 line-clamp-1 text-xs text-text-secondary">{data.title}</p>
             </div>
             <div className="space-y-1 p-2">
               <button
                 onClick={() => onBookmark("watching")}
-                className="flex w-full items-center gap-3 rounded-lg px-3 py-3 text-start hover:bg-white/5"
+                className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-start transition-colors hover:bg-white/5"
               >
                 <span className="flex h-9 w-9 items-center justify-center rounded-full bg-accent/15 text-accent">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
@@ -302,9 +321,9 @@ export function AnimeDetailPage() {
               </button>
               <button
                 onClick={() => onBookmark("planned")}
-                className="flex w-full items-center gap-3 rounded-lg px-3 py-3 text-start hover:bg-white/5"
+                className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-start transition-colors hover:bg-white/5"
               >
-                <span className="flex h-9 w-9 items-center justify-center rounded-full bg-violet/15 text-violet">
+                <span className="flex h-9 w-9 items-center justify-center rounded-full bg-violet/20 text-white">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M19 4h-1V2h-2v2H8V2H6v2H5c-1.11 0-1.99.9-1.99 2L3 20a2 2 0 002 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 16H5V10h14v10zM9 14H7v-2h2v2zm4 0h-2v-2h2v2zm4 0h-2v-2h2v2z" /></svg>
                 </span>
                 <span className="flex-1">
@@ -315,7 +334,7 @@ export function AnimeDetailPage() {
             </div>
             <button
               onClick={() => setPickerOpen(false)}
-              className="block w-full border-t border-white/5 py-3 text-sm text-text-muted hover:text-white"
+              className="block w-full border-t border-white/5 py-3 text-sm text-text-muted transition-colors hover:text-white"
             >
               {t.cancel}
             </button>
@@ -339,13 +358,5 @@ function titleFromSlug(href: string): string {
 
 function pickUp4ForEpisode(ep: Episode, up4: Episode[]): string | null {
   if (!up4.length) return null;
-  console.info(`[anime-detail] matching witanime ep ${ep.number} (${ep.title}) against ${up4.length} anime4up episodes`);
-  const match = up4.find((u) => u.number === ep.number);
-  if (match) {
-    console.info(`[anime-detail] matched to anime4up ep ${match.number} (${match.title}) → ${match.href}`);
-  } else {
-    console.warn(`[anime-detail] no match found for episode ${ep.number}`);
-    console.info(`[anime-detail] available anime4up episodes:`, up4.map(u => ({ num: u.number, title: u.title })));
-  }
-  return match?.href ?? null;
+  return up4.find((u) => u.number === ep.number)?.href ?? null;
 }

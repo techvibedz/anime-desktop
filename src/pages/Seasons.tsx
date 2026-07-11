@@ -42,7 +42,7 @@ export function SeasonsPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="font-display text-2xl font-extrabold text-white">{t.seasonsTitle}</h1>
+      <h1 className="text-2xl font-bold text-white">{t.seasonsTitle}</h1>
 
       {/* Season selector */}
       <div className="flex flex-wrap gap-2">
@@ -52,7 +52,7 @@ export function SeasonsPage() {
             onClick={() => setSelected(i)}
             className={`rounded-full border px-4 py-1.5 text-sm font-semibold transition ${
               selected === i
-                ? "border-accent bg-accent text-white shadow-glow"
+                ? "border-accent bg-accent text-black"
                 : "border-white/10 bg-surface text-text-secondary hover:border-white/30 hover:text-white"
             }`}
           >

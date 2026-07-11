@@ -53,7 +53,7 @@ export function UpcomingPage() {
   return (
     <div className="space-y-5">
       <div>
-        <h1 className="font-display text-2xl font-extrabold text-white">{t.upcomingTitle}</h1>
+        <h1 className="text-2xl font-bold text-white">{t.upcomingTitle}</h1>
         <p className="mt-1 text-sm text-text-muted">{t.upcomingSub}</p>
       </div>
 
@@ -64,7 +64,7 @@ export function UpcomingPage() {
             onClick={() => setSort(m)}
             className={`rounded-full border px-4 py-1.5 text-sm font-semibold transition ${
               sort === m
-                ? "border-accent bg-accent text-white shadow-glow"
+                ? "border-accent bg-accent text-black"
                 : "border-white/10 bg-surface text-text-secondary hover:border-white/30 hover:text-white"
             }`}
           >

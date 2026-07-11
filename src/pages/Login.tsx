@@ -31,37 +31,45 @@ export function LoginPage() {
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-bg p-6">
-      <form onSubmit={submit} className="w-full max-w-sm space-y-4 rounded-2xl border border-white/10 bg-surface p-8">
+      <form onSubmit={submit} className="w-full max-w-sm space-y-5 rounded-2xl border border-white/10 bg-surface p-8 shadow-card">
         <div className="text-center">
-          <h1 className="font-display text-3xl font-extrabold text-white">{t.appName}</h1>
-          <p className="mt-1 text-sm text-text-secondary">{t.welcomeBack}</p>
+          <img src="/logo.png" alt="" className="mx-auto h-14 w-14 rounded-2xl" />
+          <h1 className="mt-3 text-2xl font-bold text-white">{t.welcomeBack}</h1>
+          <p className="mt-1 text-sm text-text-secondary">{t.loginSub}</p>
         </div>
-        <input
-          type="email" required value={email} onChange={(e) => setEmail(e.target.value)}
-          placeholder={t.email}
-          className="w-full rounded-md border border-white/10 bg-bg px-3 py-2.5 text-sm focus:border-accent focus:outline-none"
-        />
-        <input
-          type="password" required value={password} onChange={(e) => setPassword(e.target.value)}
-          placeholder={t.password}
-          className="w-full rounded-md border border-white/10 bg-bg px-3 py-2.5 text-sm focus:border-accent focus:outline-none"
-        />
-        {(err || authError) && <p className="text-sm text-accent">{err || authError}</p>}
+        <div className="space-y-3">
+          <input
+            type="email" required value={email} onChange={(e) => setEmail(e.target.value)}
+            placeholder={t.email}
+            className="w-full rounded-xl border border-white/10 bg-bg px-4 py-3 text-sm text-white placeholder:text-text-muted focus:border-accent focus:outline-none"
+          />
+          <input
+            type="password" required value={password} onChange={(e) => setPassword(e.target.value)}
+            placeholder={t.password}
+            className="w-full rounded-xl border border-white/10 bg-bg px-4 py-3 text-sm text-white placeholder:text-text-muted focus:border-accent focus:outline-none"
+          />
+        </div>
+        {(err || authError) && <p className="text-sm text-red-400">{err || authError}</p>}
         <button
           type="submit" disabled={busy}
-          className="w-full rounded-md bg-accent py-2.5 text-sm font-semibold text-white shadow-glow disabled:opacity-50"
+          className="w-full rounded-full bg-accent py-3 text-sm font-bold text-black transition-colors hover:bg-accent-bright disabled:opacity-50"
         >
           {busy ? t.loading : t.signIn}
         </button>
+        <div className="flex items-center gap-3">
+          <span className="h-px flex-1 bg-white/10" />
+          <span className="text-xs text-text-muted">{t.or}</span>
+          <span className="h-px flex-1 bg-white/10" />
+        </div>
         <button
           type="button" onClick={() => signInWithGoogle()}
-          className="w-full rounded-md border border-white/10 bg-bg py-2.5 text-sm font-medium text-white hover:bg-white/5"
+          className="w-full rounded-full border border-white/10 bg-white/5 py-3 text-sm font-medium text-white transition-colors hover:bg-white/10"
         >
           {t.continueWithGoogle}
         </button>
         <p className="text-center text-xs text-text-muted">
           {t.noAccount}{" "}
-          <Link to="/register" className="text-accent hover:underline">{t.createAccount}</Link>
+          <Link to="/register" className="font-semibold text-accent hover:text-accent-bright">{t.createAccount}</Link>
         </p>
       </form>
     </div>

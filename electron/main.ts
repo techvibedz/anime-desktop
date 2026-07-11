@@ -496,6 +496,14 @@ function rewriteM3U8(text: string, baseUrl: string, referer: string): string {
 // a fresh capture during a re-extract cycle.
 const inFlightProxyTargets = new Set<string>();
 
+// The embed-page origin (e.g. https://hgcloud.to) of the stream the renderer
+// is currently playing DIRECTLY (hls.js, no proxy). streamwish-family CDNs
+// whitelist the Referer of the embed mirror that minted the token, and that
+// mirror rotates across domains — so the renderer hands us the live embed
+// origin per stream (setVideoReferer IPC) and onBeforeSendHeaders stamps it as
+// the Referer on the direct manifest/segment XHRs. null when nothing direct.
+let currentDirectEmbedOrigin: string | null = null;
+
 /**
  * Hit Dailymotion's public metadata endpoint and return the master HLS
  * URL. Skipping the iframe means no ad break, no autoplay games, and
@@ -954,6 +962,11 @@ async function extractViaHtml(
         },
         redirect: "follow",
         cache: "no-store",
+        // Fail fast on dead/blocked mirrors. Without this a streamwish CDN
+        // that TCP-times-out (ERR_CONNECTION_TIMED_OUT) hangs ~2min on the
+        // Chromium socket-connect default before we fall through to the
+        // headless-capture fallback — 8s is plenty for a reachable embed.
+        signal: AbortSignal.timeout(8000),
       });
       if (!resp.ok) {
         console.info(`[${label}] static GET ${pageUrl} → ${resp.status}`);
@@ -1236,8 +1249,18 @@ async function extractMp4upload(
 // Tokens expire in ~40 minutes, which is why extraction happens at play time
 // (the resolve cache is 90s) rather than when the server list is built.
 async function extractVid3rb(
-  playerUrl: string,
+  playerUrlWithHint: string,
 ): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+  // An optional `#vid3rb=<res>` fragment (added by scrapeAnime3rbEpisodeServers
+  // when it enumerates per-quality servers) selects a specific quality; without
+  // one we take the highest. The fragment never reaches the network — strip it.
+  let desiredRes = 0;
+  let playerUrl = playerUrlWithHint;
+  const hashIdx = playerUrlWithHint.indexOf("#vid3rb=");
+  if (hashIdx >= 0) {
+    desiredRes = parseInt(playerUrlWithHint.slice(hashIdx + "#vid3rb=".length), 10) || 0;
+    playerUrl = playerUrlWithHint.slice(0, hashIdx);
+  }
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
     try {
@@ -1263,11 +1286,17 @@ async function extractVid3rb(
       if (!m) { console.warn("[extractVid3rb] no video_sources in player HTML"); continue; }
       let sources: { src?: string; res?: string; label?: string; premium?: boolean }[] = [];
       try { sources = JSON.parse(m[1]); } catch { continue; }
-      const best = sources
+      const free = sources
         .filter((s) => s.src && /^https?:\/\//.test(s.src) && !s.premium)
-        .sort((a, b) => (parseInt(b.res || "0", 10) || 0) - (parseInt(a.res || "0", 10) || 0))[0];
-      if (!best?.src) { console.warn("[extractVid3rb] no playable (non-premium) source"); return null; }
-      console.info(`[extractVid3rb] ${best.label || best.res || "?"} → ${best.src}`);
+        .map((s) => ({ src: s.src as string, res: parseInt(s.res || "0", 10) || 0, label: s.label }))
+        .sort((a, b) => b.res - a.res); // highest first
+      if (free.length === 0) { console.warn("[extractVid3rb] no playable (non-premium) source"); return null; }
+      // Pick the requested quality (exact → closest at-or-below → highest).
+      const best =
+        (desiredRes > 0 &&
+          (free.find((s) => s.res === desiredRes) || free.find((s) => s.res > 0 && s.res <= desiredRes))) ||
+        free[0];
+      console.info(`[extractVid3rb] ${best.label || best.res || "?"}p → ${best.src}`);
       return { url: best.src, type: /\.m3u8(\?|$)/i.test(best.src) ? "hls" : "mp4" };
     } catch (e) {
       console.warn(`[extractVid3rb] fetch failed (try ${attempt + 1}):`, e);
@@ -1929,14 +1958,22 @@ app.whenReady().then(() => {
   // iframes. The cross-source anime4up/anime3rb fetches go through net.fetch
   // (see pantoufa:fetch-html), which rides this same resolver.
   //
-  // 'automatic' (not 'secure') keeps the system resolver as a fallback when
-  // DoH itself is unreachable, so this can only ever help: a network that
-  // already worked keeps working, a network that blocks the anime domains now
-  // resolves them over HTTPS. Pairs with the QUIC disable above (same goal:
-  // surviving restrictive ISPs).
+  // 'secure' (not 'automatic'): use ONLY the DoH servers, never the system
+  // resolver. 'automatic' keeps the ISP resolver as a fallback, and that
+  // fallback is the bug — on a DNS-blocking ISP the blocked hostnames don't
+  // NXDOMAIN, they TIME OUT (measured: nslookup vibuxer.com / hanerix.com →
+  // "DNS request timed out", while 1.1.1.1 resolves them fine). In automatic
+  // mode Chromium stalls on that timing-out resolver instead of cleanly
+  // failing over, so a video CDN's manifest may squeak through but its many
+  // per-segment lookups hang → hls.js fragLoadTimeOut → the server looks dead.
+  // 'secure' skips the poisoned resolver entirely so streamwish (vibuxer/
+  // hanerix) segments actually load. Tradeoff: a network that blocks the DoH
+  // ENDPOINTS themselves (rare — captive portals) would lose all resolution;
+  // that's the correct failure for this threat model, and any user who can
+  // currently reach the anime sites at all is already reaching DoH.
   try {
     app.configureHostResolver({
-      secureDnsMode: "automatic",
+      secureDnsMode: "secure",
       secureDnsServers: [
         "https://cloudflare-dns.com/dns-query",
         "https://dns.google/dns-query",
@@ -1992,14 +2029,44 @@ app.whenReady().then(() => {
     // video CDN hosts only — universal injection breaks Google
     // Fonts, analytics, and other third-party assets.
     const host = (() => { try { return new URL(details.url).hostname.toLowerCase(); } catch { return ""; } })();
-    const isVideoCdn = /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix|mp4upload|voe|dood|uqload|share4max|megamax|dailymotion|dmcdn/.test(host);
     const isSupabase = host.includes("supabase.co");
-    if (isVideoCdn || isSupabase) {
+    // A streamed manifest/segment/key OR an explicit media request on any
+    // non-ad host counts as a video CDN — this catches streamwish's rotating
+    // mirrors without matching the app's own fonts/analytics/script assets.
+    const looksLikeStream =
+      /\.(m3u8|ts|m4s|mp4|key)(\?|#|$)/i.test(details.url) ||
+      (details as any).resourceType === "media";
+    const isVideoCdn =
+      /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix|mp4upload|voe|dood|uqload|share4max|megamax|dailymotion|dmcdn/.test(host) ||
+      (looksLikeStream && host.includes(".") && !AD_HOST_RE.test(host) && !isSupabase);
+    if (isSupabase) {
       const origin = (() => {
         try { return new URL(details.referrer || "").origin; } catch { return "*"; }
       })();
       headers["access-control-allow-origin"] = [origin];
       headers["access-control-allow-credentials"] = ["true"];
+    } else if (isVideoCdn) {
+      // Drop any ACAO the CDN itself sent (any casing) so we don't emit a
+      // conflicting duplicate.
+      for (const k of Object.keys(headers)) {
+        const lk = k.toLowerCase();
+        if (lk === "access-control-allow-origin" || lk === "access-control-allow-credentials") delete headers[k];
+      }
+      if (inFlightProxyTargets.has(details.url)) {
+        // Main-process proxy fetch (credentials:"include") — needs an exact
+        // origin + allow-credentials mirrored from the request referrer.
+        const origin = (() => {
+          try { return new URL(details.referrer || "").origin; } catch { return "*"; }
+        })();
+        headers["access-control-allow-origin"] = [origin];
+        headers["access-control-allow-credentials"] = ["true"];
+      } else {
+        // Renderer direct hls.js XHR (withCredentials=false) — wildcard, because
+        // the browser's CORS check compares the response against the APP's real
+        // origin (http://localhost in dev, "null" from file:// when packaged),
+        // never the forged embed Referer. * is only valid without credentials.
+        headers["access-control-allow-origin"] = ["*"];
+      }
     }
     cb({ responseHeaders: headers });
   });
@@ -2117,9 +2184,16 @@ app.whenReady().then(() => {
       }
       try {
         const host = new URL(details.url).hostname.toLowerCase();
-        const hasReferer = Object.keys(hdrs).some(
-          (k) => k.toLowerCase() === "referer",
-        );
+        const existingRef = (() => {
+          const k = Object.keys(hdrs).find((kk) => kk.toLowerCase() === "referer");
+          return k ? String(hdrs[k]) : "";
+        })();
+        const hasReferer = !!existingRef;
+        // hls.js XHR/fetch from our own app page always carries the app's own
+        // Referer (http://localhost:5173/ in dev, file:// packaged). CDNs 403
+        // that, so treat an app-origin Referer as if it were absent and force
+        // the provider-canonical value in its place (the direct-play path).
+        const appOriginRef = /^(https?:\/\/localhost|https?:\/\/127\.0\.0\.1|file:)/i.test(existingRef);
         let ref = "";
         let ori = "";
         // `force` = override the Referer even if the request already carries
@@ -2137,8 +2211,17 @@ app.whenReady().then(() => {
           ori = "https://www.mp4upload.com";
           force = true;
         } else if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(host)) {
-          ref = "https://streamwish.to/";
-          ori = "https://streamwish.to";
+          // streamwish rotates the embed mirror that mints the token, and its
+          // CDN whitelists THAT mirror's Referer — not a fixed streamwish.to.
+          // The renderer hands us the live embed origin (setVideoReferer) for
+          // the stream it's playing direct; prefer it, fall back to the literal.
+          if (currentDirectEmbedOrigin) {
+            ref = currentDirectEmbedOrigin + "/";
+            ori = currentDirectEmbedOrigin;
+          } else {
+            ref = "https://streamwish.to/";
+            ori = "https://streamwish.to";
+          }
         } else if (/voe\./.test(host)) {
           ref = "https://voe.sx/";
           ori = "https://voe.sx";
@@ -2161,6 +2244,29 @@ app.whenReady().then(() => {
           // Force it (the request inherits the app's file://-/localhost Referer)
           // and send NO Origin — a cross-origin Origin trips the same check.
           ref = "https://anime3rb.com/";
+          ori = "";
+          force = true;
+        } else if (/images\.anime3rb\.com/.test(host) || /^anime3rb\.com$/.test(host)) {
+          // anime3rb's poster CDN (images.anime3rb.com) hotlink-checks the
+          // Referer: it 403s the app's file:///localhost Referer but serves
+          // 200 with the anime3rb.com site Referer (or none). The search
+          // screen's <img> tags inherit the renderer's file:// origin, so
+          // without forcing https://anime3rb.com/ here every anime3rb card
+          // poster is rejected and the card renders image-less. Force it
+          // and send NO Origin — a cross-origin Origin trips the same check.
+          ref = "https://anime3rb.com/";
+          ori = "";
+          force = true;
+        } else if (/anime4up/.test(host)) {
+          // anime4up's poster CDN (w1.anime4up.rest/wp-content) hotlink-checks
+          // the Referer: it 403s the app's dev localhost Referer but serves 200
+          // with an anime4up site Referer (or none). Only witanime posters skip
+          // this check, so Home (witanime-primary) looks fine while search —
+          // which surfaces anime4up cards up front — renders them image-less.
+          // Force the site Referer and send NO Origin (mirrors the anime3rb
+          // poster branch). Only the renderer's <img> posters hit this session;
+          // page scrapes go through the main-process fetch path.
+          ref = "https://w1.anime4up.rest/";
           ori = "";
           force = true;
         } else if (/videa|vidvaita|vidit/.test(host)) {
@@ -2195,8 +2301,12 @@ app.whenReady().then(() => {
             ori = `https://${root}`;
           }
         }
-        if (ref && (force || !hasReferer)) {
-          if (force) {
+        // Replace when a branch forces it, when there's no Referer at all, OR
+        // when the only Referer is our own app origin (the direct-play XHR case
+        // — a real CDN 403s a localhost/file Referer).
+        const replaceExisting = force || appOriginRef;
+        if (ref && (replaceExisting || !hasReferer)) {
+          if (replaceExisting) {
             // Drop any inherited Referer/Origin (any casing) first so we don't
             // emit a duplicate header — Chromium may have set "Referer" while
             // we'd add "referer", and the CDN could read the wrong one.
@@ -2461,7 +2571,11 @@ app.whenReady().then(() => {
   });
 
   // Kept for backwards compatibility; no-op now that we proxy.
-  ipcMain.handle("pantoufa:set-video-referer", () => true);
+  ipcMain.handle("pantoufa:set-video-referer", (_e, embedUrl: string | null) => {
+    try { currentDirectEmbedOrigin = embedUrl ? new URL(embedUrl).origin : null; }
+    catch { currentDirectEmbedOrigin = null; }
+    return true;
+  });
 
   // Track which iframe the renderer is currently watching so did-fail-load
   // can ignore sub-resource failures (ad iframes inside embed pages) and

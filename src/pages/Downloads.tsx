@@ -38,7 +38,7 @@ export function DownloadsPage() {
   return (
     <div className="space-y-5">
       <div className="flex items-baseline justify-between">
-        <h1 className="font-display text-2xl font-extrabold text-white">{t.downloadsTitle}</h1>
+        <h1 className="text-2xl font-bold text-white">{t.downloadsTitle}</h1>
         {totalBytes > 0 && <span className="text-xs text-text-muted">{t.storageUsed(formatBytes(totalBytes))}</span>}
       </div>
 
@@ -66,7 +66,7 @@ export function DownloadsPage() {
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 {it.status === "completed" && (
-                  <button onClick={() => setPlaying(it)} title={t.playDownload} className="rounded-full bg-accent px-3 py-1.5 text-xs font-bold text-white shadow-glow hover:bg-accent/80">
+                  <button onClick={() => setPlaying(it)} title={t.playDownload} className="rounded-full bg-accent px-3 py-1.5 text-xs font-bold text-black transition-colors hover:bg-accent-bright">
                     {t.playDownload}
                   </button>
                 )}

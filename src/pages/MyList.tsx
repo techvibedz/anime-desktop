@@ -27,14 +27,14 @@ export function MyListPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="font-display text-3xl font-extrabold">{t.myListTitle}</h1>
-      <div className="flex gap-2 border-b border-white/10">
+      <h1 className="text-3xl font-bold">{t.myListTitle}</h1>
+      <div className="flex gap-1 border-b border-white/10">
         {TABS.map((tabDef) => (
           <button
             key={tabDef.id}
             onClick={() => setTab(tabDef.id)}
-            className={`relative px-4 py-2.5 text-sm font-semibold transition ${
-              tab === tabDef.id ? "text-white" : "text-text-muted hover:text-white"
+            className={`relative px-4 py-2.5 text-sm font-semibold transition-colors ${
+              tab === tabDef.id ? "text-accent" : "text-text-muted hover:text-white"
             }`}
           >
             {tabDef.label}
@@ -54,7 +54,7 @@ export function MyListPage() {
       ) : filtered && filtered.length === 0 ? (
         <Empty msg={t.emptyList} />
       ) : (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
           {filtered!.map((f) => (
             <FavRow key={f.href} fav={f} onRemove={async () => { await removeFavorite(f.href); reload(); }} />
           ))}
@@ -68,18 +68,27 @@ function FavRow({ fav, onRemove }: { fav: FavoriteAnime; onRemove: () => void })
   return (
     <div className="group relative">
       <Link to={`/anime/${encodeURIComponent(fav.href)}`} className="block">
-        <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface">
-          {fav.image && <img src={fav.image} alt={fav.title} className="h-full w-full object-cover" />}
-          <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/90 to-transparent" />
-          <CompletionBadge hrefs={[fav.href]} titles={[fav.title]} className="absolute bottom-9 end-2" />
-          <div className="absolute inset-x-0 bottom-0 p-2.5">
-            <h3 className="line-clamp-2 text-[13px] font-semibold leading-tight text-white">{fav.title}</h3>
-          </div>
+        <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface ring-1 ring-transparent transition-shadow duration-200 group-hover:shadow-glow group-hover:ring-accent/50">
+          {fav.image ? (
+            <img
+              src={fav.image}
+              alt={fav.title}
+              className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.04]"
+              loading="lazy"
+              decoding="async"
+            />
+          ) : (
+            <div className="h-full w-full shimmer" />
+          )}
+          <CompletionBadge hrefs={[fav.href]} titles={[fav.title]} className="absolute bottom-2 end-2" />
         </div>
+        <h3 className="mt-2 line-clamp-2 text-[13px] font-semibold leading-snug text-text-secondary transition-colors group-hover:text-white">
+          {fav.title}
+        </h3>
       </Link>
       <button
         onClick={onRemove}
-        className="absolute end-2 top-2 hidden h-7 w-7 items-center justify-center rounded-full bg-black/70 text-white group-hover:flex hover:bg-accent"
+        className="absolute end-2 top-2 hidden h-7 w-7 items-center justify-center rounded-full bg-black/70 text-white transition-colors hover:bg-red-600 group-hover:flex"
         title={t.remove}
       >
         ×
@@ -100,13 +109,13 @@ function HistoryRow({ entry }: { entry: WatchEntry }) {
   return (
     <Link
       to={`/watch/${encodeURIComponent(entry.episodeHref)}${qs ? `?${qs}` : ""}`}
-      className="group flex items-center gap-3 rounded-lg border border-white/5 bg-surface p-2 hover:border-accent/40"
+      className="group flex items-center gap-3 rounded-xl bg-surface p-2 ring-1 ring-white/5 transition hover:ring-accent/50"
     >
-      <div className="relative h-16 w-28 flex-shrink-0 overflow-hidden rounded bg-bg">
+      <div className="relative h-16 w-28 flex-shrink-0 overflow-hidden rounded-lg bg-bg">
         {entry.image ? (
-          <img src={entry.image} alt="" className="h-full w-full object-cover" />
+          <img src={entry.image} alt="" className="h-full w-full object-cover" loading="lazy" decoding="async" />
         ) : (
-          <div className="flex h-full w-full items-center justify-center bg-surface">
+          <div className="flex h-full w-full items-center justify-center bg-raised">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-text-muted">
               <path d="M15.5 2H8.6c-2 0-3.2 1.1-3.5 3-.3 1.9-.3 3.7 0 5.5.3 1.9 1.5 3 3.5 3h6.9c2 0 3.2-1.1 3.5-3 .3-1.8.3-3.6 0-5.5-.3-1.9-1.5-3-3.5-3Z" />
               <path d="M16 10.5a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
@@ -115,16 +124,16 @@ function HistoryRow({ entry }: { entry: WatchEntry }) {
           </div>
         )}
         {num != null && (
-          <span className="absolute end-1 top-1 rounded bg-accent px-1.5 py-0.5 text-[10px] font-bold leading-none text-white shadow-glow">
+          <span className="absolute end-1 top-1 rounded bg-accent px-1.5 py-0.5 text-[10px] font-bold leading-none text-black">
             {t.episode} {num}
           </span>
         )}
-        <div className="absolute inset-x-0 bottom-0 h-1 bg-white/10">
+        <div className="absolute inset-x-0 bottom-0 h-1 bg-black/50">
           <div className="h-full bg-accent" style={{ width: `${done ? 100 : pct}%` }} />
         </div>
       </div>
       <div className="min-w-0 flex-1">
-        <p className="line-clamp-1 text-[11px] font-bold uppercase tracking-wider text-accent">{entry.animeTitle}</p>
+        <p className="line-clamp-1 text-[11px] font-bold text-accent">{entry.animeTitle}</p>
         <p className="line-clamp-1 text-sm font-semibold text-white">{entry.episodeTitle}</p>
         <p className="text-xs text-text-muted">{done ? t.watched : t.progressPercent(pct)}</p>
       </div>
@@ -134,7 +143,7 @@ function HistoryRow({ entry }: { entry: WatchEntry }) {
 
 function Empty({ msg }: { msg: string }) {
   return (
-    <div className="rounded-2xl border border-dashed border-white/10 bg-surface/50 p-10 text-center">
+    <div className="rounded-2xl border border-dashed border-white/10 p-12 text-center">
       <p className="text-text-secondary">{msg}</p>
     </div>
   );

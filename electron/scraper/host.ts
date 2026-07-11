@@ -298,6 +298,19 @@ async function runJob(slotIdx: number, p: Pending) {
     }
   } finally {
     activeJobs.delete(win.webContents.id);
+    // Video extraction leaves the hidden window sitting on a live embed: the
+    // captured <video> keeps buffering the whole file and ad scripts keep
+    // looping in the background. Across a long session the 3 slots pile up
+    // these leftover downloads, starving bandwidth/CPU — the main player
+    // "buffers forever" and later extractions time out, so only the first
+    // server worked until an app restart. Halt the leftover page. This is a
+    // POST-job cleanup, NOT the pre-job about:blank prefix that broke
+    // connectivity (removed above): the next job's loadURL is a fresh nav that
+    // supersedes this blank.
+    if (p.job.isVideoJob && !win.isDestroyed()) {
+      try { win.webContents.stop(); } catch {}
+      win.loadURL("about:blank").catch(() => {});
+    }
     slot.busy = false;
     pendingBySlot[slotIdx] = null;
     beltScripts[slotIdx] = null;

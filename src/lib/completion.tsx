@@ -12,8 +12,8 @@
 
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { storage } from "./storage";
-import { animeTitleKey, getCompletedSets, type CompletedSets } from "./history";
-import { fetchNextAiring } from "./airing";
+import { normAnimeKey, animeTitleKey, getCompletedSets, type CompletedSets } from "./history";
+import { fetchSeriesFinished } from "./airing";
 import { supabase, isSupabaseConfigured } from "./supabase";
 
 const KEY = "anime_completion_v2";
@@ -28,14 +28,6 @@ export interface AnimeCompletion {
   updatedAt: number;
 }
 
-function normHref(u: string | null | undefined): string {
-  if (!u) return "";
-  try { return decodeURIComponent(u).replace(/\/+$/, "").toLowerCase(); }
-  catch { return u.replace(/\/+$/, "").toLowerCase(); }
-}
-function titleKey(s: string | null | undefined): string {
-  return (s || "").toLowerCase().replace(/\s+/g, " ").trim();
-}
 function uniq(arr: (string | null | undefined)[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -96,7 +88,10 @@ export async function recordAnimeCompletion(rec: {
 }): Promise<void> {
   const hrefs = uniq(rec.hrefs);
   const titles = uniq(rec.titles);
-  const key = normHref(hrefs[0]) || titleKey(titles[0]);
+  // ponytail: TLD-stable key. Records written under the old full-URL scheme keep
+  // resolving via buildLookup (it re-indexes hrefs by normAnimeKey), so badges
+  // still show; a stale old-key record may briefly co-exist until it's re-written.
+  const key = normAnimeKey(hrefs[0]) || animeTitleKey(titles[0]);
   if (!key) return;
   const map = await getCompletionMap();
   const prev = map[key];
@@ -259,17 +254,14 @@ export async function recordEpisodeWatched(opts: {
   if (opts.epNum < rec.lastEpNum) return; // not the latest available episode
   if (rec.caughtUp && rec.finished) return; // already fully marked
 
-  // Finale is out when AniList reports no upcoming episode. A network miss
-  // defaults to "finished" — an anime watched to its last available episode is
-  // overwhelmingly a completed series (mirrors the detail page's default).
-  let airing = false;
-  try { airing = !!(await fetchNextAiring(opts.animeTitle || rec.titles[0] || "")); } catch {}
+  let finished = false;
+  try { finished = await fetchSeriesFinished(opts.animeTitle || rec.titles[0] || "", rec.lastEpNum || opts.epNum); } catch {}
 
   const next: AnimeCompletion = {
     ...rec,
     lastEpNum: Math.max(rec.lastEpNum, opts.epNum),
     caughtUp: true,
-    finished: !airing,
+    finished,
     updatedAt: Date.now(),
   };
   if (next.caughtUp === rec.caughtUp && next.finished === rec.finished && next.lastEpNum === rec.lastEpNum) return;
@@ -293,19 +285,22 @@ export interface CompletionLookup {
 function buildLookup(map: Record<string, AnimeCompletion>): CompletionLookup {
   const byHref = new Map<string, AnimeCompletion>();
   const byTitle = new Map<string, AnimeCompletion>();
+  // Index by the TLD-stable anime key + decoration-folded title so a badge
+  // resolves regardless of which rotating witanime TLD (.life/.you) or which
+  // source's decorated title a card carries vs. what was recorded.
   for (const rec of Object.values(map)) {
-    for (const h of rec.hrefs) byHref.set(normHref(h), rec);
-    for (const tt of rec.titles) byTitle.set(titleKey(tt), rec);
+    for (const h of rec.hrefs) byHref.set(normAnimeKey(h), rec);
+    for (const tt of rec.titles) byTitle.set(animeTitleKey(tt), rec);
   }
   return {
     byHref,
     byTitle,
     get({ hrefs, titles }) {
       for (const h of hrefs || []) {
-        if (h) { const r = byHref.get(normHref(h)); if (r) return r; }
+        if (h) { const r = byHref.get(normAnimeKey(h)); if (r) return r; }
       }
       for (const tt of titles || []) {
-        if (tt) { const r = byTitle.get(titleKey(tt)); if (r) return r; }
+        if (tt) { const r = byTitle.get(animeTitleKey(tt)); if (r) return r; }
       }
       return null;
     },

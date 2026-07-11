@@ -4,20 +4,20 @@
 
 html, body, #root { height: 100%; margin: 0; }
 body {
-  background: #06071A;
-  color: #FFFFFF;
-  font-family: "DM Sans", system-ui, sans-serif;
+  font-family: "IBM Plex Sans Arabic", system-ui, sans-serif;
   overflow-x: hidden;
 }
 
-/* Scrollbars */
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-track { background: #06071A; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 8px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.16); }
+h1, h2, h3 { text-wrap: balance; }
 
-/* Display font helper */
-.font-display { font-family: "Outfit", system-ui, sans-serif; }
+/* Scrollbars — quiet, on the black canvas */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.10); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.20); }
+
+/* Legacy helper — one family system-wide; weight carries hierarchy */
+.font-display { font-family: "IBM Plex Sans Arabic", system-ui, sans-serif; }
 
 /* Shimmer keyframes */
 @keyframes shimmer {
@@ -25,17 +25,9 @@ body {
   100% { background-position: 400px 0; }
 }
 .shimmer {
-  background: linear-gradient(90deg, #0E1028 0%, #1a1d40 50%, #0E1028 100%);
+  background: linear-gradient(90deg, oklch(14.5% 0.004 113) 0%, oklch(20% 0.006 113) 50%, oklch(14.5% 0.004 113) 100%);
   background-size: 800px 100%;
   animation: shimmer 1.4s infinite linear;
-}
-
-/* Glass blur card */
-.glass {
-  background: rgba(14,16,40,0.65);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(255,255,255,0.06);
 }
 
 .no-drag { -webkit-app-region: no-drag; }
@@ -44,6 +36,13 @@ body {
 a { color: inherit; text-decoration: none; }
 button { font-family: inherit; }
 
+/* Keyboard focus — visible ring in the brand green, no ring on mouse click */
+:focus-visible {
+  outline: 2px solid oklch(80% 0.17 113 / 0.8);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
 /* Hide native scrollbars on horizontal carousels */
 .scroll-x {
   overflow-x: auto;
@@ -51,3 +50,19 @@ button { font-family: inherit; }
   -webkit-overflow-scrolling: touch;
 }
 .scroll-x::-webkit-scrollbar { display: none; }
+
+/* Long home pages: skip layout/paint for offscreen rails */
+.lazy-section {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 320px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .shimmer { animation: none; }
+}

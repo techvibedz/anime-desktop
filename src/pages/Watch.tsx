@@ -4,6 +4,7 @@ import Hls from "hls.js";
 import {
   fetchVideoServers, enrichServersFromUp4, resolveVideo, fetchEpisodes, fetchEpisodesUp4,
   resolveUp4EpisodeUrl, fetchAnime3rbServers,
+  isDefinitiveMiss, clearDefinitiveMiss,
   invalidateServersCache, invalidateResolveCache,
   type VideoServer, type Episode,
 } from "../lib/api";
@@ -15,6 +16,8 @@ import {
   type DownloadStatus,
 } from "../lib/downloads";
 import { t } from "../lib/i18n";
+import { useAuth } from "../lib/auth";
+import { useWatchPartySync, createRoom } from "../lib/watchParty";
 
 type ServerWithSource = VideoServer & { source?: string };
 
@@ -36,6 +39,17 @@ const PROVIDER_RANK: Record<string, number> = {
   uqload: 8, okru: 9, yonaplay: 10, vk: 11,
 };
 function rank(p: string) { return PROVIDER_RANK[p] ?? 50; }
+
+// Carries the measured bandwidth across hls.js instances so a server switch /
+// next episode starts at a rendition the link can actually sustain instead of
+// re-probing from the optimistic default (which over-picks on slow links and
+// shows up as "keeps loading" until ABR catches up).
+let lastBandwidthEstimate = 0;
+
+// "Anime3rb 1080p" → 1080; 0 when the name carries no resolution.
+function resOf(name: string): number {
+  return parseInt(name.match(/(\d{3,4})p/i)?.[1] || "0", 10);
+}
 
 // Providers we can re-extract cheaply. If extraction returns an iframe
 // fallback for one of these, it was almost certainly a transient miss, so we
@@ -210,6 +224,35 @@ export function WatchPage() {
   const [skipIntroVisible, setSkipIntroVisible] = useState(false);
   const skipHideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reextractUsedRef = useRef(false);
+  // True while the user has deliberately paused. The stall-recovery handler
+  // uses it to avoid force-resuming a pause the user actually wanted (a pause
+  // aborts the media fetch, which fires `stalled`).
+  const userPausedRef = useRef(false);
+
+  // ── WATCH PARTY ──
+  // Sync this player with a room. Host broadcasts its <video> state on a
+  // heartbeat; client follows it (see lib/watchParty). Inert when not in a room.
+  const { user } = useAuth();
+  const [partyPanelOpen, setPartyPanelOpen] = useState(false);
+  const autoStart = params.get("auto") === "1";
+  // Query params re-broadcast so a client can reopen the SAME episode.
+  const partyNavParams = useMemo<Record<string, string>>(() => {
+    const p: Record<string, string> = {};
+    if (up4Param) p.up4 = up4Param;
+    if (imgParam) p.img = imgParam;
+    if (animeParam) p.anime = animeParam;
+    return p;
+  }, [up4Param, imgParam, animeParam]);
+  const party = useWatchPartySync({ videoRef, episode: episodeUrl, navParams: partyNavParams });
+  const isPartyClient = party.role === "client";
+  // Read through a ref so the control handlers can see the live role.
+  const partyClientRef = useRef(false);
+  useEffect(() => { partyClientRef.current = isPartyClient; }, [isPartyClient]);
+  const startParty = useCallback(() => {
+    if (!user) return;
+    createRoom(user).catch(() => {});
+    setPartyPanelOpen(true);
+  }, [user]);
 
   const sortedServers = useMemo(
     () => [...servers]
@@ -401,6 +444,12 @@ export function WatchPage() {
     // resolves or the deadline passes.
     const scheduleRetry = () => {
       if (cancelled) return;
+      // A definitive "this episode isn't on anime4up" verdict won't change on a
+      // retry — stop instead of hammering to the deadline.
+      if (isDefinitiveMiss("anime4up", title, currentEpNumber)) {
+        console.info(`[player] anime4up has no ep ${currentEpNumber} for "${title}" — stopping retries`);
+        return;
+      }
       if (Date.now() - directUp4StartedAtRef.current > DIRECT_UP4_DEADLINE_MS) {
         console.warn(`[player] direct anime4up resolution gave up after ${attempt} attempts`);
         return;
@@ -465,6 +514,10 @@ export function WatchPage() {
   // the re-scrape is genuinely fresh rather than replaying the cached list.
   const refreshServers = useCallback(() => {
     invalidateServersCache(episodeUrl);
+    // Wipe any "definitively absent" verdict so a manual refresh genuinely
+    // re-queries anime4up/anime3rb instead of short-circuiting on the miss.
+    const rt = meta.animeTitle || animeTitleFromDetail || slugTitle;
+    if (rt) clearDefinitiveMiss(rt);
     enrichAttemptsRef.current = 0;
     enrichStartedAtRef.current = 0;
     enrichInFlightRef.current = false;
@@ -479,7 +532,7 @@ export function WatchPage() {
     directUp4StartedAtRef.current = 0;
     if (directUp4RetryTimer.current) { clearTimeout(directUp4RetryTimer.current); directUp4RetryTimer.current = null; }
     setRetryServersNonce((n) => n + 1);
-  }, [episodeUrl]);
+  }, [episodeUrl, meta.animeTitle, animeTitleFromDetail, slugTitle]);
 
   // Merge anime4up servers once an anime4up URL is known (explicit ?up4=
   // or resolved cross-source). Runs CONCURRENTLY with the primary witanime
@@ -631,6 +684,12 @@ export function WatchPage() {
     console.info(`[player] resolving anime3rb servers for "${title}" ep ${currentEpNumber} (attempt ${attempt})`);
     const scheduleRetry = () => {
       if (leftEpisode()) return;
+      // Title proven absent from anime3rb this session — retrying only re-probes
+      // slugs that tarpit the site. Stop.
+      if (isDefinitiveMiss("anime3rb", title)) {
+        console.info(`[player] anime3rb has no match for "${title}" — stopping retries`);
+        return;
+      }
       if (Date.now() - a3rbStartedAtRef.current > A3RB_RETRY_DEADLINE_MS) {
         console.warn(`[player] anime3rb enrichment gave up after ${attempt} attempts`);
         return;
@@ -702,6 +761,39 @@ export function WatchPage() {
     iframeFailedRef.current = false;
     setIframeLoaded(false);
   }, []);
+
+  // Slow-connection quality step-down. The anime3rb qualities are separate
+  // servers over fixed-bitrate progressive MP4s — no ABR exists, so when the
+  // connection is slower than the file's bitrate the stream rebuffers forever
+  // and the only real fix is the lower-quality sibling (1080p → 720p → 480p).
+  // Returns false when there's nothing to step down to (non-vid3rb server,
+  // already lowest, sibling broken). stepDownSeekRef carries the exact
+  // position across the switch (saved progress only lands every 10s).
+  const stepDownSeekRef = useRef(0);
+  const stepDownQuality = useCallback((): boolean => {
+    if (activeIdx === null) return false;
+    const cur = sortedServers[activeIdx];
+    if (!cur || cur.provider !== "vid3rb") return false;
+    const curRes = resOf(cur.name);
+    if (!curRes) return false;
+    let best = -1, bestRes = 0;
+    sortedServers.forEach((s, i) => {
+      if (s.provider !== "vid3rb" || brokenIds.has(s.id)) return;
+      const r = resOf(s.name);
+      if (r > 0 && r < curRes && r > bestRes) { best = i; bestRes = r; }
+    });
+    if (best === -1) return false;
+    console.warn(`[player] ${cur.name} keeps rebuffering — stepping down to ${sortedServers[best].name}`);
+    stepDownSeekRef.current = videoRef.current?.currentTime || 0;
+    activateServer(best);
+    return true;
+  }, [activeIdx, sortedServers, brokenIds, activateServer]);
+
+  // Auto-activate for party clients (auto=1) and autoplay hops — skip the
+  // click-to-start gate so the client plays immediately and syncs to the host.
+  useEffect(() => {
+    if (autoStart && !userActivated && activeIdx !== null) activateServer(activeIdx);
+  }, [autoStart, userActivated, activeIdx, activateServer]);
 
   const advanceToNext = useCallback(() => {
     if (activeIdx === null) return;
@@ -911,6 +1003,9 @@ export function WatchPage() {
     // Reset re-extract gate for the new stream — covers both HLS and
     // mp4 paths so the second error path also has a recovery shot.
     reextractUsedRef.current = false;
+    // A fresh stream starts un-paused-by-user; clear any stale pause intent so
+    // stall recovery works on the new source.
+    userPausedRef.current = false;
 
     let played = false;
     let advanced = false;
@@ -920,23 +1015,51 @@ export function WatchPage() {
     // before we give up on the server (see checkStall).
     let inPlaceRecoveries = 0;
     const MAX_INPLACE_RECOVERIES = 2;
+    // Cumulative stall count for THIS stream — unlike inPlaceRecoveries it is
+    // never reset by a brief resume, so the slow-connection stutter loop
+    // (play 5s → stall 15s → recover → …) can't grind forever: on the 3rd
+    // stall we step down to the lower anime3rb quality instead.
+    let totalMidStreamStalls = 0;
     // Absolute wall clock for initial load. Even if `progress` events
     // keep firing (slow CDN dripping bytes), we still hard-advance once
     // this elapses without `playing` firing. Without this the player
     // could buffer forever on a half-working stream.
-    const loadStartedAt = Date.now();
+    let loadStartedAt = Date.now();
     const INITIAL_LOAD_DEADLINE_MS = 22000;
+    // Track buffered-end growth so a slow-but-alive link isn't yanked to
+    // another (equally slow) server mid-download. On bad internet the 22s
+    // hard-deadline used to fire while bytes were still flowing → endless
+    // server roulette. We only give up on initial load if the deadline passed
+    // AND the buffer hasn't grown for STALL_THRESHOLD_MS (stream truly dead).
+    let lastBufferedEnd = 0;
+    let lastBufferGrowthAt = Date.now();
 
     const checkStall = () => {
       if (advanced) return;
       const now = Date.now();
       const isInitialLoading = !played && !v.paused;
       const isBufferingMidStream = played && !v.paused && !v.ended && v.currentTime === lastTime;
+      // Initial-load-never-started, INDEPENDENT of v.paused. With autoPlay, a
+      // <video> whose CDN delivers zero fragments never leaves paused (playback
+      // can't begin with no data), so `isInitialLoading` (which requires
+      // !v.paused) stays false and the watchdog goes inert while hls.js grinds
+      // its whole retry budget — a dead streamwish CDN (fragLoadTimeOut loop)
+      // "buffers for minutes then fails". The buffer-growth guard below is the
+      // real safety: it only fires when NOTHING loaded, so decoupling the
+      // deadline from paused can't yank a slow-but-working (buffer-growing) or
+      // a genuinely user-paused-mid-buffer stream.
+      const neverStarted = !played;
 
-      if (isInitialLoading && now - loadStartedAt > INITIAL_LOAD_DEADLINE_MS) {
+      try {
+        const be = v.buffered.length ? v.buffered.end(v.buffered.length - 1) : 0;
+        if (be > lastBufferedEnd + 0.01) { lastBufferedEnd = be; lastBufferGrowthAt = now; }
+      } catch {}
+
+      if (neverStarted && now - loadStartedAt > INITIAL_LOAD_DEADLINE_MS
+          && now - lastBufferGrowthAt > STALL_THRESHOLD_MS) {
         advanced = true;
-        console.warn(`[player] Initial load exceeded ${INITIAL_LOAD_DEADLINE_MS}ms — advancing`);
-        advanceToNext();
+        console.warn(`[player] Initial load exceeded ${INITIAL_LOAD_DEADLINE_MS}ms with no buffer growth — advancing`);
+        triggerReextract(`${resolved.type.toUpperCase()} initial load timed out`);
         return;
       }
 
@@ -950,19 +1073,46 @@ export function WatchPage() {
           // The signed URL is still valid (tokens live ~40 min), so reload
           // the SAME source in place and seek back instead of yanking the
           // user to a different server — vid3rb's "keeps loading" symptom.
-          if (isBufferingMidStream && resolved.type !== "hls" && inPlaceRecoveries < MAX_INPLACE_RECOVERIES) {
+          // HLS gets the same courtesy: the 15s watchdog used to fire while
+          // hls.js was still inside its own frag retry budget (30s timeout ×
+          // 5 retries), so one transient CDN drop yanked the server. Kick
+          // the loader and nudge past a possible buffer gap instead.
+          // Repeated mid-stream stalls = the link can't sustain this bitrate.
+          // In-place reloads can't fix that; a lower quality can.
+          if (isBufferingMidStream && ++totalMidStreamStalls >= 3 && stepDownQuality()) {
+            advanced = true;
+            return;
+          }
+          if (isBufferingMidStream && inPlaceRecoveries < MAX_INPLACE_RECOVERIES) {
             inPlaceRecoveries++;
             const pos = v.currentTime;
-            console.warn(`[player] mid-stream stall ${elapsed}ms — in-place reload #${inPlaceRecoveries} @ ${pos.toFixed(1)}s`);
-            try {
-              v.load();
-              v.addEventListener("loadedmetadata", () => {
-                try {
-                  if (pos > 0 && v.duration > 0 && pos < v.duration) v.currentTime = pos;
-                  v.play().catch(() => {});
-                } catch {}
-              }, { once: true });
-            } catch {}
+            if (resolved.type === "hls" && hlsRef.current) {
+              console.warn(`[player] mid-stream HLS stall ${elapsed}ms — flush + reload #${inPlaceRecoveries} @ ${pos.toFixed(1)}s`);
+              // A bare startLoad() resumes from hls.js's internal load pointer
+              // and will NOT abort a fragment request that's hung inside its
+              // 30s fragLoadTimeOut — so the stream stays frozen. stopLoad()
+              // cancels the stuck request, then startLoad(pos) forces a fresh
+              // fetch of the fragment at the playhead. This is the documented
+              // recovery for a wedged mid-stream HLS load.
+              const nudged = pos + 0.1;
+              try { hlsRef.current.stopLoad(); } catch {}
+              // Tiny forward seek jumps Chromium over a sub-100ms buffer
+              // hole hls.js's gap controller occasionally leaves behind.
+              try { v.currentTime = nudged; } catch {}
+              try { hlsRef.current.startLoad(nudged); } catch {}
+              v.play().catch(() => {});
+            } else {
+              console.warn(`[player] mid-stream stall ${elapsed}ms — in-place reload #${inPlaceRecoveries} @ ${pos.toFixed(1)}s`);
+              try {
+                v.load();
+                v.addEventListener("loadedmetadata", () => {
+                  try {
+                    if (pos > 0 && v.duration > 0 && pos < v.duration) v.currentTime = pos;
+                    v.play().catch(() => {});
+                  } catch {}
+                }, { once: true });
+              } catch {}
+            }
             lastTimeUpdate = Date.now();
             return;
           }
@@ -978,6 +1128,10 @@ export function WatchPage() {
 
     const onPlaying = () => {
       played = true;
+      // Real playback resumed — refill the in-place budget so a long episode
+      // on a flaky CDN survives more than 2 drops total. A dead stream never
+      // fires `playing`, so it still advances after 2 failed recoveries.
+      inPlaceRecoveries = 0;
       lastTime = v.currentTime;
       lastTimeUpdate = Date.now();
     };
@@ -1000,7 +1154,10 @@ export function WatchPage() {
     // timer which is the last resort). This catches transient CDN drops.
     const onStalled = () => {
       console.warn("[player] video stalled — chunk drop detected, attempting recovery");
-      if (v.paused) {
+      // Only auto-resume a stall the user didn't cause. A deliberate pause also
+      // aborts the in-flight media fetch → fires `stalled`; without this guard
+      // the recovery re-plays the video the instant the user pauses it.
+      if (v.paused && !userPausedRef.current) {
         v.play().catch(() => {});
       }
       lastTimeUpdate = Date.now();
@@ -1019,6 +1176,16 @@ export function WatchPage() {
         lowLatencyMode: false,
         startLevel: -1,
         backBufferLength: 90,
+        // These rehoster HLS packagers (streamruby .urlset etc.) leave small
+        // gaps at fragment boundaries. hls.js's default 0.1s hole tolerance
+        // freezes the playhead AT the gap even though buffered data sits right
+        // past it — the "plays the initial burst then freezes in place" stall,
+        // which otherwise sits frozen until the 15s app watchdog. Widen the
+        // jump and give the nudge more tries so hls.js steps over the hole
+        // itself, instantly, instead of stalling.
+        maxBufferHole: 0.5,
+        nudgeOffset: 0.2,
+        nudgeMaxRetry: 6,
         // Bigger forward cushion to mask the throttled anime3rb/vid3rb CDN —
         // accumulate surplus during the throttled download so a delayed or
         // dropped fragment never surfaces as a mid-stream stall. (Mirrors the
@@ -1036,19 +1203,63 @@ export function WatchPage() {
         levelLoadingMaxRetry: 3,
         levelLoadingRetryDelay: 1500,
         // Bumped fragment retries — transient CDN errors are common.
-        // 5 retries × 2s backoff = 10s of trying before declaring fatal.
-        fragLoadingTimeOut: 30000,
+        // Timeout MUST stay under the 15s stall watchdog: at 30s a wedged
+        // fragment froze playback (buffer drained) for 15s+ before hls.js
+        // even retried it, and the watchdog's recovery fired first against a
+        // still-in-flight request. 12s lets hls.js abandon + retry a stuck
+        // frag before the buffer runs dry, and 5 retries still tolerate a
+        // flaky CDN.
+        fragLoadingTimeOut: 12000,
         fragLoadingMaxRetry: 5,
         fragLoadingRetryDelay: 2000,
-        // Proxy handles cookies/Referer — renderer XHR doesn't need creds.
+        // Slow-connection ABR: seed with the bandwidth measured on the LAST
+        // stream (default estimate over-picks on slow links → long initial
+        // buffer), start loading before the play click, and demand real
+        // headroom (2× instead of the default 1.4×) before switching up so a
+        // marginal link doesn't oscillate into a rebuffer.
+        abrEwmaDefaultEstimate: lastBandwidthEstimate || 500000,
+        abrBandWidthFactor: 0.8,
+        abrBandWidthUpFactor: 0.5,
+        startFragPrefetch: true,
+        // Direct-play like mobile: hls.js fetches the raw CDN URL and the
+        // main-process onBeforeSendHeaders stamps the canonical Referer/Origin.
+        // withCredentials stays false so the CDN's wildcard CORS is accepted.
         xhrSetup: (xhr) => { xhr.withCredentials = false; },
       });
       let recoveryUsed = false;
       let mediaRecoveryCount = 0;
       let networkRecoveryCount = 0;
-      hls.loadSource(proxied);
+      // Tell main which embed mirror minted this stream's token — streamwish
+      // rotates mirrors and its CDN whitelists that mirror's Referer.
+      window.pantoufa?.setVideoReferer?.(resolved.embed);
+      // Direct first (mobile parity); fall back to the main-process proxy ONCE
+      // if the raw CDN rejects us before a single frame plays (wrong-mirror
+      // Referer / CORS). The proxy's strategy-race + cookie sharing is the
+      // safety net for the handful of providers a bare header can't satisfy.
+      let usingDirect = true;
+      let directFallbackUsed = false;
+      const fallbackToProxy = (): boolean => {
+        if (directFallbackUsed || !usingDirect) return false;
+        directFallbackUsed = true;
+        usingDirect = false;
+        console.warn("[player] direct HLS rejected — retrying via proxy");
+        loadStartedAt = Date.now();
+        lastBufferGrowthAt = Date.now();
+        lastTimeUpdate = Date.now();
+        networkRecoveryCount = 0;
+        try { hls.stopLoad(); } catch {}
+        try { hls.detachMedia(); } catch {}
+        try { hls.loadSource(proxied); } catch {}
+        try { hls.attachMedia(v); } catch {}
+        try { hls.startLoad(); } catch {}
+        return true;
+      };
+      hls.loadSource(resolved.url);
       hls.attachMedia(v);
-      hls.on(Hls.Events.FRAG_LOADED, () => { if (!played) lastTimeUpdate = Date.now(); });
+      hls.on(Hls.Events.FRAG_LOADED, () => {
+        if (!played) lastTimeUpdate = Date.now();
+        if (hls.bandwidthEstimate > 0) lastBandwidthEstimate = hls.bandwidthEstimate;
+      });
       hls.on(Hls.Events.LEVEL_LOADED, () => { if (!played) lastTimeUpdate = Date.now(); });
       hls.on(Hls.Events.MANIFEST_PARSED, () => { if (!played) lastTimeUpdate = Date.now(); });
       hls.on(Hls.Events.ERROR, (_e, data) => {
@@ -1063,11 +1274,13 @@ export function WatchPage() {
           // Skip the recovery loop — retrying a dead URL wastes ~22s.
           const nfStatus = (data.response as any)?.code;
           if (nfStatus === 410 || nfStatus === 403 || nfStatus === 401) {
+            if (!played && fallbackToProxy()) return;
             triggerReextract(`HLS auth error ${nfStatus} (non-fatal)`);
             return;
           }
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
             networkRecoveryCount++;
+            if (!played && data.details === Hls.ErrorDetails.FRAG_LOAD_TIMEOUT && fallbackToProxy()) return;
             if (networkRecoveryCount <= 8) {
               console.warn(`[player] non-fatal network ${data.details}, startLoad #${networkRecoveryCount}`);
               try { hls.startLoad(); } catch {}
@@ -1093,6 +1306,7 @@ export function WatchPage() {
         // Proxy returned 410/403/401 → signed URL expired or rejected.
         const status = (data.response as any)?.code;
         if (status === 410 || status === 403 || status === 401) {
+          if (!played && fallbackToProxy()) return;
           triggerReextract(`HLS auth error ${status}`);
           return;
         }
@@ -1102,13 +1316,26 @@ export function WatchPage() {
           mediaRecoveryCount++;
           if (mediaRecoveryCount <= 3) {
             console.warn(`[player] media error (${data.details}), recoverMediaError #${mediaRecoveryCount}`);
+            // "Failed to send audio packet for decoding" recurring across
+            // recoveries = audio-codec mismatch in the init segment (HE-AAC
+            // declared as AAC-LC etc. — common on these rehoster HLS packagers,
+            // e.g. streamruby .urlset). recoverMediaError alone re-appends the
+            // same broken track, so on the 2nd+ attempt swap the audio codec
+            // first (the documented hls.js recipe for this exact symptom).
+            if (mediaRecoveryCount >= 2) hls.swapAudioCodec();
             hls.recoverMediaError();
             return;
           }
+          // Media recovery genuinely exhausted — a fresh signed token can't fix
+          // undecodable content, so re-extracting is pure wasted time for
+          // decode-class failures. Advance straight to the next server.
+          advanced = true; advanceToNext();
+          return;
         }
 
         // Network errors — manifest/level load timeouts. Recover up to 2x.
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          if (!played && fallbackToProxy()) return;
           if (!recoveryUsed) {
             recoveryUsed = true;
             console.warn("[player] HLS fatal network, startLoad attempt", data.details);
@@ -1156,13 +1383,22 @@ export function WatchPage() {
 
     return () => {
       clearInterval(interval);
+      window.pantoufa?.setVideoReferer?.(null);
       v.removeEventListener("playing", onPlaying);
       v.removeEventListener("timeupdate", onTimeUpdate);
       v.removeEventListener("progress", onProgress);
       v.removeEventListener("stalled", onStalled);
+      // Chromium does NOT pause a media element just because React detached
+      // it from the DOM — a direct-src <video> (vid3rb/videa/mp4upload, the
+      // top-ranked providers) keeps playing audio in the background after the
+      // user leaves the page. Explicitly silence it. hls.destroy() handles the
+      // MediaSource detach + object-URL revocation for the HLS path itself;
+      // removeAttribute("src") (not src="") avoids load() re-fetching the page.
+      try { v.pause(); } catch {}
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
+      try { v.removeAttribute("src"); v.load(); } catch {}
     };
-  }, [resolved, advanceToNext]);
+  }, [resolved, advanceToNext, stepDownQuality]);
 
   // Resume position — wait for metadata before seeking.
   useEffect(() => {
@@ -1172,10 +1408,16 @@ export function WatchPage() {
 
     const doSeek = () => {
       if (cancelled) return;
+      // A quality step-down carries the exact in-session position — prefer it
+      // over saved progress (which only lands every 10s).
+      const stepDownPos = stepDownSeekRef.current;
+      stepDownSeekRef.current = 0;
       getProgress(episodeUrl).then((p) => {
         if (cancelled || !v) return;
-        if (!p || p.positionMs < 5000) return;
-        const target = p.positionMs / 1000;
+        const savedMs = p && p.positionMs >= 5000 ? p.positionMs : 0;
+        const targetMs = stepDownPos > 0 ? stepDownPos * 1000 : savedMs;
+        if (targetMs <= 0) return;
+        const target = targetMs / 1000;
         // Only seek if metadata is available and the target is valid.
         if (v.duration > 0 && target < v.duration) {
           try { v.currentTime = target; } catch {}
@@ -1207,13 +1449,19 @@ export function WatchPage() {
     if (!v) return;
     const onPlay = () => setIsPlaying(true);
     const onPause = () => setIsPlaying(false);
-    const onTime = () => setCurrentTime(v.currentTime);
-    const onDur = () => setDuration(v.duration || 0);
-    const onProg = () => {
+    const syncBuffered = () => {
       try {
         if (v.buffered.length > 0) setBuffered(v.buffered.end(v.buffered.length - 1));
       } catch {}
     };
+    // Refresh the buffered bar on timeupdate too: hls.js appends fragments via
+    // MSE/SourceBuffer, so the media element's `progress` event stops firing
+    // after the initial network burst and the grey bar freezes in place even
+    // though the buffer keeps growing. `timeupdate` fires continuously during
+    // playback, so reading v.buffered there keeps the bar live for HLS + MP4.
+    const onTime = () => { setCurrentTime(v.currentTime); syncBuffered(); };
+    const onDur = () => setDuration(v.duration || 0);
+    const onProg = syncBuffered;
     const onVol = () => { setVolume(v.volume); setMuted(v.muted); };
     const onRate = () => setPlaybackRate(v.playbackRate);
     v.addEventListener("play", onPlay);
@@ -1338,6 +1586,7 @@ export function WatchPage() {
   }, [siblings, episodeUrl]);
 
   const navTo = useCallback((ep: Episode) => {
+    if (partyClientRef.current) return; // host drives episode changes in a party
     if (!ep.href) return;
     // Match the anime4up sibling by episode number. Do NOT try to derive
     // the URL by slug-swapping from the current up4Param: witanime and
@@ -1385,10 +1634,13 @@ export function WatchPage() {
   }, [episodeUrl, meta, animeTitleFromDetail, currentEpNumber, imgParam, posterFromDetail, resolvedAnimeHref, effectiveUp4]);
 
   const togglePlay = useCallback(() => {
+    if (partyClientRef.current) return; // host controls playback in a party
     const v = videoRef.current; if (!v) return;
-    if (v.paused) v.play().catch(() => {}); else v.pause();
+    if (v.paused) { userPausedRef.current = false; v.play().catch(() => {}); }
+    else { userPausedRef.current = true; v.pause(); }
   }, []);
   const onSeek = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    if (partyClientRef.current) return; // host controls seeking in a party
     const v = videoRef.current; if (!v || !duration) return;
     v.currentTime = Number(e.target.value);
   }, [duration]);
@@ -1408,10 +1660,12 @@ export function WatchPage() {
     setShowRateMenu(false);
   }, []);
   const skip = useCallback((delta: number) => {
+    if (partyClientRef.current) return; // host controls seeking in a party
     const v = videoRef.current; if (!v) return;
     v.currentTime = Math.max(0, Math.min((v.duration || 0), v.currentTime + delta));
   }, []);
   const skipIntro = useCallback(() => {
+    if (partyClientRef.current) return;
     const v = videoRef.current; if (!v) return;
     const target = v.currentTime + INTRO_SKIP_SECONDS;
     v.currentTime = v.duration ? Math.min(v.duration - 1, target) : target;
@@ -1503,7 +1757,7 @@ export function WatchPage() {
       <div
         ref={playerRef}
         dir="ltr"
-        className={`group relative aspect-video w-full overflow-hidden rounded-xl border border-white/10 bg-black shadow-card ${
+        className={`group relative aspect-video w-full overflow-hidden rounded-xl bg-black shadow-card ${
           isFullscreen && resolved?.type === "iframe"
             ? "!fixed !inset-0 !z-[9999] !h-screen !w-screen !rounded-none !border-none !aspect-auto"
             : ""
@@ -1593,6 +1847,17 @@ export function WatchPage() {
                 const err = (e.target as HTMLVideoElement).error;
                 const code = err?.code;
                 console.warn(`[player] <video> error code=${code} message=${err?.message || ""}`);
+                // During HLS playback the SAME <video> element surfaces MSE
+                // failures (bufferAppendError → PIPELINE_ERROR_DECODE code=3),
+                // but hls.js already owns recovery via Hls.Events.ERROR
+                // (recoverMediaError / swapAudioCodec). Re-extracting here just
+                // double-drives it — worse, triggerReextract is single-shot per
+                // mount and wins the race, tearing down the engine before
+                // hls.js's 3x media recovery can run, and re-extract can't fix
+                // an undecodable track anyway → the streamruby spin loop. Only
+                // the direct-mp4 path (no hls engine) should re-extract here.
+                // (Element code 4 also can't occur while MSE is attached.)
+                if (hlsRef.current) return;
                 // Code 2 (MEDIA_ERR_NETWORK): proxy returned 410/403 → signed URL expired.
                 // Code 3 (MEDIA_ERR_DECODE): a transient mid-stream proxy 502 / dropped chunk
                 // often surfaces here, NOT as a true decode failure — so try one re-extract
@@ -1626,6 +1891,39 @@ export function WatchPage() {
               )}
             </div>
 
+            {/* WATCH PARTY panel — non-intrusive room overlay (members + status) */}
+            {party.role && partyPanelOpen && (
+              <div dir="rtl" className="absolute right-4 top-16 z-40 w-60 rounded-xl border border-accent/30 bg-bg/95 p-4 shadow-card backdrop-blur-md">
+                <div className="flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full bg-accent" />
+                  <span className="flex-1 text-right text-sm font-bold text-white">
+                    {party.role === "host" ? `${t.wpRoomCode}: ${party.code}` : t.wpFollowing}
+                  </span>
+                </div>
+                <p className="mt-1 text-right text-xs text-text-muted">
+                  {isPartyClient
+                    ? (party.hostPaused ? t.wpHostPaused : t.wpHostPlaying)
+                    : t.wpInRoom(party.members.length)}
+                </p>
+                <div className="mt-3 flex flex-row-reverse flex-wrap gap-1.5">
+                  {party.members.slice(0, 6).map((m) => (
+                    <div
+                      key={m.userId}
+                      className={`flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold text-white ${m.isHost ? "bg-accent" : "border border-white/10 bg-white/10"}`}
+                    >
+                      {(m.name || "?").trim().charAt(0).toUpperCase()}
+                    </div>
+                  ))}
+                </div>
+                <button
+                  onClick={() => { party.leaveParty(); setPartyPanelOpen(false); }}
+                  className="mt-3 w-full rounded-lg border border-red-500/25 bg-red-500/10 py-2 text-xs font-bold text-red-400 transition hover:bg-red-500/20"
+                >
+                  {t.wpLeaveParty}
+                </button>
+              </div>
+            )}
+
             {/* Big play overlay when paused */}
             {!isPlaying && (
               <button
@@ -1633,8 +1931,8 @@ export function WatchPage() {
                 onClick={togglePlay}
                 className="absolute inset-0 flex items-center justify-center bg-black/40 backdrop-blur-[1px] transition"
               >
-                <span className="flex h-20 w-20 items-center justify-center rounded-full bg-accent/90 shadow-glow ring-4 ring-white/10 transition duration-200 hover:scale-105">
-                  <svg width="34" height="34" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z" /></svg>
+                <span className="flex h-20 w-20 items-center justify-center rounded-full bg-accent shadow-glow transition duration-200 hover:scale-105">
+                  <svg width="34" height="34" viewBox="0 0 24 24" fill="black"><path d="M8 5v14l11-7z" /></svg>
                 </span>
               </button>
             )}
@@ -1645,7 +1943,7 @@ export function WatchPage() {
             {showSkipIntroEligible && (
               <button
                 onClick={(e) => { e.stopPropagation(); skipIntro(); }}
-                className={`group/skip absolute bottom-20 right-5 z-30 flex items-center gap-2 rounded-lg border border-white/25 bg-black/65 px-4 py-2.5 text-sm font-bold text-white shadow-card backdrop-blur-md transition-all duration-300 hover:-translate-y-0.5 hover:border-accent hover:bg-accent ${
+                className={`group/skip absolute bottom-20 right-5 z-30 flex items-center gap-2 rounded-lg border border-white/25 bg-black/65 px-4 py-2.5 text-sm font-bold text-white shadow-card backdrop-blur-md transition-all duration-300 hover:-translate-y-0.5 hover:border-accent hover:bg-accent hover:text-black ${
                   skipIntroVisible ? "opacity-100" : "opacity-0 pointer-events-none"
                 }`}
               >
@@ -1766,6 +2064,19 @@ export function WatchPage() {
                   )}
                 </div>
 
+                {/* Watch Party — create a room (host) or open the room panel */}
+                <button
+                  onClick={() => (party.role ? setPartyPanelOpen((o) => !o) : startParty())}
+                  title={t.wpPartyBtn}
+                  className={`relative rounded-lg p-2 transition hover:bg-white/15 ${party.role ? "text-accent" : ""}`}
+                >
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z" /></svg>
+                  {party.members.length > 1 && (
+                    <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-accent px-1 text-[9px] font-bold text-black">
+                      {party.members.length}
+                    </span>
+                  )}
+                </button>
                 <button onClick={toggleFs} title="Fullscreen (f)" className="rounded-lg p-2 transition hover:bg-white/15">
                   {isFullscreen ? (
                     <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z" /></svg>
@@ -1784,7 +2095,7 @@ export function WatchPage() {
                 <p className="text-sm text-red-400">Failed to load video servers.</p>
                 <button
                   onClick={() => setRetryServersNonce((n) => n + 1)}
-                  className="rounded-full bg-accent hover:bg-accent/80 text-white font-semibold text-xs px-4 py-2 transition shadow-glow"
+                  className="rounded-full bg-accent hover:bg-accent-bright text-black font-bold text-xs px-4 py-2 transition"
                 >
                   Retry Loading Servers
                 </button>
@@ -1792,7 +2103,7 @@ export function WatchPage() {
             ) : !loadingServers && activeIdx !== null && !userActivated ? (
               <button
                 onClick={() => activateServer(activeIdx)}
-                className="flex items-center gap-2 rounded-full bg-accent px-6 py-3 text-base font-bold text-white shadow-glow hover:bg-accent/80 transition"
+                className="flex items-center gap-2 rounded-full bg-accent px-6 py-3 text-base font-bold text-black shadow-glow hover:bg-accent-bright transition"
               >
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
                 {t.playNow ?? "▶ Play"}
@@ -1912,7 +2223,7 @@ export function WatchPage() {
                   }}
                   className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition ${
                     activeIdx === i
-                      ? "border-accent bg-accent text-white shadow-glow"
+                      ? "border-accent bg-accent text-black"
                       : broken
                       ? "border-white/5 bg-bg text-text-muted line-through hover:text-white"
                       : "border-white/10 bg-surface text-text-secondary hover:border-white/30 hover:text-white"
@@ -1949,7 +2260,7 @@ export function WatchPage() {
                     title={ep.title}
                     className={`rounded-md border px-2 py-2 text-center text-xs font-semibold tabular-nums transition ${
                       isCurrent
-                        ? "border-accent bg-accent text-white shadow-glow"
+                        ? "border-accent bg-accent text-black"
                         : "border-white/10 bg-surface text-text-secondary hover:border-white/30 hover:text-white"
                     }`}
                   >
