@@ -21,6 +21,8 @@ export interface DownloadItem {
   animeHref: string;
   episodeHref: string;
   url4up?: string;
+  url3rb?: string;
+  server?: DownloadMeta["server"];
   status: DownloadStatus;
   progress: number; // 0..1
   bytes: number;
@@ -36,11 +38,16 @@ export interface DownloadMeta {
   animeHref: string;
   episodeHref: string;
   url4up?: string;
+  url3rb?: string;
+  server?: { name: string; iframeUrl: string; provider: string; quality: string; videoUrl?: string };
 }
 
 const INDEX_KEY = "@downloads_index_v1";
 
 let items: DownloadItem[] | null = null;
+let loadPromise: Promise<DownloadItem[]> | null = null;
+const pending = new Set<string>();
+const operationVersions = new Map<string, number>();
 const listeners = new Set<() => void>();
 let lastEmit = 0;
 let progressWired = false;
@@ -90,19 +97,28 @@ async function persist() {
 
 async function load(): Promise<DownloadItem[]> {
   if (items) return items;
-  try {
-    const raw = await storage.getItem(INDEX_KEY);
-    const parsed: DownloadItem[] = raw ? JSON.parse(raw) : [];
-    // An in-flight download can't survive an app restart → mark it failed.
-    items = parsed.map((it) =>
-      it.status === "downloading" || it.status === "resolving"
-        ? { ...it, status: "failed" as DownloadStatus }
-        : it,
-    );
-  } catch {
-    items = [];
-  }
-  return items;
+  if (loadPromise) return loadPromise;
+  loadPromise = (async () => {
+    try {
+      const raw = await storage.getItem(INDEX_KEY);
+      const parsed: DownloadItem[] = raw ? JSON.parse(raw) : [];
+      let changed = false;
+      items = await Promise.all(parsed.map(async (it) => {
+        const file = await window.pantoufa.downloadQuery?.(it.id).catch(() => null);
+        if (file?.valid) {
+          if (it.status !== "completed" || it.totalBytes !== file.size) changed = true;
+          return { ...it, status: "completed" as DownloadStatus, progress: 1, bytes: file.size, totalBytes: file.size };
+        }
+        if (it.status !== "failed") changed = true;
+        return { ...it, status: "failed" as DownloadStatus, progress: 0 };
+      }));
+      if (changed) await persist();
+    } catch {
+      items = [];
+    }
+    return items!;
+  })().finally(() => { loadPromise = null; });
+  return loadPromise;
 }
 
 export async function getDownloads(): Promise<DownloadItem[]> {
@@ -142,10 +158,15 @@ export async function startDownload(meta: DownloadMeta): Promise<string> {
   await load();
   wireProgress();
   const id = idFor(meta.episodeHref);
+  if (pending.has(id)) return id;
 
   const existing = items!.find((x) => x.id === id);
   if (existing && existing.status === "completed") return id;
   if (existing && existing.status === "downloading") return id;
+  pending.add(id);
+  const operation = (operationVersions.get(id) ?? 0) + 1;
+  operationVersions.set(id, operation);
+  const isCurrent = () => operationVersions.get(id) === operation;
 
   const item: DownloadItem = {
     id,
@@ -156,6 +177,8 @@ export async function startDownload(meta: DownloadMeta): Promise<string> {
     animeHref: meta.animeHref,
     episodeHref: meta.episodeHref,
     url4up: meta.url4up,
+    url3rb: meta.url3rb,
+    server: meta.server,
     status: "resolving",
     progress: 0,
     bytes: 0,
@@ -170,8 +193,10 @@ export async function startDownload(meta: DownloadMeta): Promise<string> {
     const resolved = await resolveDownloadUrl({
       episodeHref: meta.episodeHref,
       url4up: meta.url4up,
+      url3rb: meta.url3rb,
       epNum: meta.epNum,
       animeTitle: meta.animeTitle,
+      server: meta.server,
     });
     if (!resolved) {
       patch(id, { status: "failed" });
@@ -179,11 +204,30 @@ export async function startDownload(meta: DownloadMeta): Promise<string> {
       emit(true);
       return id;
     }
+    if (!isCurrent()) return id;
 
-    patch(id, { status: "downloading" });
+    patch(id, { status: "downloading", server: meta.server });
+    await persist();
     emit(true);
 
-    const res = await window.pantoufa.downloadStart({ id, url: resolved.url, provider: resolved.provider });
+    let res = await window.pantoufa.downloadStart({ id, url: resolved.url, provider: resolved.provider });
+    // A picked CDN token can expire while the dialog is open or while a retry
+    // waits in the list. Refresh that exact server once before declaring the
+    // download failed; the main process removes the partial file between runs.
+    if (!res?.ok && meta.server && isCurrent()) {
+      const refreshed = await resolveDownloadUrl({
+        episodeHref: meta.episodeHref,
+        url4up: meta.url4up,
+        url3rb: meta.url3rb,
+        epNum: meta.epNum,
+        animeTitle: meta.animeTitle,
+        server: { ...meta.server, videoUrl: undefined },
+      });
+      if (refreshed) {
+        res = await window.pantoufa.downloadStart({ id, url: refreshed.url, provider: refreshed.provider });
+      }
+    }
+    if (!isCurrent()) return id;
     if (!res?.ok) {
       patch(id, { status: "failed" });
     } else {
@@ -192,9 +236,13 @@ export async function startDownload(meta: DownloadMeta): Promise<string> {
     await persist();
     emit(true);
   } catch {
-    patch(id, { status: "failed" });
-    await persist();
-    emit(true);
+    if (isCurrent()) {
+      patch(id, { status: "failed" });
+      await persist();
+      emit(true);
+    }
+  } finally {
+    if (isCurrent()) pending.delete(id);
   }
   return id;
 }
@@ -211,11 +259,15 @@ export async function retryDownload(id: string): Promise<void> {
     animeHref: it.animeHref,
     episodeHref: it.episodeHref,
     url4up: it.url4up,
+    url3rb: it.url3rb,
+    server: it.server,
   });
 }
 
 export async function deleteDownload(id: string): Promise<void> {
   await load();
+  operationVersions.set(id, (operationVersions.get(id) ?? 0) + 1);
+  pending.delete(id);
   try { await window.pantoufa.downloadDelete(id); } catch {}
   items = items!.filter((x) => x.id !== id);
   await persist();

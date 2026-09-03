@@ -3,7 +3,7 @@
   Full release pipeline — build, tag, push, and upload to GitHub.
 
 .DESCRIPTION
-  Reads version from package.json, builds Windows .exe + Linux .tar.gz,
+  Reads version from package.json, builds Windows .exe + Linux packages,
   creates a git tag, generates release notes from commits since the last tag,
   pushes everything and uploads assets to GitHub.
 
@@ -23,7 +23,7 @@
   Print every action without executing.
 
 .PARAMETER Token
-  GitHub PAT. Defaults to extracting from git remote origin URL.
+  GitHub PAT. Defaults to GH_TOKEN. Never reads credentials from git remotes.
 #>
 
 param(
@@ -49,22 +49,7 @@ if (-not $Token) {
   $Token = $env:GH_TOKEN
 }
 if (-not $Token) {
-  # 2. .env file
-  $envFile = Join-Path $RepoRoot ".env"
-  if (Test-Path $envFile) {
-    $envContent = Get-Content $envFile -Raw
-    if ($envContent -match 'GH_TOKEN=(\S+)') { $Token = $Matches[1] }
-  }
-}
-if (-not $Token) {
-  # 3. Extract from git remote (local .git/config — never committed)
-  $remote = git remote get-url origin 2>$null
-  if ($remote -match 'https://([^@]+)@github.com') {
-    $Token = $Matches[1]
-  }
-}
-if (-not $Token) {
-  throw "No GitHub token found. Set GH_TOKEN env var, add GH_TOKEN= to .env, or pass -Token"
+  throw "No GitHub token found. Set GH_TOKEN or pass -Token."
 }
 $ApiBase = "https://api.github.com/repos/techvibedz/anime-desktop"
 $ApiHeaders = @{ Authorization = "token $Token"; Accept = "application/vnd.github+json" }
@@ -92,10 +77,13 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) { throw "Windows build failed" }
   }
 
-  # Linux tar.gz (deb/AppImage need native Linux tools, tar.gz works from Windows)
-  Write-Host "  > electron-builder --linux tar.gz"
+  # AppImage creation needs real Linux symlink semantics. On Windows the local
+  # pipeline keeps producing the compatible tarball; the tag-triggered GitHub
+  # workflow builds AppImage + latest-linux.yml on Ubuntu.
+  $linuxTargets = if ($env:OS -eq "Windows_NT") { @("tar.gz") } else { @("AppImage", "tar.gz") }
+  Write-Host "  > electron-builder --linux $($linuxTargets -join ' ')"
   if (-not $DryRun) {
-    npx electron-builder --linux tar.gz --publish never
+    npx electron-builder --linux @linuxTargets --publish never
     if ($LASTEXITCODE -ne 0) { throw "Linux build failed" }
   }
 }
@@ -119,25 +107,24 @@ $Log
 | Platform | File |
 |----------|------|
 | Windows  | `Pantoufa-Setup-$Version.exe` |
-| Linux    | `Pantoufa-$Version.tar.gz` |
+| Linux    | `Pantoufa-$Version.AppImage` or `Pantoufa-$Version.tar.gz` |
 "@
 Write-Host ($Body -split "`n" | ForEach-Object { "  $_" })
 
 # ── tag & push ────────────────────────────────────────────────────────
 Write-Host "`n[3/4] Tagging & pushing…" -ForegroundColor Yellow
 if (-not $DryRun) {
-  # NOTE: do NOT `git add release/` — it's gitignored (build artifacts), and
-  # with $ErrorActionPreference="Stop" the ignored-path warning aborts the
-  # whole pipeline before tagging/pushing. Stage only tracked release files.
-  # No `2>$null` on git calls: with $ErrorActionPreference="Stop", redirecting
-  # native stderr turns ANY stderr line (e.g. the LF/CRLF warning) into a
-  # fatal NativeCommandError — unredirected stderr just prints and continues.
-  git add package.json
-  git commit -m "v$Version" --allow-empty
-  if ($LASTEXITCODE -ne 0) { Write-Host "  (nothing to commit, continuing)" }
-  git tag -a $Tag -m "v$Version" -f
-  git push origin main --follow-tags -f
-  if ($LASTEXITCODE -ne 0) { throw "Push failed" }
+  git diff --quiet
+  if ($LASTEXITCODE -ne 0) { throw "Tracked files have uncommitted changes. Commit them before shipping." }
+  git diff --cached --quiet
+  if ($LASTEXITCODE -ne 0) { throw "The index has uncommitted changes. Commit them before shipping." }
+  if (git tag --list $Tag) { throw "Tag $Tag already exists." }
+  git tag -a $Tag -m "v$Version"
+  if ($LASTEXITCODE -ne 0) { throw "Tag failed" }
+  git push origin main
+  if ($LASTEXITCODE -ne 0) { throw "Branch push failed" }
+  git push origin $Tag
+  if ($LASTEXITCODE -ne 0) { throw "Tag push failed" }
 } else {
   Write-Host "  [dry] git tag $Tag && git push origin main --follow-tags"
 }
@@ -168,15 +155,21 @@ if (-not $DryRun) {
   # Linux
   $tarFile = "$RepoRoot\release\Pantoufa-$Version.tar.gz"
   if (Test-Path $tarFile) { $Assets += @{ Path = $tarFile; Name = "Pantoufa-$Version.tar.gz"; Label = "Linux (tar.gz)" } }
+  $appImage = "$RepoRoot\release\Pantoufa-$Version.AppImage"
+  if (Test-Path $appImage) { $Assets += @{ Path = $appImage; Name = "Pantoufa-$Version.AppImage"; Label = "Linux AppImage" } }
+  $appImageBlockmap = "$RepoRoot\release\Pantoufa-$Version.AppImage.blockmap"
+  if (Test-Path $appImageBlockmap) { $Assets += @{ Path = $appImageBlockmap; Name = "Pantoufa-$Version.AppImage.blockmap"; Label = "Linux AppImage blockmap" } }
 
   # latest.yml
   $ymlFile = "$RepoRoot\release\latest.yml"
   if (Test-Path $ymlFile) { $Assets += @{ Path = $ymlFile; Name = "latest.yml"; Label = "Auto-update manifest" } }
+  $linuxYmlFile = "$RepoRoot\release\latest-linux.yml"
+  if (Test-Path $linuxYmlFile) { $Assets += @{ Path = $linuxYmlFile; Name = "latest-linux.yml"; Label = "Linux auto-update manifest" } }
 
   foreach ($a in $Assets) {
     $sizeMB = [math]::Round((Get-Item $a.Path).Length / 1MB, 1)
     Write-Host "  Uploading $($a.Name) ($sizeMB MB)…"
-    $url = $UploadBase + "?name=$($a.Name)&label=$($a.Label)"
+    $url = $UploadBase + "?name=$([uri]::EscapeDataString($a.Name))&label=$([uri]::EscapeDataString($a.Label))"
     Invoke-RestMethod -Uri $url -Method Post -Headers (@{ Authorization = "token $Token"; Accept = "application/vnd.github+json"; "Content-Type" = "application/octet-stream" }) -InFile $a.Path -TimeoutSec 300
   }
 

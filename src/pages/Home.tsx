@@ -26,23 +26,30 @@ export function HomePage() {
 
     setLoading(true);
     setError(null);
-    fetchHome()
+    // Apply a home payload to the screen — used by the initial load AND by
+    // fetchHome's onUpdated push, which fires when the background revalidation
+    // lands with visibly newer content (new episode aired etc.) so the feed
+    // updates live, no manual refresh needed.
+    const apply = (r: { data: { featured: FeaturedItem[]; sections: HomeSection[] } }) => {
+      setFeatured(r.data.featured);
+      setSections(r.data.sections.filter((s) => s.id !== "tv_series"));
+      // Clear stale "caught up"/"finished" badges the instant a new episode
+      // drops, without waiting for the user to reopen the anime's detail page.
+      const recent = r.data.sections.find((s) => s.id === "recently_updated");
+      if (recent) {
+        reconcileCompletionFromEpisodes(
+          (recent.items as EpisodeItem[]).map((ep) => ({
+            animeHref: ep.animeHref,
+            animeTitle: ep.animeTitle,
+            epNum: extractEpisodeNumber(ep.title),
+          })),
+        ).catch(() => {});
+      }
+    };
+    fetchHome((fresh) => { if (!cancelled) apply(fresh); })
       .then((r) => {
         if (cancelled) return;
-        setFeatured(r.data.featured);
-        setSections(r.data.sections.filter((s) => s.id !== "tv_series"));
-        // Clear stale "caught up"/"finished" badges the instant a new episode
-        // drops, without waiting for the user to reopen the anime's detail page.
-        const recent = r.data.sections.find((s) => s.id === "recently_updated");
-        if (recent) {
-          reconcileCompletionFromEpisodes(
-            (recent.items as EpisodeItem[]).map((ep) => ({
-              animeHref: ep.animeHref,
-              animeTitle: ep.animeTitle,
-              epNum: extractEpisodeNumber(ep.title),
-            })),
-          ).catch(() => {});
-        }
+        apply(r);
       })
       .catch(async (e) => {
         if (cancelled) return;

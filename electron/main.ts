@@ -58,6 +58,21 @@ function downloadPathFor(id: string): string {
   const safe = (id || "").replace(/[^a-z0-9_-]/gi, "").slice(0, 64) || "dl";
   return path.join(downloadsDir(), `${safe}.mp4`);
 }
+function isValidDownloadedMp4(filePath: string): boolean {
+  let fd: number | null = null;
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size < 1024) return false;
+    fd = fs.openSync(filePath, "r");
+    const header = Buffer.alloc(64);
+    const read = fs.readSync(fd, header, 0, header.length, 0);
+    return header.subarray(0, read).includes(Buffer.from("ftyp"));
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch {} }
+  }
+}
 // Mobile UA for video CDNs — matches what the mobile app uses and what
 // most providers expect from real users. mp4upload + streamwish refuse
 // some desktop UAs.
@@ -2517,6 +2532,7 @@ app.whenReady().then(() => {
     if (!id || !url) return { ok: false };
     if (activeDownloads.has(id)) return { ok: false };
     const dest = downloadPathFor(id);
+    const partial = `${dest}.part`;
     const controller = new AbortController();
     activeDownloads.set(id, controller);
     const headers: Record<string, string> = { "User-Agent": VIDEO_UA };
@@ -2525,6 +2541,7 @@ app.whenReady().then(() => {
     let ws: fs.WriteStream | null = null;
     try {
       try { fs.unlinkSync(dest); } catch {}
+      try { fs.unlinkSync(partial); } catch {}
       const resp = await session.defaultSession.fetch(url, {
         method: "GET",
         headers,
@@ -2534,7 +2551,7 @@ app.whenReady().then(() => {
       });
       if (!resp.ok || !resp.body) { activeDownloads.delete(id); return { ok: false }; }
       const total = parseInt(resp.headers.get("content-length") || "0", 10) || 0;
-      ws = fs.createWriteStream(dest);
+      ws = fs.createWriteStream(partial);
       const reader = (resp.body as ReadableStream<Uint8Array>).getReader();
       let bytes = 0;
       let lastEmit = 0;
@@ -2552,12 +2569,20 @@ app.whenReady().then(() => {
         }
       }
       await new Promise<void>((res) => ws!.end(res));
+      ws = null;
+      if (!isValidDownloadedMp4(partial)) {
+        try { fs.unlinkSync(partial); } catch {}
+        activeDownloads.delete(id);
+        return { ok: false };
+      }
+      fs.renameSync(partial, dest);
       activeDownloads.delete(id);
       mainWindow?.webContents.send("pantoufa:download-progress", { id, bytes, total: total || bytes });
       return { ok: true, total: total || bytes };
     } catch (e) {
       activeDownloads.delete(id);
       try { ws?.end(); } catch {}
+      try { fs.unlinkSync(partial); } catch {}
       try { fs.unlinkSync(dest); } catch {}
       return { ok: false };
     }
@@ -2566,8 +2591,20 @@ app.whenReady().then(() => {
   ipcMain.handle("pantoufa:download-delete", async (_evt, id: string): Promise<boolean> => {
     const ctrl = activeDownloads.get(id);
     if (ctrl) { try { ctrl.abort(); } catch {} activeDownloads.delete(id); }
-    try { fs.unlinkSync(downloadPathFor(id)); } catch {}
+    const dest = downloadPathFor(id);
+    try { fs.unlinkSync(dest); } catch {}
+    try { fs.unlinkSync(`${dest}.part`); } catch {}
     return true;
+  });
+
+  ipcMain.handle("pantoufa:download-query", async (_evt, id: string) => {
+    const filePath = downloadPathFor(id);
+    try {
+      const stat = fs.statSync(filePath);
+      return { exists: true, valid: isValidDownloadedMp4(filePath), size: stat.size };
+    } catch {
+      return { exists: false, valid: false, size: 0 };
+    }
   });
 
   // Kept for backwards compatibility; no-op now that we proxy.

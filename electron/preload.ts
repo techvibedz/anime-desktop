@@ -78,6 +78,8 @@ contextBridge.exposeInMainWorld("pantoufa", {
     ipcRenderer.invoke("pantoufa:download-start", opts) as Promise<{ ok: boolean; total?: number }>,
   downloadDelete: (id: string) =>
     ipcRenderer.invoke("pantoufa:download-delete", id) as Promise<boolean>,
+  downloadQuery: (id: string) =>
+    ipcRenderer.invoke("pantoufa:download-query", id) as Promise<{ exists: boolean; valid: boolean; size: number }>,
   onDownloadProgress: (handler: (info: { id: string; bytes: number; total: number }) => void) => {
     const listener = (_evt: unknown, info: { id: string; bytes: number; total: number }) => handler(info);
     ipcRenderer.on("pantoufa:download-progress", listener);

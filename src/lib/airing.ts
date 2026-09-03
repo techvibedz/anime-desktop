@@ -3,6 +3,7 @@
 // mobile app (lib/airing.ts): title search only, no alt-title bridge, cached.
 
 import { storage } from "./storage";
+import { fuzzyScore } from "./fuzzy";
 
 const ANILIST_URL = "https://graphql.anilist.co";
 const CACHE_PREFIX = "@anime_airing_v1:";
@@ -28,8 +29,8 @@ const QUERY = `query ($search: String) {
 
 // Prefer the Electron main process (net.fetch: no CORS, DoH-routed); fall back
 // to the renderer fetch when the bridge is unavailable (browser dev).
-async function anilistPost(variables: Record<string, unknown>): Promise<any | null> {
-  const body = JSON.stringify({ query: QUERY, variables });
+async function anilistPost(variables: Record<string, unknown>, query: string = QUERY): Promise<any | null> {
+  const body = JSON.stringify({ query, variables });
   const headers = { "Content-Type": "application/json", Accept: "application/json" };
   try {
     const viaMain = await (window as any).pantoufa?.fetchJson?.({ url: ANILIST_URL, method: "POST", body, headers });
@@ -152,4 +153,68 @@ export async function fetchSeriesFinished(title: string, lastKnownEp?: number | 
     if (pick != null) return pick;
   }
   return false;
+}
+
+/* ── Release year + movie/series format (AniList) ──
+ * Powers the anime3rb old-vs-new disambiguation: franchises that have BOTH an
+ * old film and a new TV remake share one base name ("Koukaku Kidoutai" 1995
+ * vs "Koukaku Kidoutai (TV)" 2026), so title matching alone locks onto the
+ * wrong entry — the release year / format is the only reliable discriminator.
+ * Resolved via AniList (keyless), cached for a week. A null result simply
+ * disables the check: the caller falls back to title-only matching. */
+export type AnimeYearType = { year: number | null; isMovie: boolean | null };
+
+const YT_CACHE_PREFIX = "@anime_yt_v1:";
+const YT_TTL = 7 * 24 * 60 * 60 * 1000;
+const ytMem = new Map<string, AnimeYearType>();
+const YEAR_TYPE_QUERY = `query ($s: String) { Page(perPage: 5) { media(search: $s, type: ANIME) { title { romaji english } seasonYear format } } }`;
+
+export async function getAnimeYearType(title: string): Promise<AnimeYearType> {
+  const none: AnimeYearType = { year: null, isMovie: null };
+  const q = (title || "").trim();
+  // AniList's search is Latin-only — an Arabic title can't resolve, so skip
+  // the network entirely and let the caller run its title-only fallback.
+  if (!q || !/[a-z]/i.test(q)) return none;
+  const key = q.toLowerCase();
+  const hit = ytMem.get(key);
+  if (hit) return hit;
+  try {
+    const raw = await storage.getItem(YT_CACHE_PREFIX + key);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Date.now() - parsed.ts < YT_TTL) {
+        ytMem.set(key, parsed.data);
+        return parsed.data as AnimeYearType;
+      }
+    }
+  } catch {}
+  try {
+    const json = await anilistPost({ s: q }, YEAR_TYPE_QUERY);
+    const medias: any[] = json?.data?.Page?.media || [];
+    let best: { score: number; year: number | null; isMovie: boolean | null } | null = null;
+    for (const m of medias) {
+      const romaji = m?.title?.romaji || "";
+      const english = m?.title?.english || "";
+      const sc = Math.max(fuzzyScore(q, romaji), english ? fuzzyScore(q, english) : 0);
+      if (!best || sc > best.score) {
+        best = {
+          score: sc,
+          year: typeof m?.seasonYear === "number" ? m.seasonYear : null,
+          isMovie: m?.format == null ? null : m.format === "MOVIE",
+        };
+      }
+    }
+    // A weak best match means AniList resolved to a different anime entirely —
+    // treat as unknown rather than disambiguate against the wrong year.
+    const out: AnimeYearType = best && best.score >= 0.55 ? { year: best.year, isMovie: best.isMovie } : none;
+    ytMem.set(key, out);
+    // Only persist real hits — a miss is likely transient (rate-limit, offline)
+    // and shouldn't be frozen for the whole week.
+    if (out.year != null || out.isMovie != null) {
+      try { await storage.setItem(YT_CACHE_PREFIX + key, JSON.stringify({ ts: Date.now(), data: out })); } catch {}
+    }
+    return out;
+  } catch {
+    return none;
+  }
 }

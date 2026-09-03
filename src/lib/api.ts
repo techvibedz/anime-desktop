@@ -1,5 +1,5 @@
 import { storage } from "./storage";
-import { fuzzyScore } from "./fuzzy";
+import { fuzzyScore, sourceSearchQueries } from "./fuzzy";
 import {
   scrapeWitanimeHome,
   fetchWitHomeDirect,
@@ -21,6 +21,7 @@ import {
   searchAnime3rbDirect,
   searchAnime3rbCatalog,
   searchAnime3rbCatalogFuzzy,
+  searchAnime3rbFamily,
   scrapeAnime3rbEpisodeServers,
   scrapeAnime3rbTitlePage,
   anime3rbExactSlugs,
@@ -28,7 +29,22 @@ import {
   type RawServer,
 } from "./scraper";
 import { getAltTitles } from "./altTitles";
+import { getAnimeYearType } from "./airing";
 import { animeTitleKey } from "./history";
+import { createRequestCache, withTimeout } from "./requestCache";
+import {
+  anime4upEpisodeUrl,
+  episodeNumberFromUrl,
+  mergeVideoServers,
+  normalizeServerUrl,
+  isResolvedDownloadServer,
+  selectDownloadCandidates,
+  selectServerCandidates,
+  selectWarmupServers,
+  serverCandidateSignature,
+  validateMediaUrl,
+  videoContentType,
+} from "./videoProviders";
 
 const HOME_CACHE_KEY = "@home_cache_v1";
 const HOME_CACHE_TTL = 30 * 60 * 1000;
@@ -57,7 +73,7 @@ export interface EpisodeItem { title: string; href: string; image: string; anime
 export interface HomeSection { id: string; title: string; type: "anime" | "episode"; items: (AnimeItem | EpisodeItem)[]; }
 export interface Episode { title: string; number: number; type: string; screenshot: string; href: string | null; }
 export interface AnimeDetail { title: string; poster: string; banner: string; synopsis: string; genres: string[]; rating: string | null; metadata: Record<string, string>; externalLinks: { label: string; href: string }[]; totalEpisodes: number; episodes: Episode[]; }
-export interface VideoServer { id: string; name: string; iframeUrl: string; provider: string; }
+export interface VideoServer { id: string; name: string; iframeUrl: string; provider: string; videoUrl?: string; source?: string; }
 export interface SearchResult { title: string; href: string; image: string; type?: string; status?: string; synopsis?: string; }
 
 function imgOrEmpty(s: string | null | undefined): string { return s ?? ""; }
@@ -140,10 +156,32 @@ async function fetchHomeFresh(): Promise<HomePayload> {
   return result;
 }
 
-export async function fetchHome(): Promise<HomePayload> {
+// Cheap change detector for the SWR push: a new episode / new trending entry
+// always alters a section's item count or its first item, so comparing section
+// counts + lead hrefs catches every visible change without a full deep-equal.
+function homeSignature(p: HomePayload): string {
+  return (
+    p.data.sections.map((s) => `${s.id}:${s.items.length}:${s.items[0]?.href || ""}`).join("|") +
+    "#" + (p.data.featured[0]?.href || "")
+  );
+}
+
+export async function fetchHome(onUpdated?: (p: HomePayload) => void): Promise<HomePayload> {
+  // Stale-while-revalidate: return cached payload immediately if present,
+  // then kick off a background refresh. When the fresh scrape lands with
+  // visibly different content, push it to the open screen via onUpdated so the
+  // user sees new episodes WITHOUT a manual refresh.
   const cached = await readCache<HomePayload>(HOME_CACHE_KEY, HOME_CACHE_TTL);
   if (cached) {
-    if (!bgRefreshInFlight) { bgRefreshInFlight = true; void fetchHomeFresh().finally(() => { bgRefreshInFlight = false; }); }
+    if (!bgRefreshInFlight) {
+      bgRefreshInFlight = true;
+      void fetchHomeFresh()
+        .then((fresh) => {
+          if (onUpdated && homeSignature(fresh) !== homeSignature(cached)) onUpdated(fresh);
+        })
+        .catch(() => {})
+        .finally(() => { bgRefreshInFlight = false; });
+    }
     return cached;
   }
   return fetchHomeFresh();
@@ -305,15 +343,34 @@ async function fetchEpisodesFresh(animeUrl: string): Promise<EpisodesPayload> {
   return payload;
 }
 
-export async function fetchEpisodes(animeUrl: string): Promise<EpisodesPayload> {
+// Cheap change detector for the detail-page SWR push: a newly-aired episode
+// changes the episode count (and a lead href), so this catches every visible
+// update without deep-comparing the whole payload.
+function detailSignature(p: EpisodesPayload): string {
+  const eps = p.data.episodes;
+  return `${p.data.totalEpisodes}:${eps.length}:${eps[0]?.href || ""}:${eps[eps.length - 1]?.href || ""}`;
+}
+
+export async function fetchEpisodes(animeUrl: string, onUpdated?: (p: EpisodesPayload) => void): Promise<EpisodesPayload> {
   // Re-clean the title on every return so entries cached by an older build (with
   // the "أنمي … مترجم" decoration) display cleanly too.
   const clean = (p: EpisodesPayload): EpisodesPayload => {
     if (p?.data) p.data.title = cleanAnimeTitle(p.data.title);
     return p;
   };
+  // Return the cached payload instantly, then revalidate in the background and
+  // PUSH the fresh payload to the open screen when it visibly changed, so a
+  // newly-aired episode shows without a manual refresh.
   const cached = await readCache<EpisodesPayload>(DETAIL_CACHE_PREFIX + animeUrl, DETAIL_CACHE_TTL);
-  if (cached) { void fetchEpisodesFresh(animeUrl).catch(() => {}); return clean(cached); }
+  if (cached) {
+    void fetchEpisodesFresh(animeUrl)
+      .then((fresh) => {
+        if (onUpdated && fresh?.data && detailSignature(fresh) !== detailSignature(cached))
+          onUpdated(clean(fresh));
+      })
+      .catch(() => {});
+    return clean(cached);
+  }
   return clean(await fetchEpisodesFresh(animeUrl));
 }
 
@@ -441,67 +498,125 @@ function hrefRank(href: string): number {
   return 1; // witanime (or anything else) — richest merge
 }
 
-// witanime-primary progressive search. witanime is the authoritative source, so
-// its results are shown FIRST and alone; anime4up + anime3rb are a FALLBACK that
-// only surfaces titles witanime has nothing for. Two-stage witanime lookup keeps
-// the common case fast: a direct static-HTML GET paints in well under a second,
-// and the slow headless scrape (which overlaps in the background) fills anything
-// the direct parse missed and recovers a Cloudflare block on the direct fetch.
+// Three-source progressive search, matching the mobile app. Witanime,
+// Anime4up, and Anime3rb all start at t=0 and stream into the same deduplicated
+// list as they land. A slow or blocked Witanime request can no longer hold the
+// other two sources behind it, and broader smart queries run concurrently so a
+// slightly misspelled multi-word title still resolves quickly.
 export async function searchAnimeStream(
   query: string,
   onPartial?: (results: SearchResult[], phase: "fast" | "full") => void,
 ): Promise<SearchResult[]> {
   const sink = makeSearchSink(query);
 
-  // Headless witanime overlaps the direct GET so we never serialize the two.
-  const witHeadlessP = scrapeSearch(query).catch(() => ({ results: [] as SearchResult[] }));
+  let lastSignature = "";
+  const emit = (phase: "fast" | "full") => {
+    const results = sink.snapshot();
+    const signature = results.map((item) => `${item.href}|${item.title}`).join("\n");
+    if (phase === "fast" && signature === lastSignature) return;
+    lastSignature = signature;
+    onPartial?.(results, phase);
+  };
 
-  // PRIMARY, fast: witanime direct static search — paint the moment it lands.
-  const witDirect = await searchWitanimeDirectList(query).catch(() => null);
-  for (const it of witDirect || []) sink.push(it);
-  if (sink.snapshot().length > 0) onPartial?.(sink.snapshot(), "fast");
+  const FAST_SOURCE_MS = 3_000;
+  const plannedQueries = sourceSearchQueries(query);
+  let exactWitFailed = false;
 
-  // Merge the headless witanime pass (fills gaps / recovers a blocked direct GET).
-  const witH = await witHeadlessP;
-  for (const it of witH.results || []) sink.push(it);
+  const directTasks = plannedQueries.map(async (sourceQuery) => {
+    const [wit, up4] = await Promise.all([
+      withTimeout(searchWitanimeDirectList(sourceQuery).catch(() => null), FAST_SOURCE_MS, null),
+      withTimeout(searchAnime4upDirectList(sourceQuery).catch(() => null), FAST_SOURCE_MS, null),
+    ]);
+    if (sourceQuery.toLowerCase() === query.toLowerCase()) exactWitFailed = wit === null;
+    for (const item of wit || []) sink.push(item);
+    for (const item of up4 || []) sink.push(item);
+    if ((wit?.length || 0) + (up4?.length || 0) > 0) emit("fast");
+  });
 
-  // Cross-language bridge: witanime often indexes an anime ONLY under its romaji
-  // name (King's Game → Ousama Game). Still on witanime, just under an alt title,
-  // so try that BEFORE reaching for the other sources.
+  // Anime3rb starts alongside both WordPress sources. Exact/catalog resolution
+  // supplies the real title and poster, while the fuzzy catalog is kept ready
+  // for a true typo/no-result case.
+  const fuzzyCatalogP = withTimeout(
+    searchAnime3rbCatalogFuzzy(query, 5).catch(() => [] as { slug: string; score: number; poster: string }[]),
+    5_000,
+    [] as { slug: string; score: number; poster: string }[],
+  );
+  const a3rbTask = withTimeout((async () => {
+    const url =
+      (await searchAnime3rbCatalog(query).catch(() => null)) ||
+      (await searchAnime3rbDirect(query).catch(() => null));
+    if (!url) return null;
+    const detail = await scrapeAnime3rbTitlePage(url).catch(() => null);
+    return detail?.title ? { url, detail } : null;
+  })(), 5_000, null).then((hit) => {
+    if (!hit) return;
+    sink.push({
+      title: hit.detail.title,
+      href: hit.url,
+      image: hit.detail.poster,
+      type: null,
+      status: null,
+      synopsis: hit.detail.synopsis,
+    });
+    emit("fast");
+  });
+
+  await Promise.all([...directTasks, a3rbTask]);
+
+  // A true miss gets the closest Anime3rb catalog candidates. Fetch their
+  // detail pages in parallel so the cards use real titles/posters rather than
+  // exposing raw slugs.
   if (sink.snapshot().length === 0) {
-    const alts = await getAltTitles(query).catch(() => [] as string[]);
-    for (const alt of alts.slice(0, 2)) {
-      if (alt.toLowerCase().trim() === query.toLowerCase().trim()) continue;
-      const [wd, wh] = await Promise.all([
-        searchWitanimeDirectList(alt).catch(() => null),
-        scrapeSearch(alt).catch(() => ({ results: [] as SearchResult[] })),
-      ]);
-      for (const it of wd || []) sink.push(it);
-      for (const it of wh.results || []) sink.push(it);
-      if (sink.snapshot().length > 0) break;
-    }
-  }
-
-  // FALLBACK sources — anime4up + anime3rb — only when witanime (direct, headless,
-  // and alt-title) found NOTHING for the query. This keeps witanime the primary
-  // source and stops the looser anime3rb fuzzy match from polluting normal results.
-  if (sink.snapshot().length === 0) {
-    const up4 = await searchAnime4upDirectList(query).catch(() => null);
-    for (const it of up4 || []) sink.push(it);
-    const fuzzy = await searchAnime3rbCatalogFuzzy(query, 6)
-      .catch(() => [] as { slug: string; score: number; poster: string }[]);
-    for (const { slug, poster } of fuzzy) {
+    const fuzzy = await fuzzyCatalogP;
+    const details = await Promise.all(fuzzy.slice(0, 3).map(async ({ slug, poster }) => {
+      const url = `https://anime3rb.com/titles/${slug}`;
+      const detail = await withTimeout(scrapeAnime3rbTitlePage(url).catch(() => null), 3_500, null);
+      return { url, slug, poster, detail };
+    }));
+    for (const { url, slug, poster, detail } of details) {
       sink.push({
-        title: slug.replace(/[-_]+/g, " ").trim(),
-        href: `https://anime3rb.com/titles/${slug}`,
-        image: poster || "",
-        type: undefined, status: undefined, synopsis: undefined,
+        title: detail?.title || slug.replace(/[-_]+/g, " ").trim(),
+        href: url,
+        image: detail?.poster || poster || "",
+        type: null,
+        status: null,
+        synopsis: detail?.synopsis || null,
       });
     }
+    if (details.length > 0) emit("fast");
+  }
+
+  // The headless Witanime path is now a network-failure fallback only. An
+  // empty direct result is a valid miss and should not impose a slow render.
+  if (sink.snapshot().length === 0 && exactWitFailed) {
+    const headless = await withTimeout(
+      scrapeSearch(query).catch(() => ({ results: [] as SearchResult[] })),
+      6_000,
+      { results: [] as SearchResult[] },
+    );
+    for (const item of headless.results || []) sink.push(item);
+  }
+
+  // Cross-language bridge for titles indexed under only one Latin name.
+  if (sink.snapshot().length === 0) {
+    const alts = await withTimeout(getAltTitles(query).catch(() => [] as string[]), 5_000, [] as string[]);
+    const candidates = alts
+      .filter((alt) => /[a-z]/i.test(alt))
+      .filter((alt) => alt.toLowerCase().trim() !== query.toLowerCase().trim())
+      .slice(0, 2);
+    await Promise.all(candidates.map(async (alt) => {
+      const [wit, up4] = await Promise.all([
+        withTimeout(searchWitanimeDirectList(alt).catch(() => null), FAST_SOURCE_MS, null),
+        withTimeout(searchAnime4upDirectList(alt).catch(() => null), FAST_SOURCE_MS, null),
+      ]);
+      for (const item of wit || []) sink.push(item);
+      for (const item of up4 || []) sink.push(item);
+      if ((wit?.length || 0) + (up4?.length || 0) > 0) emit("fast");
+    }));
   }
 
   const results = sink.snapshot();
-  onPartial?.(results, "full");
+  emit("full");
   return results;
 }
 
@@ -528,8 +643,9 @@ type ServersPayload = Awaited<ReturnType<typeof doFetchVideoServers>>;
 const serversCache = new Map<string, { ts: number; promise: Promise<ServersPayload> }>();
 const SERVERS_TTL = 5 * 60 * 1000;
 
-export function fetchVideoServers(episodeUrl: string, url4up?: string): Promise<ServersPayload> {
+export function fetchVideoServers(episodeUrl: string, url4up?: string, force = false): Promise<ServersPayload> {
   const key = `${episodeUrl}|${url4up || ""}`;
+  if (force) serversCache.delete(key);
   const hit = serversCache.get(key);
   if (hit && Date.now() - hit.ts < SERVERS_TTL) return hit.promise;
   const promise = doFetchVideoServers(episodeUrl, url4up).catch((e) => { serversCache.delete(key); throw e; });
@@ -709,7 +825,11 @@ const a3rbTitleCache = new Map<string, { url: string; ts: number }>();
 // re-wrote that wrong slug on every hit so it never aged out. A fresh key forces
 // re-resolution with the season-aware logic (which correctly returns nothing
 // when a later season isn't on anime3rb).
-const A3RB_TITLE_PREFIX = "@a3rb_title_v2:";
+// v3: bumped to discard slug mappings that predate the year/format
+// disambiguation — franchises with an old film + a new TV remake ("Koukaku
+// Kidoutai" 1995 vs "Koukaku Kidoutai (TV)" 2026) could be locked onto the OLD
+// entry, and the wrong slug was re-written on every hit so it never aged out.
+const A3RB_TITLE_PREFIX = "@a3rb_title_v3:";
 // Titles whose Jikan alt-name bridge has already been attempted this session.
 // The bridge hits Jikan + probes anime3rb with each alt name; a fundamental
 // name mismatch won't change between the watch screen's retries, so run it at
@@ -738,15 +858,27 @@ async function resolveAnime3rbTitleUrl(animeTitle: string): Promise<string | nul
   const key = animeTitle.toLowerCase().trim();
   const cached = await peekAnime3rbTitleUrl(animeTitle);
   if (cached) return cached;
+  // What AniList knows about this anime (release year, film vs series). Franchises
+  // with an old film AND a new TV remake share the base name, so title matching
+  // alone can lock onto the wrong entry ("Koukaku Kidoutai" 1995 instead of the
+  // 2026 TV remake). Null-safe: when AniList can't resolve the title, matching
+  // falls back to title-only behaviour.
+  const want = await getAnimeYearType(animeTitle).catch(() => null);
   // Catalog (sitemap) matching FIRST: one plain GET (cached 6h in memory)
   // plus one verification probe of a slug that's KNOWN to exist — both fast
   // 200s. On desktop the slug guess goes second (anime3rb's edge TARPITS
   // unknown /titles/<slug> paths rather than 404ing them, so a missed guess
   // burst can blackhole the site — the catalog avoids that).
-  let url = await searchAnime3rbCatalog(animeTitle).catch(() => null);
+  let url = await searchAnime3rbCatalog(animeTitle, want).catch(() => null);
   if (!url) {
     console.info(`[a3rb-resolve] catalog miss for "${animeTitle}", probing top slug guesses`);
-    url = await searchAnime3rbDirect(animeTitle).catch(() => null);
+    url = await searchAnime3rbDirect(animeTitle, want).catch(() => null);
+  }
+  if (!url && want) {
+    // Same-base family scan: the new TV remake of an old franchise lives at a
+    // "-tv"/suffixed slug no guess produces, so only a year/format-filtered
+    // scan of the whole family finds it. No extra fetches for ordinary anime.
+    url = await searchAnime3rbFamily(animeTitle, want).catch(() => null);
   }
   if (!url && !a3rbBridgeTried.has(key)) {
     // Cross-language bridge — the main reason anime3rb "sometimes doesn't show".
@@ -771,8 +903,8 @@ async function resolveAnime3rbTitleUrl(animeTitle: string): Promise<string | nul
       const altQ = seasonNum >= 2 ? `${alt} season ${seasonNum}` : alt;
       if (altQ.toLowerCase().trim() === key) continue; // already tried as the primary
       url =
-        (await searchAnime3rbCatalog(altQ).catch(() => null)) ||
-        (await searchAnime3rbDirect(altQ).catch(() => null));
+        (await searchAnime3rbCatalog(altQ, want).catch(() => null)) ||
+        (await searchAnime3rbDirect(altQ, want).catch(() => null));
       if (url) break;
     }
   }
@@ -877,7 +1009,7 @@ export async function findAnime3rbAnimeUrl(animeTitle: string): Promise<string |
 // anime3rb's full episode list for an anime, for the detail page's cross-source
 // union — so episodes missing from witanime/anime4up still appear (and stay
 // playable, since each href is a real anime3rb episode URL). Cached 6h.
-const A3RB_EPS_PREFIX = "@a3rb_eps_v2:"; // v2: discard episode lists keyed by pre-fix (wrong-season) title URLs
+const A3RB_EPS_PREFIX = "@a3rb_eps_v3:"; // v3: discard episode lists keyed by pre-disambiguation (wrong-version) title URLs
 const A3RB_EPS_TTL = 6 * 60 * 60 * 1000;
 export async function fetchAnime3rbEpisodes(animeTitle: string): Promise<Episode[]> {
   if (!animeTitle || !animeTitle.trim()) return [];
@@ -894,58 +1026,339 @@ export async function fetchAnime3rbEpisodes(animeTitle: string): Promise<Episode
   return eps;
 }
 
-/* ── downloads ──────────────────────────────────
- * Resolve a DIRECT, progressive .mp4 URL for an episode so it can be saved to
- * disk for offline viewing. HLS (.m3u8) sources are skipped (a playlist, not a
- * single file), so only providers proven to hand out a progressive .mp4 are
- * considered: vid3rb (anime3rb's first-party host, direct 1080p) first, then
- * mp4upload. The main process performs the actual file download and forces the
- * per-provider Referer the CDN's signed URL needs. */
-const DL_RANK: Record<string, number> = { vid3rb: 0, mp4upload: 1 };
+// ── Complete three-source server discovery ──
 
-function dlQualityScore(name: string): number {
-  const n = (name || "").toLowerCase();
-  if (n.includes("fhd") || n.includes("1080")) return 3;
-  if (n.includes("hd") || n.includes("720")) return 2;
-  if (n.includes("sd") || n.includes("480") || n.includes("360")) return 0;
-  return 1;
+export type CompleteVideoServersPayload = {
+  success: boolean;
+  data: {
+    episodeTitle: string;
+    animeTitle: string;
+    animeHref: string;
+    serverCount: number;
+    servers: VideoServer[];
+    navigation: { prev: string | null; next: string | null };
+    up4EpisodeUrl?: string;
+  };
+};
+
+export type CompleteVideoServersOptions = {
+  episodeUrl: string;
+  url4up?: string | null;
+  url3rb?: string | null;
+  animeHref?: string | null;
+  animeTitle?: string | null;
+  episodeNumber?: number | null;
+  force?: boolean;
+  // Candidates arrive as soon as each source is discovered. Playable updates
+  // arrive as direct streams finish resolving, matching the mobile pipeline.
+  onCandidates?: (payload: CompleteVideoServersPayload) => void;
+  onPartial?: (payload: CompleteVideoServersPayload) => void;
+};
+
+const completeVideoServerRequests = createRequestCache<CompleteVideoServersPayload>(30_000);
+
+function completePayload(
+  servers: VideoServer[],
+  metadata: Partial<CompleteVideoServersPayload["data"]> = {},
+): CompleteVideoServersPayload {
+  return {
+    success: servers.length > 0,
+    data: {
+      episodeTitle: metadata.episodeTitle || "",
+      animeTitle: metadata.animeTitle || "",
+      animeHref: metadata.animeHref || "",
+      serverCount: servers.length,
+      servers,
+      navigation: metadata.navigation || { prev: null, next: null },
+      up4EpisodeUrl: metadata.up4EpisodeUrl,
+    },
+  };
+}
+
+/** Discover WitAnime, Anime4up, and Anime3rb concurrently, deduplicate them with
+ * the mobile provider policy, then pre-resolve direct streams. A failed source
+ * is isolated; candidates from the other sources remain available. */
+export function fetchCompleteVideoServers(
+  options: CompleteVideoServersOptions,
+): Promise<CompleteVideoServersPayload> {
+  const episodeUrl = normalizeServerUrl(options.episodeUrl) || options.episodeUrl;
+  const key = JSON.stringify([
+    episodeUrl,
+    options.url4up || "",
+    options.url3rb || "",
+    options.animeHref || "",
+    options.animeTitle || "",
+    options.episodeNumber ?? "",
+  ]);
+
+  return completeVideoServerRequests.run(key, async () => {
+    const deadline = Date.now() + 45_000;
+    const primaryIsUp4 = /anime4up/i.test(episodeUrl);
+    const primaryIsA3rb = /anime3rb\.com\/episode\//i.test(episodeUrl);
+    const episodeNumber = options.episodeNumber ?? episodeNumberFromUrl(episodeUrl);
+    const initialTitle = (options.animeTitle || "").trim();
+
+    const primaryPromise: Promise<CompleteVideoServersPayload | null> = primaryIsA3rb
+      ? fetchAnime3rbServersByUrl(episodeUrl)
+          .then((raw) => completePayload(raw.map((server) => ({ ...server, source: "anime3rb" })), {
+            episodeTitle: episodeNumber != null ? `الحلقة ${episodeNumber}` : "",
+            animeTitle: initialTitle,
+            animeHref: options.animeHref || "",
+          }))
+          .catch(() => null)
+      : fetchVideoServers(episodeUrl, undefined, !!options.force)
+          .then((payload) => completePayload(payload.data.servers, {
+            episodeTitle: payload.data.episodeTitle,
+            animeTitle: initialTitle || payload.data.animeTitle,
+            animeHref: options.animeHref || payload.data.animeHref,
+            navigation: payload.data.navigation,
+            up4EpisodeUrl: payload.data.up4EpisodeUrl || undefined,
+          }))
+          .catch(() => null);
+
+    const loadUp4 = async (title: string): Promise<CompleteVideoServersPayload | null> => {
+      if (primaryIsUp4) return null;
+      let href = options.url4up || null;
+      if (!href && title && episodeNumber != null) {
+        const guessed = anime4upEpisodeUrl(title, episodeNumber);
+        const direct = guessed
+          ? await scrapeAnime4upEpisodePageDirect(guessed).catch(() => null)
+          : null;
+        if (direct?.servers.length) {
+          const servers = mergeVideoServers([
+            direct.servers.map((server) => ({ ...server, source: "anime4up" })),
+          ]);
+          return completePayload(servers, {
+            episodeTitle: direct.episodeTitle,
+            animeTitle: direct.animeTitle || title,
+            animeHref: options.animeHref || "",
+            up4EpisodeUrl: guessed || undefined,
+          });
+        }
+      }
+      if (!href && title && episodeNumber != null) {
+        href = await resolveUp4EpisodeUrl(title, episodeNumber).catch(() => null);
+      }
+      if (!href || normalizeServerUrl(href) === normalizeServerUrl(episodeUrl)) return null;
+      return fetchVideoServers(href, undefined, !!options.force)
+        .then((payload) => completePayload(
+          payload.data.servers.map((server) => ({ ...server, source: "anime4up" })),
+          { ...payload.data, animeTitle: title || payload.data.animeTitle, animeHref: options.animeHref || "", up4EpisodeUrl: href || undefined },
+        ))
+        .catch(() => null);
+    };
+
+    const loadA3rb = async (title: string): Promise<VideoServer[]> => {
+      let raw: RawServer[] = [];
+      if (primaryIsA3rb) raw = await fetchAnime3rbServersByUrl(episodeUrl);
+      else if (options.url3rb) raw = await fetchAnime3rbServersByUrl(options.url3rb);
+      else if (title && episodeNumber != null) raw = await fetchAnime3rbServers(title, episodeNumber);
+      return raw.map((server) => ({ ...server, source: "anime3rb" }));
+    };
+
+    const discovered = new Map<string, VideoServer[]>();
+    let lastCandidateSignature = "";
+    let primaryResult: CompleteVideoServersPayload | null = null;
+    let resolvedTitle = initialTitle;
+    const metadata = () => primaryResult;
+    const emitCandidates = (fallback?: CompleteVideoServersPayload | null) => {
+      if (Date.now() > deadline) return;
+      const servers = selectServerCandidates(mergeVideoServers([...discovered.values()]));
+      if (!servers.length) return;
+      const signature = serverCandidateSignature(servers);
+      if (signature === lastCandidateSignature) return;
+      lastCandidateSignature = signature;
+      const base = metadata() || fallback;
+      options.onCandidates?.(completePayload(servers, {
+        episodeTitle: base?.data.episodeTitle || (episodeNumber != null ? `الحلقة ${episodeNumber}` : ""),
+        animeTitle: resolvedTitle || base?.data.animeTitle || "",
+        animeHref: options.animeHref || base?.data.animeHref || "",
+        navigation: base?.data.navigation,
+        up4EpisodeUrl: base?.data.up4EpisodeUrl,
+      }));
+    };
+
+    const observedPrimary = primaryPromise.then((payload) => {
+      primaryResult = payload;
+      resolvedTitle = initialTitle || payload?.data.animeTitle || "";
+      if (payload?.data.servers.length) {
+        discovered.set("primary", payload.data.servers);
+        emitCandidates(payload);
+      }
+      return payload;
+    });
+    const observeUp4 = (promise: Promise<CompleteVideoServersPayload | null>) => promise.then((payload) => {
+      if (payload?.data.servers.length) {
+        discovered.set("anime4up", payload.data.servers);
+        emitCandidates(payload);
+      }
+      return payload;
+    });
+    const observeA3rb = (promise: Promise<VideoServer[]>) => promise.then((servers) => {
+      if (servers.length) {
+        discovered.set("anime3rb", servers);
+        emitCandidates(primaryResult);
+      }
+      return servers;
+    });
+
+    // With a title from the detail route, all three requests are observed from
+    // the start: a fast fallback is surfaced even while the primary is slow.
+    // Legacy links without a title start fallbacks as soon as primary metadata
+    // supplies one.
+    let up4Promise = initialTitle || options.url4up ? loadUp4(initialTitle) : null;
+    let a3rbPromise = initialTitle || options.url3rb || primaryIsA3rb ? loadA3rb(initialTitle) : null;
+    let observedUp4 = up4Promise ? observeUp4(up4Promise) : null;
+    let observedA3rb = a3rbPromise ? observeA3rb(a3rbPromise) : null;
+
+    const primary = await withTimeout(observedPrimary, Math.max(1, deadline - Date.now()), null);
+    if (primary && !primaryResult) primaryResult = primary;
+    resolvedTitle = initialTitle || primary?.data.animeTitle || resolvedTitle;
+    if (!up4Promise) {
+      up4Promise = loadUp4(resolvedTitle);
+      observedUp4 = observeUp4(up4Promise);
+    }
+    if (!a3rbPromise) {
+      a3rbPromise = loadA3rb(resolvedTitle);
+      observedA3rb = observeA3rb(a3rbPromise);
+    }
+
+    const remaining = Math.max(1, deadline - Date.now());
+    const [up4, a3rb] = await Promise.all([
+      withTimeout(observedUp4 || Promise.resolve(null), remaining, null),
+      withTimeout(observedA3rb || Promise.resolve([] as VideoServer[]), remaining, [] as VideoServer[]),
+    ]);
+    const candidates = mergeVideoServers([
+      primary?.data.servers || [],
+      up4?.data.servers || [],
+      a3rb,
+    ]);
+
+    const playable = new Map<string, VideoServer>();
+    let lastPlayableSignature = "";
+    const resolveOne = async (server: VideoServer) => {
+      const result = await withTimeout(
+        resolveVideo(server.iframeUrl, server.provider, { fresh: !!options.force }),
+        40_000,
+        { success: false, error: "Timed out" } as ResolvePayload,
+      ).catch(() => null);
+      if (!result?.success || result.data.type === "iframe" || !validateMediaUrl(result.data.videoUrl, server.provider)) return;
+      playable.set(server.iframeUrl, { ...server, videoUrl: result.data.videoUrl });
+      const ready = selectServerCandidates(candidates).flatMap((candidate) => {
+        const hit = playable.get(candidate.iframeUrl);
+        return hit ? [hit] : [];
+      });
+      const signature = serverCandidateSignature(ready);
+      if (!ready.length || signature === lastPlayableSignature) return;
+      lastPlayableSignature = signature;
+      options.onPartial?.(completePayload(ready, {
+        episodeTitle: primary?.data.episodeTitle || up4?.data.episodeTitle || (episodeNumber != null ? `الحلقة ${episodeNumber}` : ""),
+        animeTitle: resolvedTitle,
+        animeHref: options.animeHref || "",
+        navigation: primary?.data.navigation,
+        up4EpisodeUrl: options.url4up || up4?.data.up4EpisodeUrl,
+      }));
+    };
+
+    // Warm the best three first so the recommended server becomes playable
+    // quickly, then validate the remaining direct candidates concurrently.
+    const warm = selectWarmupServers(candidates);
+    await Promise.all(warm.map(resolveOne));
+    const warmUrls = new Set(warm.map((server) => server.iframeUrl));
+    await Promise.all(selectServerCandidates(candidates)
+      .filter((server) => !warmUrls.has(server.iframeUrl))
+      .map(resolveOne));
+
+    const servers = selectServerCandidates(candidates).flatMap((candidate) => {
+      const hit = playable.get(candidate.iframeUrl);
+      return hit ? [hit] : [];
+    });
+    return completePayload(servers, {
+      episodeTitle: primary?.data.episodeTitle || up4?.data.episodeTitle || (episodeNumber != null ? `الحلقة ${episodeNumber}` : ""),
+      animeTitle: resolvedTitle,
+      animeHref: options.animeHref || primary?.data.animeHref || "",
+      navigation: primary?.data.navigation,
+      up4EpisodeUrl: options.url4up || up4?.data.up4EpisodeUrl,
+    });
+  }, {
+    force: !!options.force,
+    valid: (payload) => payload.data.servers.length > 0,
+  });
+}
+
+/* ── downloads ──────────────────────────────────
+ * Use the same three-source discovery as the player/mobile app, then expose
+ * every resolved progressive file to the quality/source picker. */
+export type DownloadServer = {
+  name: string;
+  iframeUrl: string;
+  provider: string;
+  quality: string;
+  videoUrl?: string;
+};
+
+export async function listDownloadServers(opts: {
+  episodeHref: string;
+  url4up?: string;
+  url3rb?: string;
+  epNum?: number | null;
+  animeTitle?: string | null;
+  force?: boolean;
+  onUpdate?: (servers: DownloadServer[]) => void;
+}): Promise<DownloadServer[]> {
+  const complete = await fetchCompleteVideoServers({
+    episodeUrl: opts.episodeHref,
+    url4up: opts.url4up,
+    url3rb: opts.url3rb,
+    animeTitle: opts.animeTitle,
+    episodeNumber: opts.epNum,
+    force: opts.force,
+    onPartial: (payload) => {
+      const servers = selectDownloadCandidates([payload.data.servers]);
+      if (servers.length) opts.onUpdate?.(servers);
+    },
+  }).catch(() => null);
+  return selectDownloadCandidates([complete?.data.servers || []]);
 }
 
 export async function resolveDownloadUrl(opts: {
   episodeHref: string;
   url4up?: string;
+  url3rb?: string;
   epNum?: number | null;
   animeTitle?: string | null;
+  server?: { iframeUrl: string; provider: string; videoUrl?: string } | null;
 }): Promise<{ url: string; provider: string } | null> {
-  const { episodeHref, url4up, epNum, animeTitle } = opts;
-  const cands: { name: string; iframeUrl: string; provider: string }[] = [];
+  const resolveCandidate = async (server: { iframeUrl: string; provider: string; videoUrl?: string }) => {
+    const usable = (url: string) =>
+      url && validateMediaUrl(url, server.provider) &&
+      videoContentType(url, server.provider) === "progressive"
+        ? { url, provider: server.provider }
+        : null;
+    const cached = usable(server.videoUrl || "");
+    if (cached) return cached;
+    const result = await resolveVideo(server.iframeUrl, server.provider, { priority: true, fresh: true }).catch(() => null);
+    return usable(result?.success ? result.data.videoUrl : "");
+  };
 
-  // anime3rb (vid3rb → direct 1080p .mp4) — the best download source.
-  try {
-    if (animeTitle && epNum != null) {
-      const a3 = await fetchAnime3rbServers(animeTitle, epNum);
-      for (const s of a3) cands.push({ name: s.name, iframeUrl: s.iframeUrl, provider: s.provider });
-    }
-  } catch {}
+  if (opts.server?.iframeUrl) {
+    const selected = await resolveCandidate(opts.server);
+    if (selected) return selected;
+  }
 
-  // Primary (witanime/anime4up) — for the mp4upload server.
-  try {
-    const res = await fetchVideoServers(episodeHref, url4up);
-    if (res?.success) for (const s of res.data.servers) cands.push({ name: s.name, iframeUrl: s.iframeUrl, provider: s.provider });
-  } catch {}
-
-  const downloadable = cands
-    .filter((c) => c.provider in DL_RANK && c.iframeUrl)
-    .sort((a, b) => (DL_RANK[a.provider] - DL_RANK[b.provider]) || (dlQualityScore(b.name) - dlQualityScore(a.name)));
-
-  for (const c of downloadable) {
-    const r = await resolveVideo(c.iframeUrl, c.provider).catch(() => null);
-    if (r && r.success) {
-      const { videoUrl, type } = r.data;
-      if (videoUrl && type !== "hls" && !/\.m3u8(\?|$)/i.test(videoUrl)) {
-        return { url: videoUrl, provider: c.provider };
-      }
-    }
+  const complete = await fetchCompleteVideoServers({
+    episodeUrl: opts.episodeHref,
+    url4up: opts.url4up,
+    url3rb: opts.url3rb,
+    animeTitle: opts.animeTitle,
+    episodeNumber: opts.epNum,
+    force: true,
+  }).catch(() => null);
+  const downloadable = selectDownloadCandidates([complete?.data.servers || []]);
+  for (const candidate of downloadable) {
+    if (!isResolvedDownloadServer(candidate)) continue;
+    const resolved = await resolveCandidate(candidate);
+    if (resolved) return resolved;
   }
   return null;
 }
@@ -1006,6 +1419,7 @@ const CUSTOM_PLAYER_PROVIDERS = new Set([
 const EXPECT_DIRECT_PROVIDERS = new Set([...CUSTOM_PLAYER_PROVIDERS, "mp4upload", "videa"]);
 
 type ResolvePayload = { success: true; data: { videoUrl: string; type: "hls" | "mp4" | "iframe" } } | { success: false; error: string };
+export type ResolveVideoOptions = { fresh?: boolean; priority?: boolean };
 const resolveCache = new Map<string, { ts: number; promise: Promise<ResolvePayload> }>();
 // 90s (was 15s): long enough that the prefetch fired when the server list
 // loads still serves the user's Play click, and that a click during a slow
@@ -1014,7 +1428,12 @@ const resolveCache = new Map<string, { ts: number; promise: Promise<ResolvePaylo
 // re-extract path covers the rare expiry anyway.
 const RESOLVE_TTL = 90 * 1000;
 
-export function resolveVideo(iframeUrl: string, provider: string): Promise<ResolvePayload> {
+export function resolveVideo(
+  iframeUrl: string,
+  provider: string,
+  options: ResolveVideoOptions = {},
+): Promise<ResolvePayload> {
+  if (options.fresh) resolveCache.delete(iframeUrl);
   const hit = resolveCache.get(iframeUrl);
   if (hit && Date.now() - hit.ts < RESOLVE_TTL) return hit.promise;
   const promise = doResolveVideo(iframeUrl, provider).then((r) => {

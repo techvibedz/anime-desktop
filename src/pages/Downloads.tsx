@@ -4,6 +4,7 @@
 // retry a failed one or delete. Ported from the mobile app (app/downloads.tsx).
 
 import { useEffect, useState, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   getDownloads, subscribeDownloads, deleteDownload, retryDownload, downloadFileUrl,
   formatBytes, type DownloadItem,
@@ -23,7 +24,7 @@ function statusLabel(it: DownloadItem): string {
 
 export function DownloadsPage() {
   const [items, setItems] = useState<DownloadItem[]>([]);
-  const [playing, setPlaying] = useState<DownloadItem | null>(null);
+  const navigate = useNavigate();
 
   const refresh = useCallback(() => { getDownloads().then(setItems); }, []);
 
@@ -34,6 +35,18 @@ export function DownloadsPage() {
   }, [refresh]);
 
   const totalBytes = items.filter((i) => i.status === "completed").reduce((a, i) => a + (i.totalBytes || 0), 0);
+
+  const playOffline = useCallback((item: DownloadItem) => {
+    const local = downloadFileUrl(item.id);
+    if (!local) return;
+    const params = new URLSearchParams();
+    params.set("local", local);
+    if (item.image) params.set("img", item.image);
+    if (item.animeTitle) params.set("title", item.animeTitle);
+    if (item.animeHref) params.set("anime", item.animeHref);
+    if (item.epNum != null) params.set("ep", String(item.epNum));
+    navigate(`/watch/${encodeURIComponent(item.episodeHref)}?${params.toString()}`);
+  }, [navigate]);
 
   return (
     <div className="space-y-5">
@@ -52,7 +65,7 @@ export function DownloadsPage() {
           {items.map((it) => (
             <div key={it.id} className="flex items-center gap-3 rounded-xl border border-white/10 bg-surface p-2.5">
               <div className="h-16 w-12 shrink-0 overflow-hidden rounded-md bg-bg">
-                {it.image ? <img src={it.image} alt="" className="h-full w-full object-cover" /> : <div className="h-full w-full shimmer" />}
+                {it.image ? <img src={it.image} alt="" referrerPolicy="no-referrer" onError={(event) => { event.currentTarget.style.display = "none"; }} className="h-full w-full object-cover" /> : <div className="h-full w-full shimmer" />}
               </div>
               <div className="min-w-0 flex-1">
                 <h3 className="line-clamp-1 font-semibold text-white">{it.animeTitle || it.episodeTitle}</h3>
@@ -66,7 +79,7 @@ export function DownloadsPage() {
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 {it.status === "completed" && (
-                  <button onClick={() => setPlaying(it)} title={t.playDownload} className="rounded-full bg-accent px-3 py-1.5 text-xs font-bold text-black transition-colors hover:bg-accent-bright">
+                  <button onClick={() => playOffline(it)} title={t.playDownload} className="rounded-full bg-accent px-3 py-1.5 text-xs font-bold text-black transition-colors hover:bg-accent-bright">
                     {t.playDownload}
                   </button>
                 )}
@@ -88,23 +101,6 @@ export function DownloadsPage() {
         </div>
       )}
 
-      {/* Inline offline player */}
-      {playing && (
-        <div className="fixed inset-0 z-[9999] flex flex-col bg-black/95" onClick={() => setPlaying(null)}>
-          <div className="flex items-center justify-between p-4">
-            <p className="line-clamp-1 font-semibold text-white">{playing.episodeTitle || playing.animeTitle}</p>
-            <button onClick={() => setPlaying(null)} className="rounded-full bg-white/10 px-3 py-1.5 text-sm text-white hover:bg-white/20">✕</button>
-          </div>
-          <div className="flex flex-1 items-center justify-center px-4 pb-6" onClick={(e) => e.stopPropagation()}>
-            <video
-              src={downloadFileUrl(playing.id)}
-              controls
-              autoPlay
-              className="max-h-full max-w-full rounded-lg bg-black"
-            />
-          </div>
-        </div>
-      )}
     </div>
   );
 }

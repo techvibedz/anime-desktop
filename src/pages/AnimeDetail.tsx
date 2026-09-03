@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useMemo } from "react";
 import { useParams, Link } from "react-router-dom";
 import {
-  fetchEpisodes, fetchEpisodesUp4,
+  fetchEpisodes, fetchEpisodesUp4, fetchAnime3rbEpisodes,
   type AnimeDetail, type Episode,
 } from "../lib/api";
 import { addFavorite, removeFavorite, favoriteListOf, type FavoriteList } from "../lib/favorites";
@@ -9,32 +9,50 @@ import { getCompletedSets, isEpisodeWatched, animeTitleKey, normHref, toggleWatc
 import { recordAnimeCompletion } from "../lib/completion";
 import { fetchSeriesFinished } from "../lib/airing";
 import { Shimmer } from "../components/Shimmer";
+import { DownloadPicker } from "../components/DownloadPicker";
+import type { DownloadMeta } from "../lib/downloads";
 import { t } from "../lib/i18n";
+
+type SourceId = "witanime" | "anime4up" | "anime3rb";
+type GridEpisode = Episode & {
+  href4up: string | null;
+  href3rb: string | null;
+  sources: SourceId[];
+};
 
 export function AnimeDetailPage() {
   const { id } = useParams<{ id: string }>();
   const animeHref = id ? decodeURIComponent(id) : "";
   const [data, setData] = useState<AnimeDetail | null>(null);
   const [episodes4up, setEpisodes4up] = useState<Episode[]>([]);
+  const [episodes3rb, setEpisodes3rb] = useState<Episode[]>([]);
   const [merged, setMerged] = useState<{ anime4up: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [bookmarkList, setBookmarkList] = useState<FavoriteList | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [downloadMeta, setDownloadMeta] = useState<DownloadMeta | null>(null);
   const [completed, setCompleted] = useState<CompletedSets>({ hrefs: new Set(), numbersByTitle: new Map() });
 
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
     setData(null); setLoading(true); setError(null);
-    setEpisodes4up([]); setMerged(null);
+    setEpisodes4up([]); setEpisodes3rb([]); setMerged(null);
     favoriteListOf(animeHref).then(setBookmarkList);
     getCompletedSets().then(setCompleted);
 
     // Kick off the primary scrape. As soon as it returns the up4Hint
     // (from a direct link on the wit page) we start the up4 scrape with
     // that URL — no title-search round-trip required.
-    fetchEpisodes(animeHref)
+    // onUpdated fires when the background revalidation finds visibly newer
+    // data (a newly-aired episode) — the list refreshes itself, no reload.
+    // Only `data` is replaced: episodes4up/merged are enriched separately and
+    // a fresh payload carries none, so touching them would clear the union.
+    fetchEpisodes(animeHref, (fresh) => {
+      if (cancelled) return;
+      setData(fresh.data);
+    })
       .then((res) => {
         if (cancelled) return;
         setData(res.data);
@@ -59,6 +77,20 @@ export function AnimeDetailPage() {
     return () => { cancelled = true; };
   }, [id, animeHref]);
 
+  // Mobile parity: Anime3rb contributes a third, independent episode list.
+  // Resolve it after the primary detail has painted so it never delays opening
+  // the page. An Anime3rb-primary page already owns that list, so skip it.
+  useEffect(() => {
+    if (!data?.title || /anime3rb\.com/i.test(animeHref)) return;
+    let cancelled = false;
+    fetchAnime3rbEpisodes(data.title)
+      .then((episodes) => {
+        if (!cancelled && episodes.length > 0) setEpisodes3rb(episodes);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [data?.title, animeHref]);
+
   const onBookmark = useCallback(async (list: FavoriteList) => {
     if (!data) return;
     await addFavorite({ title: data.title, href: animeHref, image: data.poster, list });
@@ -71,19 +103,45 @@ export function AnimeDetailPage() {
     setBookmarkList(null);
   }, [animeHref]);
 
-  const onToggleWatched = useCallback(async (ep: Episode) => {
-    if (!data || !ep.href) return;
-    await toggleWatched(ep.href, {
+  const onToggleWatched = useCallback(async (ep: GridEpisode) => {
+    const primary = ep.href || ep.href4up || ep.href3rb;
+    if (!data || !primary) return;
+    await toggleWatched(primary, {
       episodeTitle: ep.title || `${t.episode} ${ep.number}`,
       animeTitle: data.title,
       animeHref,
       image: data.poster,
-      url4up: pickUp4ForEpisode(ep, episodes4up) ?? undefined,
+      url4up: ep.href4up ?? undefined,
       epNum: ep.number ?? undefined,
     });
     // Re-read the index so both the href and per-title number sets reflect the toggle.
     getCompletedSets().then(setCompleted);
-  }, [data, animeHref, episodes4up]);
+  }, [data, animeHref]);
+
+  const onDownload = useCallback((ep: GridEpisode) => {
+    if (!data) return;
+    const primary = ep.href || ep.href4up || ep.href3rb;
+    if (!primary) return;
+    setDownloadMeta({
+      animeTitle: data.title,
+      episodeTitle: ep.title || `${t.episode} ${ep.number}`,
+      epNum: ep.number ?? null,
+      image: ep.screenshot || data.poster || "",
+      animeHref,
+      episodeHref: primary,
+      url4up: ep.href4up || undefined,
+      url3rb: ep.href3rb || undefined,
+    });
+  }, [data, animeHref]);
+
+  // A title-based secondary lookup can resolve a different season/cour. Match
+  // the mobile app's trust guard: require overlap with the opened page and
+  // clamp secondaries to its episode-number range. When the primary list is
+  // empty, keep the secondary lists because they are the only usable data.
+  const trusted = useMemo(
+    () => trustedSources(data?.episodes ?? [], episodes4up, episodes3rb),
+    [data?.episodes, episodes4up, episodes3rb],
+  );
 
   // Record this anime's completion state (caught-up / finished) for the
   // poster-card badges — synced to the cloud so the mobile app sees it too.
@@ -95,7 +153,7 @@ export function AnimeDetailPage() {
   // and toggling a non-final episode doesn't re-fire the AniList airing check.
   const { maxNum, caughtUp } = useMemo(() => {
     if (!data) return { maxNum: 0, caughtUp: false };
-    const all = [...data.episodes, ...episodes4up];
+    const all = [...data.episodes, ...trusted.up4, ...trusted.a3rb];
     let mx = 0;
     let hasNum = false;
     for (const e of all) {
@@ -104,28 +162,57 @@ export function AnimeDetailPage() {
     if (!hasNum) return { maxNum: 0, caughtUp: false };
     const lastHrefs = all.filter((e) => e.number === mx).map((e) => e.href).filter(Boolean) as string[];
     return { maxNum: mx, caughtUp: isEpisodeWatched(completed, { hrefs: lastHrefs, epNum: mx, animeTitle: data.title }) };
-  }, [data, episodes4up, completed]);
+  }, [data, trusted, completed]);
 
-  // Displayed episode list = the primary source's episodes UNION the anime4up
-  // episodes it's missing. anime4up frequently uploads newer episodes before
-  // witanime/anime3rb, so rendering only `data.episodes` left the latest ones
-  // hidden ("not full episodes"). Merge by number, keep ascending order (the
-  // scrapers already sort ascending), and let anime4up-only episodes carry their
-  // own href/screenshot so they open + resolve servers like any other.
+  // Union all three trusted episode lists by number. Each grid entry retains
+  // every source href, so the player can start with the best available primary
+  // and layer servers from the other two sources on top.
   const displayEpisodes = useMemo(() => {
-    if (!data) return [] as Episode[];
-    const byNum = new Map<number, Episode>();
-    const noNum: Episode[] = [];
-    for (const e of data.episodes) {
-      if (e.number != null) { if (!byNum.has(e.number)) byNum.set(e.number, e); }
-      else noNum.push(e);
+    if (!data) return [] as GridEpisode[];
+    const byNum = new Map<number, GridEpisode>();
+    const ensure = (episode: Episode): GridEpisode => {
+      let item = byNum.get(episode.number);
+      if (!item) {
+        item = { ...episode, href: null, href4up: null, href3rb: null, sources: [] };
+        byNum.set(episode.number, item);
+      }
+      return item;
+    };
+    const addSource = (item: GridEpisode, source: SourceId) => {
+      if (!item.sources.includes(source)) item.sources.push(source);
+    };
+    for (const episode of data.episodes) {
+      const item = ensure(episode);
+      item.href = episode.href ?? item.href;
+      item.title = episode.title || item.title;
+      if (episode.type) item.type = episode.type;
+      if (episode.screenshot) item.screenshot = episode.screenshot;
+      const source = sourceOfHref(episode.href || animeHref);
+      addSource(item, source);
+      if (source === "anime4up") item.href4up = episode.href;
+      if (source === "anime3rb") item.href3rb = episode.href;
     }
-    for (const e of episodes4up) {
-      if (e.number != null && !byNum.has(e.number)) byNum.set(e.number, e);
+    for (const episode of trusted.up4) {
+      const item = ensure(episode);
+      item.href4up = episode.href || item.href4up;
+      if (!item.screenshot && episode.screenshot) item.screenshot = episode.screenshot;
+      addSource(item, "anime4up");
     }
-    const merged = [...byNum.values()].sort((a, b) => (a.number ?? 0) - (b.number ?? 0));
-    return [...merged, ...noNum];
-  }, [data, episodes4up]);
+    for (const episode of trusted.a3rb) {
+      const item = ensure(episode);
+      item.href3rb = episode.href || item.href3rb;
+      if (!item.screenshot && episode.screenshot) item.screenshot = episode.screenshot;
+      addSource(item, "anime3rb");
+    }
+    return [...byNum.values()].sort((a, b) => (a.number ?? 0) - (b.number ?? 0));
+  }, [data, trusted, animeHref]);
+
+  const availableSources = useMemo(() => {
+    const found = new Set<SourceId>([sourceOfHref(animeHref)]);
+    if (trusted.up4.length > 0) found.add("anime4up");
+    if (trusted.a3rb.length > 0) found.add("anime3rb");
+    return (["witanime", "anime4up", "anime3rb"] as SourceId[]).filter((source) => found.has(source));
+  }, [animeHref, trusted]);
 
   // The set of episode numbers watched for THIS anime (cross-source), resolved
   // ONCE instead of re-deriving the title key (NFKD + regex) inside every card.
@@ -230,11 +317,11 @@ export function AnimeDetailPage() {
                   ♡ {t.addToList}
                 </button>
               )}
-              {merged?.anime4up && (
-                <span className="rounded-full bg-violet/20 px-3 py-1 text-[11px] font-semibold text-white">
-                  {t.bothSources}
+              {availableSources.map((source) => (
+                <span key={source} className="rounded-full bg-violet/20 px-3 py-1 text-[11px] font-semibold text-white">
+                  {sourceLabel(source)}
                 </span>
-              )}
+              ))}
             </div>
           </div>
         </div>
@@ -248,29 +335,61 @@ export function AnimeDetailPage() {
             // cross-source episode-number set.
             const isDone =
               (!!ep.href && completed.hrefs.has(normHref(ep.href))) ||
+              (!!ep.href4up && completed.hrefs.has(normHref(ep.href4up))) ||
+              (!!ep.href3rb && completed.hrefs.has(normHref(ep.href3rb))) ||
               (ep.number != null && !!watchedNumbers?.has(ep.number));
-            const up4 = pickUp4ForEpisode(ep, episodes4up);
+            const primary = ep.href || ep.href4up || ep.href3rb || "";
+            // Anime4up and Anime3rb episode indexes usually do not publish a
+            // per-episode screenshot. Match mobile: use the anime poster as the
+            // artwork fallback, and also fall back to it when a supplied remote
+            // screenshot fails to load.
+            const artwork = ep.screenshot || data.poster;
             return (
-              <div key={ep.href ?? `e${ep.number}`} className="group relative">
+              <div key={`${ep.number}-${primary}`} className="group relative">
                 <Link
                   to={(() => {
                     const params = new URLSearchParams();
-                    if (up4) params.set("up4", up4);
-                    if (ep.screenshot) params.set("img", ep.screenshot);
+                    if (ep.href4up && ep.href4up !== primary) params.set("up4", ep.href4up);
+                    if (ep.href3rb && ep.href3rb !== primary) params.set("a3rb", ep.href3rb);
+                    if (artwork) params.set("img", artwork);
                     params.set("anime", animeHref);
+                    params.set("title", data.title);
+                    params.set("ep", String(ep.number));
                     const q = params.toString();
-                    return `/watch/${encodeURIComponent(ep.href ?? "")}${q ? `?${q}` : ""}`;
+                    return `/watch/${encodeURIComponent(primary)}${q ? `?${q}` : ""}`;
                   })()}
                   className={`relative block aspect-video overflow-hidden rounded-lg bg-surface ring-1 transition ${
                     isDone ? "opacity-60 ring-accent/40" : "ring-white/5 hover:ring-accent/60"
                   }`}
                 >
-                  {ep.screenshot ? (
-                    <img src={ep.screenshot} alt="" loading="lazy" decoding="async" className="h-full w-full object-cover" />
-                  ) : (
-                    <div className="h-full w-full bg-gradient-to-br from-raised to-surface" />
+                  <div className="absolute inset-0 bg-gradient-to-br from-raised to-surface" />
+                  {artwork && (
+                    <img
+                      src={artwork}
+                      alt={`${data.title} — ${t.episode} ${ep.number}`}
+                      loading="lazy"
+                      decoding="async"
+                      referrerPolicy="no-referrer"
+                      className="absolute inset-0 h-full w-full object-cover"
+                      onError={(event) => {
+                        const image = event.currentTarget;
+                        if (data.poster && image.dataset.posterFallback !== "1") {
+                          image.dataset.posterFallback = "1";
+                          image.src = data.poster;
+                        } else {
+                          image.style.display = "none";
+                        }
+                      }}
+                    />
                   )}
                   <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent" />
+                  <div className="absolute start-1.5 top-1.5 flex gap-1">
+                    {ep.sources.map((source) => (
+                      <span key={source} className="rounded bg-black/70 px-1 py-0.5 text-[8px] font-bold uppercase text-white/80">
+                        {sourceShortLabel(source)}
+                      </span>
+                    ))}
+                  </div>
                   <div className="absolute inset-x-1.5 bottom-1.5 flex items-center justify-between">
                     <span className="rounded bg-black/60 px-1.5 py-0.5 text-[11px] font-bold text-white">
                       {t.episode} {ep.number}
@@ -278,13 +397,22 @@ export function AnimeDetailPage() {
                     {isDone && <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-bold text-black">✓</span>}
                   </div>
                 </Link>
-                <button
-                  onClick={() => onToggleWatched(ep)}
-                  className="absolute end-1.5 top-1.5 hidden h-6 w-6 items-center justify-center rounded-full bg-black/70 text-[11px] text-white transition-colors hover:bg-accent hover:text-black group-hover:flex"
-                  title={isDone ? "Mark unwatched" : "Mark watched"}
-                >
-                  {isDone ? "↶" : "✓"}
-                </button>
+                <div className="absolute end-1.5 top-1.5 hidden flex-col gap-1 group-hover:flex">
+                  <button
+                    onClick={() => onDownload(ep)}
+                    className="flex h-6 w-6 items-center justify-center rounded-full bg-black/75 text-white transition-colors hover:bg-accent hover:text-black"
+                    title={t.downloadEpisode}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3v10.55l3.3-3.3 1.4 1.4L12 17.4l-4.7-4.75 1.4-1.4 3.3 3.3V3h2zM5 19h14v2H5z" /></svg>
+                  </button>
+                  <button
+                    onClick={() => onToggleWatched(ep)}
+                    className="flex h-6 w-6 items-center justify-center rounded-full bg-black/75 text-[11px] text-white transition-colors hover:bg-accent hover:text-black"
+                    title={isDone ? "Mark unwatched" : "Mark watched"}
+                  >
+                    {isDone ? "↶" : "✓"}
+                  </button>
+                </div>
               </div>
             );
           })}
@@ -342,6 +470,12 @@ export function AnimeDetailPage() {
         </div>
       )}
 
+      <DownloadPicker
+        visible={downloadMeta !== null}
+        meta={downloadMeta}
+        onClose={() => setDownloadMeta(null)}
+      />
+
     </div>
   );
 }
@@ -356,7 +490,51 @@ function titleFromSlug(href: string): string {
   }
 }
 
-function pickUp4ForEpisode(ep: Episode, up4: Episode[]): string | null {
-  if (!up4.length) return null;
-  return up4.find((u) => u.number === ep.number)?.href ?? null;
+function sourceOfHref(href: string): SourceId {
+  if (/anime3rb\.com/i.test(href)) return "anime3rb";
+  if (/anime4up/i.test(href)) return "anime4up";
+  return "witanime";
+}
+
+function sourceLabel(source: SourceId): string {
+  if (source === "anime4up") return "Anime4up";
+  if (source === "anime3rb") return "Anime3rb";
+  return "WitAnime";
+}
+
+function sourceShortLabel(source: SourceId): string {
+  if (source === "anime4up") return "4up";
+  if (source === "anime3rb") return "3rb";
+  return "wit";
+}
+
+function trustedSources(
+  anchor: Episode[],
+  up4: Episode[],
+  a3rb: Episode[],
+): { up4: Episode[]; a3rb: Episode[] } {
+  const anchorNums = new Set<number>();
+  for (const episode of anchor) {
+    if (episode.number != null) anchorNums.add(episode.number);
+  }
+  if (anchorNums.size === 0) return { up4, a3rb };
+
+  let min = Infinity;
+  let max = -Infinity;
+  for (const number of anchorNums) {
+    min = Math.min(min, number);
+    max = Math.max(max, number);
+  }
+
+  const clamp = (episodes: Episode[]) => {
+    const overlaps = episodes.some(
+      (episode) => episode.number != null && anchorNums.has(episode.number),
+    );
+    if (!overlaps) return [];
+    return episodes.filter(
+      (episode) => episode.number != null && episode.number >= min && episode.number <= max,
+    );
+  };
+
+  return { up4: clamp(up4), a3rb: clamp(a3rb) };
 }

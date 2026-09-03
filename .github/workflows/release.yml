@@ -1,0 +1,74 @@
+name: Release desktop apps
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-latest
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Build Windows installer
+        if: matrix.platform == 'windows'
+        run: npx electron-builder --win --publish never
+      - name: Build Linux packages
+        if: matrix.platform == 'linux'
+        run: npx electron-builder --linux AppImage tar.gz --publish never
+      - name: Upload Windows artifacts
+        if: matrix.platform == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            release/Pantoufa-Setup-*.exe
+            release/Pantoufa-Setup-*.exe.blockmap
+            release/latest.yml
+          if-no-files-found: error
+      - name: Upload Linux artifacts
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: |
+            release/Pantoufa-*.AppImage
+            release/Pantoufa-*.AppImage.blockmap
+            release/Pantoufa-*.tar.gz
+            release/latest-linux.yml
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}" artifacts/*
+          --repo "${GITHUB_REPOSITORY}"
+          --title "${GITHUB_REF_NAME}"
+          --generate-notes
+          --verify-tag

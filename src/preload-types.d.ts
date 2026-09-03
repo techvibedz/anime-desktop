@@ -42,6 +42,7 @@ declare global {
       fetchJson: (opts: { url: string; method?: string; body?: string; headers?: Record<string, string> }) => Promise<string | null>;
       downloadStart: (opts: { id: string; url: string; provider: string }) => Promise<{ ok: boolean; total?: number }>;
       downloadDelete: (id: string) => Promise<boolean>;
+      downloadQuery: (id: string) => Promise<{ exists: boolean; valid: boolean; size: number }>;
       onDownloadProgress: (handler: (info: { id: string; bytes: number; total: number }) => void) => () => void;
       downloadFileUrl: (id: string) => string;
     };

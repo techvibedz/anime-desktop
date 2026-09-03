@@ -2,19 +2,28 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useParams, useSearchParams, Link, useNavigate } from "react-router-dom";
 import Hls from "hls.js";
 import {
-  fetchVideoServers, enrichServersFromUp4, resolveVideo, fetchEpisodes, fetchEpisodesUp4,
-  resolveUp4EpisodeUrl, fetchAnime3rbServers,
+  fetchVideoServers, fetchCompleteVideoServers, enrichServersFromUp4, resolveVideo, fetchEpisodes, fetchEpisodesUp4,
+  resolveUp4EpisodeUrl, fetchAnime3rbServers, fetchAnime3rbServersByUrl,
   isDefinitiveMiss, clearDefinitiveMiss,
   invalidateServersCache, invalidateResolveCache,
   type VideoServer, type Episode,
 } from "../lib/api";
+import {
+  STREAM_BUFFER_POLICY,
+  bufferAheadSeconds,
+  createGenerationGuard,
+  mergeVideoServers,
+  sortVideoServers,
+  videoContentType,
+} from "../lib/videoProviders";
 import { saveProgress, getProgress } from "../lib/history";
 import { recordEpisodeWatched } from "../lib/completion";
 import { toAnimeUrl } from "../lib/favorites";
 import {
-  startDownload, subscribeDownloads, getDownloadByEpisode,
-  type DownloadStatus,
+  subscribeDownloads, getDownloadByEpisode,
+  type DownloadStatus, type DownloadMeta,
 } from "../lib/downloads";
+import { DownloadPicker } from "../components/DownloadPicker";
 import { t } from "../lib/i18n";
 import { useAuth } from "../lib/auth";
 import { useWatchPartySync, createRoom } from "../lib/watchParty";
@@ -29,16 +38,6 @@ type ServerWithSource = VideoServer & { source?: string };
 function setMutedSafe(muted: boolean) {
   window.pantoufa.setMuted?.(muted).catch(() => {});
 }
-
-const PROVIDER_RANK: Record<string, number> = {
-  // vid3rb (anime3rb's first-party host) ranks top: a single static GET
-  // yields a direct 1080p .mp4 that plays natively in the custom player —
-  // no ads, no Cloudflare, Range-capable CDN.
-  vid3rb: 0, dailymotion: 0, streamwish: 1, videa: 2, voe: 3,
-  share4max: 4, streamruby: 5, mp4upload: 6, doodstream: 7,
-  uqload: 8, okru: 9, yonaplay: 10, vk: 11,
-};
-function rank(p: string) { return PROVIDER_RANK[p] ?? 50; }
 
 // Carries the measured bandwidth across hls.js instances so a server switch /
 // next episode starts at a rendition the link can actually sustain instead of
@@ -98,6 +97,10 @@ function formatTime(s: number): string {
 }
 
 const STALL_THRESHOLD_MS = 15000;
+// The mobile app owns server discovery now. Keep the previous source-specific
+// effects in place as an easy rollback path, but do not run them alongside the
+// shared three-source pipeline (that would duplicate requests and race state).
+const USE_COMPLETE_SERVER_DISCOVERY = true;
 
 // Skip-intro heuristic. Anime openings run ~85s but don't always start at
 // second 0 — a cold-open/recap often pushes the OP a few minutes in. We have
@@ -115,8 +118,13 @@ export function WatchPage() {
   const navigate = useNavigate();
   const episodeUrl = episode ? decodeURIComponent(episode) : "";
   const up4Param = params.get("up4");
+  const a3rbParam = params.get("a3rb");
   const imgParam = params.get("img");
   const animeParam = params.get("anime");
+  const titleParam = params.get("title") || "";
+  const epParam = Number(params.get("ep"));
+  const localParam = params.get("local") || "";
+  const isOffline = localParam.startsWith("pantoufa-file:");
 
   const [servers, setServers] = useState<ServerWithSource[]>([]);
   // Direct anime4up episode URL harvested off the witanime episode page by
@@ -239,10 +247,13 @@ export function WatchPage() {
   const partyNavParams = useMemo<Record<string, string>>(() => {
     const p: Record<string, string> = {};
     if (up4Param) p.up4 = up4Param;
+    if (a3rbParam) p.a3rb = a3rbParam;
     if (imgParam) p.img = imgParam;
     if (animeParam) p.anime = animeParam;
+    if (titleParam) p.title = titleParam;
+    if (Number.isFinite(epParam) && epParam > 0) p.ep = String(epParam);
     return p;
-  }, [up4Param, imgParam, animeParam]);
+  }, [up4Param, a3rbParam, imgParam, animeParam, titleParam, epParam]);
   const party = useWatchPartySync({ videoRef, episode: episodeUrl, navParams: partyNavParams });
   const isPartyClient = party.role === "client";
   // Read through a ref so the control handlers can see the live role.
@@ -255,23 +266,35 @@ export function WatchPage() {
   }, [user]);
 
   const sortedServers = useMemo(
-    () => [...servers]
+    () => sortVideoServers(servers
       // Hide unrecognized witanime embeds (mega.nz etc.), but always keep
       // anime4up-sourced servers — their data-watch URLs often don't match
       // a known provider regex yet still play fine in an iframe.
-      .filter((s) => s.provider !== "generic" || s.source === "anime4up")
-      .sort((a, b) => rank(a.provider) - rank(b.provider)),
+      .filter((s) => s.provider !== "generic" || s.source === "anime4up" || s.source === "offline")),
     [servers],
   );
 
-  // Fetch server list once.
+  const serverDiscoveryGuardRef = useRef(createGenerationGuard());
+  const activeServerUrlRef = useRef<string | null>(null);
+
+  // Mobile-parity discovery: WitAnime, Anime4up, and Anime3rb start together,
+  // candidates appear as each source answers, and direct streams are warmed in
+  // provider/quality order. One source failing never hides the others.
   useEffect(() => {
     if (!episodeUrl) return;
-    let cancelled = false;
+    const generation = serverDiscoveryGuardRef.current.next();
+    const isCurrent = () => serverDiscoveryGuardRef.current.isCurrent(generation);
+    let deliveredAny = false;
     // Clear servers when episode changes so the loading state shows
     // properly. This prevents showing servers for the wrong episode
     // during prev/next navigation.
     setServers([]);
+    activeServerUrlRef.current = null;
+    setActiveIdx(null);
+    setBrokenIds(new Set());
+    setResolved(null);
+    setStatus("idle");
+    setUserActivated(false);
     setHarvestedUp4(null);
     setDirectUp4(null);
     // Clear the titles too: on watch→watch navigation the component stays
@@ -282,37 +305,70 @@ export function WatchPage() {
     setMeta({ episodeTitle: "", animeTitle: "" });
     setLoadingServers(true);
     setServerError(false);
-    console.info(`[player] fetching servers for episode: ${episodeUrl}`);
-    console.info(`[player] up4Param: ${up4Param || 'none'}`);
-    fetchVideoServers(episodeUrl, up4Param || undefined)
-      .then((r) => {
-        if (cancelled) return;
-        console.info(`[player] loaded ${r.data.servers.length} servers for: ${r.data.episodeTitle}`);
-        // Merge append-only (dedupe by URL) instead of replacing wholesale.
-        // anime4up enrichment can run CONCURRENTLY with this primary scrape
-        // (when the anime4up URL is already known via ?up4= or harvested off
-        // the witanime page), so a wholesale replace here would race-wipe the
-        // anime4up servers an earlier enrichment run already appended.
-        setServers((prev) => {
-          const have = new Set(prev.map((s) => s.iframeUrl));
-          const additions = r.data.servers.filter((s) => !have.has(s.iframeUrl));
-          return additions.length ? [...prev, ...additions] : prev;
-        });
-        if ((r.data as any).up4EpisodeUrl) {
-          console.info(`[player] harvested direct anime4up episode: ${(r.data as any).up4EpisodeUrl}`);
-          setHarvestedUp4((r.data as any).up4EpisodeUrl);
-        }
-        setMeta({ episodeTitle: r.data.episodeTitle, animeTitle: r.data.animeTitle });
+    if (isOffline) {
+      const offline: ServerWithSource = {
+        id: "offline",
+        name: t.watchOffline,
+        iframeUrl: localParam,
+        videoUrl: localParam,
+        provider: "local",
+        source: "offline",
+      };
+      setServers([offline]);
+      activeServerUrlRef.current = localParam;
+      setActiveIdx(0);
+      setUserActivated(true);
+      setMeta({
+        animeTitle: titleParam,
+        episodeTitle: Number.isFinite(epParam) && epParam > 0 ? `${t.episode} ${epParam}` : t.downloadOffline,
+      });
+      if (imgParam) setPosterFromDetail(imgParam);
+      setStatus("resolving");
+      setLoadingServers(false);
+      return () => { serverDiscoveryGuardRef.current.next(); };
+    }
+    console.info(`[player] discovering all sources for episode: ${episodeUrl}`);
+
+    const applyPayload = (payload: Awaited<ReturnType<typeof fetchCompleteVideoServers>>) => {
+      if (!isCurrent() || payload.data.servers.length === 0) return;
+      deliveredAny = true;
+      // Put the newer group first so a warmed candidate upgrades the existing
+      // row with videoUrl instead of being discarded by URL deduplication.
+      setServers((prev) => mergeVideoServers([payload.data.servers, prev]));
+      if (payload.data.up4EpisodeUrl) setHarvestedUp4(payload.data.up4EpisodeUrl);
+      setMeta((prev) => ({
+        episodeTitle: payload.data.episodeTitle || prev.episodeTitle,
+        animeTitle: payload.data.animeTitle || prev.animeTitle,
+      }));
+      setServerError(false);
+      setLoadingServers(false);
+    };
+
+    fetchCompleteVideoServers({
+      episodeUrl,
+      url4up: up4Param,
+      url3rb: a3rbParam,
+      animeHref: animeParam,
+      animeTitle: titleParam,
+      episodeNumber: Number.isFinite(epParam) && epParam > 0 ? epParam : null,
+      force: retryServersNonce > 0,
+      onCandidates: applyPayload,
+      onPartial: applyPayload,
+    })
+      .then((payload) => {
+        if (!isCurrent()) return;
+        applyPayload(payload);
+        if (!deliveredAny && payload.data.servers.length === 0) setServerError(true);
         setLoadingServers(false);
       })
       .catch((err) => {
-        if (cancelled) return;
-        console.error("[player] failed to fetch video servers", err);
-        setServerError(true);
+        if (!isCurrent()) return;
+        console.error("[player] complete server discovery failed", err);
+        if (!deliveredAny) setServerError(true);
         setLoadingServers(false);
       });
-    return () => { cancelled = true; };
-  }, [episodeUrl, up4Param, retryServersNonce]);
+    return () => { serverDiscoveryGuardRef.current.next(); };
+  }, [episodeUrl, up4Param, a3rbParam, animeParam, titleParam, epParam, retryServersNonce, isOffline, localParam, imgParam]);
 
   // Fetch parent anime to populate prev/next + back-to-anime button.
   // Falls back to slug-deriving the anime URL from the episode URL when
@@ -325,7 +381,7 @@ export function WatchPage() {
   }, [animeParam, episodeUrl]);
 
   useEffect(() => {
-    if (!resolvedAnimeHref) return;
+    if (!resolvedAnimeHref || isOffline) return;
     let cancelled = false;
     // This effect only re-fires when the PARENT ANIME changes, so clear the
     // previous anime's data immediately: stale siblings would let prev/next
@@ -352,11 +408,12 @@ export function WatchPage() {
       })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [resolvedAnimeHref]);
+  }, [resolvedAnimeHref, isOffline]);
 
   // Episode number of the currently playing episode (used to match the
   // anime4up sibling when no explicit ?up4= was supplied).
   const currentEpNumber = useMemo(() => {
+    if (Number.isFinite(epParam) && epParam > 0) return epParam;
     const m = episodeUrl.match(/الحلقة[\s\-_]*(\d+)/);
     if (m) return parseInt(m[1], 10);
     const byHref = siblings.find((e) => {
@@ -364,7 +421,7 @@ export function WatchPage() {
       catch { return false; }
     });
     return byHref?.number ?? null;
-  }, [episodeUrl, siblings]);
+  }, [episodeUrl, siblings, epParam]);
 
   // Effective anime4up episode URL: the explicit ?up4= if present, else
   // the cross-source sibling matched by episode number.
@@ -423,6 +480,7 @@ export function WatchPage() {
   // anime URL is derived/guessed (e.g. One Piece, no embedded anime4up link).
   // Only kicks in when no other source has produced an anime4up URL yet.
   useEffect(() => {
+    if (USE_COMPLETE_SERVER_DISCOVERY) return;
     if (up4Param || harvestedUp4) return;          // already have a better source
     if (directUp4) return;                          // already resolved (e.g. via slug title)
     if (/anime4up/i.test(episodeUrl)) return;       // primary is already anime4up
@@ -431,7 +489,7 @@ export function WatchPage() {
     // Slug-derived title lets this fire on mount (no waiting on the scrape);
     // when the real title differs and the slug search found nothing, the
     // effect re-runs with the better title once the scrape reports it.
-    const title = meta.animeTitle || animeTitleFromDetail || slugTitle;
+    const title = titleParam || meta.animeTitle || animeTitleFromDetail || slugTitle;
     if (!title) return;                             // wait until we know the title
     let cancelled = false;
     const epAtStart = episodeUrl;
@@ -471,7 +529,7 @@ export function WatchPage() {
       })
       .catch((e) => { if (cancelled) return; console.warn(`[player] direct anime4up resolution failed:`, e); scheduleRetry(); });
     return () => { cancelled = true; };
-  }, [up4Param, harvestedUp4, directUp4, episodeUrl, currentEpNumber, up4Siblings, meta.animeTitle, animeTitleFromDetail, slugTitle, directUp4Nonce]);
+  }, [up4Param, harvestedUp4, directUp4, episodeUrl, currentEpNumber, up4Siblings, titleParam, meta.animeTitle, animeTitleFromDetail, slugTitle, directUp4Nonce]);
 
   // Reset the enrichment retry state whenever the episode changes (or a
   // manual/auto refresh is requested via retryServersNonce).
@@ -516,7 +574,7 @@ export function WatchPage() {
     invalidateServersCache(episodeUrl);
     // Wipe any "definitively absent" verdict so a manual refresh genuinely
     // re-queries anime4up/anime3rb instead of short-circuiting on the miss.
-    const rt = meta.animeTitle || animeTitleFromDetail || slugTitle;
+    const rt = titleParam || meta.animeTitle || animeTitleFromDetail || slugTitle;
     if (rt) clearDefinitiveMiss(rt);
     enrichAttemptsRef.current = 0;
     enrichStartedAtRef.current = 0;
@@ -532,7 +590,7 @@ export function WatchPage() {
     directUp4StartedAtRef.current = 0;
     if (directUp4RetryTimer.current) { clearTimeout(directUp4RetryTimer.current); directUp4RetryTimer.current = null; }
     setRetryServersNonce((n) => n + 1);
-  }, [episodeUrl, meta.animeTitle, animeTitleFromDetail, slugTitle]);
+  }, [episodeUrl, titleParam, meta.animeTitle, animeTitleFromDetail, slugTitle]);
 
   // Merge anime4up servers once an anime4up URL is known (explicit ?up4=
   // or resolved cross-source). Runs CONCURRENTLY with the primary witanime
@@ -542,6 +600,7 @@ export function WatchPage() {
   // append-only merge (here and in the primary load) means neither run can
   // clobber the other's servers. Runs only once per episode/URL.
   useEffect(() => {
+    if (USE_COMPLETE_SERVER_DISCOVERY) return;
     if (!effectiveUp4) return;
     if (/anime4up/i.test(episodeUrl)) return;
     if (up4ServerCount > 0) return;             // already enriched successfully
@@ -663,6 +722,7 @@ export function WatchPage() {
   useEffect(() => () => { if (a3rbRetryTimer.current) clearTimeout(a3rbRetryTimer.current); }, []);
 
   useEffect(() => {
+    if (USE_COMPLETE_SERVER_DISCOVERY) return;
     if (currentEpNumber == null) return;        // can't construct an episode URL
     if (a3rbServerCount > 0) return;            // already enriched successfully
     if (a3rbInFlightRef.current) return;        // a run is already going
@@ -670,7 +730,7 @@ export function WatchPage() {
     // Slug-derived title lets this fire on mount; the effect re-runs with the
     // real title once the scrape reports it (and the resolution caches by
     // title, so the re-run is a different cache key — both stay cheap).
-    const title = meta.animeTitle || animeTitleFromDetail || slugTitle;
+    const title = titleParam || meta.animeTitle || animeTitleFromDetail || slugTitle;
     if (!title) return;
     const epAtStart = episodeUrl;
     // Same staleness rule as the anime4up enrichment: only the user actually
@@ -698,7 +758,12 @@ export function WatchPage() {
       if (a3rbRetryTimer.current) clearTimeout(a3rbRetryTimer.current);
       a3rbRetryTimer.current = setTimeout(() => setA3rbNonce((n) => n + 1), delay);
     };
-    fetchAnime3rbServers(title, currentEpNumber)
+    const request = a3rbParam
+      ? fetchAnime3rbServersByUrl(a3rbParam)
+      : /anime3rb\.com\/episode\//i.test(episodeUrl)
+        ? fetchAnime3rbServersByUrl(episodeUrl)
+        : fetchAnime3rbServers(title, currentEpNumber);
+    request
       .then((found) => {
         a3rbInFlightRef.current = false;
         if (leftEpisode()) return;
@@ -721,16 +786,27 @@ export function WatchPage() {
       });
     // No cleanup — same rationale as the anime4up enrichment effect above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentEpNumber, a3rbServerCount, episodeUrl, retryServersNonce, meta.animeTitle, animeTitleFromDetail, slugTitle, a3rbNonce]);
+  }, [currentEpNumber, a3rbServerCount, episodeUrl, retryServersNonce, a3rbParam, titleParam, meta.animeTitle, animeTitleFromDetail, slugTitle, a3rbNonce]);
 
   // Auto-pick the highest-ranked NON-broken server (highlight only).
   useEffect(() => {
     if (sortedServers.length === 0) return;
     const firstGood = sortedServers.findIndex((s) => !brokenIds.has(s.id));
     if (firstGood >= 0 && activeIdx === null) {
+      activeServerUrlRef.current = sortedServers[firstGood].iframeUrl;
       setActiveIdx(firstGood);
     }
   }, [sortedServers, brokenIds, activeIdx]);
+
+  // Late source arrivals can insert a higher-ranked server before the selected
+  // row. Keep selection attached to its URL so discovery never switches video
+  // underneath a user who already pressed Play.
+  useEffect(() => {
+    const activeUrl = activeServerUrlRef.current;
+    if (!activeUrl) return;
+    const stableIdx = sortedServers.findIndex((server) => server.iframeUrl === activeUrl);
+    if (stableIdx >= 0 && stableIdx !== activeIdx) setActiveIdx(stableIdx);
+  }, [sortedServers, activeIdx]);
 
   // Pre-resolve the auto-picked server the moment it's known, so the user's
   // Play click serves a cached stream URL instantly instead of kicking off
@@ -741,6 +817,7 @@ export function WatchPage() {
   const prefetchedRef = useRef<Set<string>>(new Set());
   useEffect(() => { prefetchedRef.current = new Set(); }, [episodeUrl]);
   useEffect(() => {
+    if (USE_COMPLETE_SERVER_DISCOVERY) return;
     if (userActivated) return;            // real resolve flow has taken over
     if (activeIdx === null) return;
     const srv = sortedServers[activeIdx];
@@ -752,6 +829,7 @@ export function WatchPage() {
   }, [sortedServers, activeIdx, userActivated, episodeUrl]);
 
   const activateServer = useCallback((idx: number) => {
+    activeServerUrlRef.current = sortedServers[idx]?.iframeUrl || null;
     setActiveIdx(idx);
     setUserActivated(true);
     setResolved(null);
@@ -760,7 +838,7 @@ export function WatchPage() {
     reextractCount.current = 0;
     iframeFailedRef.current = false;
     setIframeLoaded(false);
-  }, []);
+  }, [sortedServers]);
 
   // Slow-connection quality step-down. The anime3rb qualities are separate
   // servers over fixed-bitrate progressive MP4s — no ABR exists, so when the
@@ -852,10 +930,25 @@ export function WatchPage() {
   useEffect(() => {
     if (!userActivated) return;
     if (activeIdx === null || !sortedServers[activeIdx]) return;
-    const srv = sortedServers[activeIdx];
+    const srv = sortedServers.find((server) => server.iframeUrl === activeServerUrlRef.current)
+      || sortedServers[activeIdx];
     let cancelled = false;
     setResolved(null);
     setStatus("resolving");
+
+    // The complete mobile pipeline pre-resolves its best direct candidates.
+    // Reuse that URL immediately; the normal resolver remains the fallback for
+    // a candidate that arrived before its warm-up completed.
+    if (srv.videoUrl) {
+      const contentType = videoContentType(srv.videoUrl, srv.provider);
+      setResolved({
+        url: srv.videoUrl,
+        type: contentType === "hls" ? "hls" : "mp4",
+        embed: srv.iframeUrl,
+      });
+      setStatus("playing");
+      return () => { cancelled = true; };
+    }
 
     // Extraction is intermittently flaky: a transient Cloudflare check or a
     // slow embed can make a provider we CAN normally extract come back as an
@@ -869,7 +962,7 @@ export function WatchPage() {
       const MAX_ATTEMPTS = fastRetry ? 2 : 1;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
-          const r = await resolveVideo(srv.iframeUrl, srv.provider);
+          const r = await resolveVideo(srv.iframeUrl, srv.provider, { fresh: attempt > 1 });
           if (cancelled) return;
           if (r.success && r.data?.videoUrl) {
             const gotDirect = r.data.type === "hls" || r.data.type === "mp4";
@@ -1007,6 +1100,21 @@ export function WatchPage() {
     // stall recovery works on the new source.
     userPausedRef.current = false;
 
+    // Match mobile's minBufferForPlayback=4: preload immediately, but release
+    // autoplay only after a useful cushion exists. This also applies after a
+    // source handoff because every resolved URL creates a fresh effect run.
+    let startupReleased = false;
+    const maybeStartPlayback = () => {
+      if (startupReleased || userPausedRef.current) return;
+      let end = 0;
+      try { end = v.buffered.length ? v.buffered.end(v.buffered.length - 1) : 0; } catch {}
+      const ahead = bufferAheadSeconds(v.currentTime, end) || 0;
+      const fullyBuffered = Number.isFinite(v.duration) && v.duration > 0 && end >= v.duration - 0.1;
+      if (ahead < STREAM_BUFFER_POLICY.minBufferForPlaybackSeconds && !fullyBuffered) return;
+      startupReleased = true;
+      v.play().catch(() => { startupReleased = false; });
+    };
+
     let played = false;
     let advanced = false;
     let lastTime = 0;
@@ -1127,6 +1235,7 @@ export function WatchPage() {
     };
 
     const onPlaying = () => {
+      startupReleased = true;
       played = true;
       // Real playback resumed — refill the in-place budget so a long episode
       // on a flaky CDN survives more than 2 drops total. A dead stream never
@@ -1147,6 +1256,7 @@ export function WatchPage() {
       if (!played) {
         lastTimeUpdate = Date.now();
       }
+      maybeStartPlayback();
     };
 
     // Fast recovery for chunk drops — the `stalled` event fires when the
@@ -1166,6 +1276,8 @@ export function WatchPage() {
     v.addEventListener("playing", onPlaying);
     v.addEventListener("timeupdate", onTimeUpdate);
     v.addEventListener("progress", onProgress);
+    v.addEventListener("canplay", maybeStartPlayback);
+    v.addEventListener("loadeddata", maybeStartPlayback);
     v.addEventListener("stalled", onStalled);
     
     const interval = setInterval(checkStall, 1000);
@@ -1190,11 +1302,12 @@ export function WatchPage() {
         // accumulate surplus during the throttled download so a delayed or
         // dropped fragment never surfaces as a mid-stream stall. (Mirrors the
         // mobile expo-video 300s forward-buffer change.)
-        maxBufferLength: 90,
-        maxMaxBufferLength: 600,
-        // Don't let the 60MB default byte cap clip the 1080p cushion before the
-        // time target is reached — let buffer time win over size.
-        maxBufferSize: 120 * 1000 * 1000,
+        maxBufferLength: STREAM_BUFFER_POLICY.preferredForwardBufferSeconds,
+        maxMaxBufferLength: Math.max(600, STREAM_BUFFER_POLICY.preferredForwardBufferSeconds),
+        // Mobile uses maxBufferBytes=0 + prioritizeTimeOverSizeThreshold. hls.js
+        // has no zero-as-unlimited mode, so use its largest safe numeric budget
+        // and let the 300-second time target control the forward buffer.
+        maxBufferSize: Number.MAX_SAFE_INTEGER,
         // Generous timeouts.
         manifestLoadingTimeOut: 20000,
         manifestLoadingMaxRetry: 3,
@@ -1259,9 +1372,10 @@ export function WatchPage() {
       hls.on(Hls.Events.FRAG_LOADED, () => {
         if (!played) lastTimeUpdate = Date.now();
         if (hls.bandwidthEstimate > 0) lastBandwidthEstimate = hls.bandwidthEstimate;
+        maybeStartPlayback();
       });
       hls.on(Hls.Events.LEVEL_LOADED, () => { if (!played) lastTimeUpdate = Date.now(); });
-      hls.on(Hls.Events.MANIFEST_PARSED, () => { if (!played) lastTimeUpdate = Date.now(); });
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { if (!played) lastTimeUpdate = Date.now(); maybeStartPlayback(); });
       hls.on(Hls.Events.ERROR, (_e, data) => {
         // Non-fatal network errors — chunk drop, buffer stall, slow CDN.
         // Auto-run startLoad() to kick the stream back to life. When the
@@ -1377,7 +1491,7 @@ export function WatchPage() {
       // vid3rb also plays direct: its signed CDN URLs answer Range requests,
       // need no Referer/cookies and aren't IP-locked (noip=yes) — while the
       // proxy would buffer the whole ~300MB file before the first byte.
-      const playsDirect = /mp4upload|videa\.hu|vidvaita|vidit|vid3rb\.com/i.test(resolved.url);
+      const playsDirect = resolved.url.startsWith("pantoufa-file:") || /mp4upload|videa\.hu|vidvaita|vidit|vid3rb\.com/i.test(resolved.url);
       v.src = playsDirect ? resolved.url : proxied;
     }
 
@@ -1387,6 +1501,8 @@ export function WatchPage() {
       v.removeEventListener("playing", onPlaying);
       v.removeEventListener("timeupdate", onTimeUpdate);
       v.removeEventListener("progress", onProgress);
+      v.removeEventListener("canplay", maybeStartPlayback);
+      v.removeEventListener("loadeddata", maybeStartPlayback);
       v.removeEventListener("stalled", onStalled);
       // Chromium does NOT pause a media element just because React detached
       // it from the DOM — a direct-src <video> (vid3rb/videa/mp4upload, the
@@ -1598,13 +1714,17 @@ export function WatchPage() {
     if (matching4) p.set("up4", matching4);
     if (ep.screenshot) p.set("img", ep.screenshot);
     if (animeParam) p.set("anime", animeParam);
+    const title = titleParam || meta.animeTitle || animeTitleFromDetail;
+    if (title) p.set("title", title);
+    if (ep.number != null) p.set("ep", String(ep.number));
     const qs = p.toString();
     navigate(`/watch/${encodeURIComponent(ep.href)}${qs ? `?${qs}` : ""}`);
-  }, [up4Siblings, animeParam, navigate]);
+  }, [up4Siblings, animeParam, titleParam, meta.animeTitle, animeTitleFromDetail, navigate]);
 
   // ── Offline download of the current episode ──
   const [dlStatus, setDlStatus] = useState<DownloadStatus | null>(null);
   const [dlProgress, setDlProgress] = useState(0);
+  const [downloadMeta, setDownloadMeta] = useState<DownloadMeta | null>(null);
   useEffect(() => {
     if (!episodeUrl) { setDlStatus(null); setDlProgress(0); return; }
     let cancelled = false;
@@ -1621,8 +1741,8 @@ export function WatchPage() {
   }, [episodeUrl]);
 
   const startEpisodeDownload = useCallback(() => {
-    if (!episodeUrl) return;
-    startDownload({
+    if (!episodeUrl || isOffline) return;
+    setDownloadMeta({
       animeTitle: meta.animeTitle || animeTitleFromDetail || "",
       episodeTitle: meta.episodeTitle || (currentEpNumber != null ? `${t.episode} ${currentEpNumber}` : ""),
       epNum: currentEpNumber,
@@ -1630,8 +1750,9 @@ export function WatchPage() {
       animeHref: resolvedAnimeHref || "",
       episodeHref: episodeUrl,
       url4up: effectiveUp4 || undefined,
+      url3rb: a3rbParam || undefined,
     });
-  }, [episodeUrl, meta, animeTitleFromDetail, currentEpNumber, imgParam, posterFromDetail, resolvedAnimeHref, effectiveUp4]);
+  }, [episodeUrl, isOffline, meta, animeTitleFromDetail, currentEpNumber, imgParam, posterFromDetail, resolvedAnimeHref, effectiveUp4, a3rbParam]);
 
   const togglePlay = useCallback(() => {
     if (partyClientRef.current) return; // host controls playback in a party
@@ -1714,6 +1835,7 @@ export function WatchPage() {
   // the retry loop hasn't given up — show a subtle "still searching" hint so
   // the user knows more servers are on the way.
   const searchingMoreServers =
+    !USE_COMPLETE_SERVER_DISCOVERY &&
     !!effectiveUp4 && !/anime4up/i.test(episodeUrl) && up4ServerCount === 0 && !enrichExhausted;
   // The "Skip Intro" affordance is eligible only in the custom player, during
   // the opening window (wide enough to catch cold-open/late openings), and only
@@ -1833,7 +1955,6 @@ export function WatchPage() {
           <>
             <video
               ref={videoRef}
-              autoPlay
               playsInline
               preload="auto"
               // No crossOrigin attribute — for direct mp4 src via our custom
@@ -1847,6 +1968,7 @@ export function WatchPage() {
                 const err = (e.target as HTMLVideoElement).error;
                 const code = err?.code;
                 console.warn(`[player] <video> error code=${code} message=${err?.message || ""}`);
+                if (isOffline) { setStatus("failed"); return; }
                 // During HLS playback the SAME <video> element surfaces MSE
                 // failures (bufferAppendError → PIPELINE_ERROR_DECODE code=3),
                 // but hls.js already owns recovery via Hls.Events.ERROR
@@ -2156,7 +2278,7 @@ export function WatchPage() {
         </div>
         <div className="flex items-center gap-2">
           {/* Offline download */}
-          <button
+          {!isOffline && <button
             onClick={startEpisodeDownload}
             disabled={dlStatus === "downloading" || dlStatus === "resolving" || dlStatus === "completed"}
             title={t.downloadEpisode}
@@ -2168,7 +2290,7 @@ export function WatchPage() {
               : dlStatus === "resolving" ? t.downloadResolving
               : dlStatus === "failed" ? t.downloadRetry
               : t.download}
-          </button>
+          </button>}
           {resolvedAnimeHref && (
             <Link
               to={`/anime/${encodeURIComponent(resolvedAnimeHref)}`}
@@ -2231,7 +2353,7 @@ export function WatchPage() {
                 >
                   {displayName(s)}
                   {s.source && (
-                    <span className="ms-1.5 opacity-60">· {s.source === "anime4up" ? "4up" : s.source === "anime3rb" ? "3rb" : "wit"}</span>
+                    <span className="ms-1.5 opacity-60">· {s.source === "anime4up" ? "4up" : s.source === "anime3rb" ? "3rb" : s.source === "offline" ? "offline" : "wit"}</span>
                   )}
                 </button>
               );
@@ -2271,6 +2393,11 @@ export function WatchPage() {
           </div>
         </aside>
       )}
+      <DownloadPicker
+        visible={downloadMeta !== null}
+        meta={downloadMeta}
+        onClose={() => setDownloadMeta(null)}
+      />
     </div>
   );
 }

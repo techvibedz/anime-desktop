@@ -776,16 +776,52 @@ export function anime3rbExactSlugs(title: string): string[] {
   return a3rbSlugVariants(title).filter((v) => v.full).map((v) => v.slug);
 }
 
+// What the caller knows about the wanted anime beyond its name (AniList).
+// Used to reject a same-name page from the WRONG franchise entry — an old
+// film vs a new TV remake share the base name ("koukaku-kidoutai" 1995 vs
+// "koukaku-kidoutai-tv" 2026), which title scoring alone can't tell apart.
+export type A3rbWant = { year: number | null; isMovie: boolean | null } | null;
+
+// anime3rb's SEO meta description ends with the airing season + year
+// ("…أنميات خريف 1995" film, "…أنميات صيف 2026" series) and its og:title
+// opens with the format word ("فيلم …" film, "أنمي …" series). Both are in
+// <head>, so the first chunk of HTML is enough. Missing markers yield nulls
+// (no rejection).
+export function a3rbPageYearType(html: string): { year: number | null; isMovie: boolean | null } {
+  const head = html.slice(0, 12000);
+  const ym = head.match(/(?:أنميات\s+\S+|عام|سنة)\s+((?:19|20)\d{2})/);
+  const tm =
+    head.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i) ||
+    head.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const og = tm ? tm[1].replace(/^\s+/, "") : "";
+  const isMovie = /^فيلم\s/.test(og) ? true : (/^(?:أنمي|انمي)\s/.test(og) ? false : null);
+  return { year: ym ? parseInt(ym[1], 10) : null, isMovie };
+}
+
+// Reject a page when the caller's known year/format contradicts it. A ±1-year
+// tolerance absorbs premiere-year boundary cases (a show listed 2025 on one
+// side and 2026 on the other); franchise entries are years apart, so the
+// tolerance never saves a wrong one. Only the series→film direction is checked
+// for format (the reported bug: a new TV series resolving to the old film).
+export function a3rbWantRejects(want: A3rbWant, html: string): boolean {
+  if (!want) return false;
+  const pt = a3rbPageYearType(html);
+  if (want.year != null && pt.year != null && Math.abs(pt.year - want.year) > 1) return true;
+  if (want.isMovie === false && pt.isMovie === true) return true;
+  return false;
+}
+
 // Probe /titles/<slug> and verify the page's own title actually matches the
 // wanted anime (same >=34 threshold as the other cross-source matchers) so a
 // coincidental slug can't hijack the match. Returns the page URL or null.
 // `relaxed` skips the title-score guard for an exact full-title slug (see
 // a3rbSlugVariants): the page exists, the slug is unique, so it IS the anime —
 // even when its og:title is in a different language than the query.
-async function probeA3rbTitlePage(slug: string, title: string, relaxed = false): Promise<string | null> {
+async function probeA3rbTitlePage(slug: string, title: string, relaxed = false, want: A3rbWant = null): Promise<string | null> {
   const url = `${A3RB_BASE}/titles/${slug}`;
   const html = await a3rbFetch(url);
   if (!html) return null; // miss (tarpit timeout) / fetch failure
+  if (a3rbWantRejects(want, html)) return null; // same base name, wrong franchise entry
   if (relaxed) return url; // exact full slug on a live page — confident match
   const tm =
     html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i) ||
@@ -799,10 +835,10 @@ async function probeA3rbTitlePage(slug: string, title: string, relaxed = false):
 // title. Only a FALLBACK now (the catalog resolves first — see api.ts): a
 // missed probe doesn't 404, it hangs until the timeout, so each guess is
 // expensive and a long guess chain re-triggers the tarpit. Cap hard.
-export async function searchAnime3rbDirect(title: string): Promise<string | null> {
+export async function searchAnime3rbDirect(title: string, want: A3rbWant = null): Promise<string | null> {
   if (!title) return null;
   for (const { slug, full } of a3rbSlugVariants(title).slice(0, 4)) {
-    const url = await probeA3rbTitlePage(slug, title, full);
+    const url = await probeA3rbTitlePage(slug, title, full, want);
     if (url) return url;
   }
   return null;
@@ -932,14 +968,47 @@ function a3rbCatalogMatch(title: string, slugs: string[]): string | null {
   return best.slug;
 }
 
-export async function searchAnime3rbCatalog(title: string): Promise<string | null> {
+export async function searchAnime3rbCatalog(title: string, want: A3rbWant = null): Promise<string | null> {
   if (!title) return null;
   const slugs = await fetchA3rbCatalog();
   if (!slugs.length) return null;
   const slug = a3rbCatalogMatch(title, slugs);
   if (!slug) return null;
   // Confirm against the real page's own title before trusting the match.
-  return probeA3rbTitlePage(slug, title);
+  return probeA3rbTitlePage(slug, title, false, want);
+}
+
+// Family disambiguation: franchises with BOTH an old film and a new TV remake
+// share one base slug ("koukaku-kidoutai" 1995 film vs "koukaku-kidoutai-tv"
+// 2026 series). Neither the slug guesses (they never emit the "-tv" form) nor
+// the strict catalog matcher (its token coverage rejects both) can find the
+// new entry, so the resolver used to lock onto the OLD film and play its
+// "episode 1". With a known year/format, scan the same-base slug family and
+// take the entry whose page year/format matches — the only reliable
+// discriminator. Runs only when a year/format is known AND the family has 2+
+// entries, so ordinary anime pay zero extra fetches. Capped: each probe is a
+// rate-gated a3rbFetch, so the tarpit-safe spacing applies here too.
+export async function searchAnime3rbFamily(title: string, want: A3rbWant): Promise<string | null> {
+  if (!title || !want || (want.year == null && want.isMovie == null)) return null;
+  const head = title.replace(/[\(\[][^\)\]]*[\)\]]/g, " ").split(/\s*[:：]\s*/)[0].trim();
+  const base = a3rbSlugify(head);
+  if (!base || base.length < 4) return null;
+  const slugs = await fetchA3rbCatalog();
+  const family = slugs.filter((s) => s === base || s.startsWith(base + "-")).slice(0, 15);
+  if (family.length < 2) return null;
+  let best: { url: string; score: number } | null = null;
+  for (const slug of family) {
+    const url = `${A3RB_BASE}/titles/${slug}`;
+    const html = await a3rbFetch(url);
+    if (!html || a3rbWantRejects(want, html)) continue;
+    const tm =
+      html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i) ||
+      html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const got = tm ? tm[1].replace(/\s*[-|–—]\s*Anime3rb.*$/i, "").trim() : slug.replace(/-+/g, " ");
+    const sc = tm_score(title, got);
+    if (sc >= 34 && (!best || sc > best.score)) best = { url, score: sc };
+  }
+  return best?.url ?? null;
 }
 
 // Typo-tolerant catalog ranking for the SEARCH screen (not the watch path).

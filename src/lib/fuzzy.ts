@@ -94,3 +94,39 @@ export function fuzzyScore(query: string, title: string): number {
 
   return Math.max(coverage, compactSim);
 }
+
+/** Broader source queries used alongside the complete phrase. WordPress
+ * source search treats multi-word text as one exact-ish phrase; querying a few
+ * meaningful pieces recovers misspellings such as "naruto shuppudin" via
+ * "naruto", while fuzzyScore still ranks the closest full title first. */
+export function wordSearchFallbacks(query: string, limit = 4): string[] {
+  const tokens = normFuzzy(query).split(" ").filter(Boolean);
+  if (tokens.length < 2) return [];
+  const noise = new Set([
+    "the", "and", "of", "in", "no", "to", "season", "part", "cour",
+    "anime", "series", "الجزء", "الموسم", "انمي",
+  ]);
+  const out: string[] = [];
+  for (const token of tokens) {
+    if (token.length < 3 || noise.has(token) || out.includes(token)) continue;
+    out.push(token);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/** Query plan shared with the mobile app: search the exact text, its normalized
+ * spelling, and meaningful words concurrently. Results are still ranked
+ * against the full user query, so broad word hits cannot outrank exact ones. */
+export function sourceSearchQueries(query: string, limit = 6): string[] {
+  const out: string[] = [];
+  const add = (value: string) => {
+    const trimmed = value.replace(/\s+/g, " ").trim();
+    const key = trimmed.toLowerCase();
+    if (trimmed && !out.some((item) => item.toLowerCase() === key)) out.push(trimmed);
+  };
+  add(query);
+  add(normFuzzy(query));
+  for (const word of wordSearchFallbacks(query)) add(word);
+  return out.slice(0, limit);
+}
