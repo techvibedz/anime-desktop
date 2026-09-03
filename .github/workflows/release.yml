@@ -10,6 +10,9 @@ permissions:
 
 jobs:
   build:
+    env:
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
     strategy:
       fail-fast: false
       matrix:
@@ -25,6 +28,8 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Validate authentication build configuration
+        run: node -e "if (!process.env.VITE_SUPABASE_URL || !process.env.VITE_SUPABASE_ANON_KEY) throw new Error('Missing Supabase build configuration')"
       - run: npm ci
       - run: npm run build
       - name: Build Windows installer

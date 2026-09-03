@@ -32,11 +32,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setReady(true);
       return;
     }
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
-      setUser(data.session?.user ?? null);
-      setReady(true);
-    });
+    supabase.auth.getSession()
+      .then(({ data, error }) => {
+        setSession(data.session);
+        setUser(data.session?.user ?? null);
+        if (error) setAuthError(error.message);
+      })
+      .catch((error) => {
+        console.warn("[auth] failed to restore session", error);
+        setAuthError(error instanceof Error ? error.message : "Could not restore the saved session.");
+      })
+      .finally(() => setReady(true));
     const { data: sub } = supabase.auth.onAuthStateChange((_event, sess) => {
       setSession(sess);
       setUser(sess?.user ?? null);

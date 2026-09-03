@@ -2000,15 +2000,81 @@ app.whenReady().then(() => {
   }
 
   // Offline-download playback: stream a saved .mp4 from <userData>/downloads.
-  // URL shape: pantoufa-file://x/<id>. net.fetch on the file: URL streams the
-  // bytes with Range support so the <video> element can seek.
+  // URL shape: pantoufa-file://x/<id>. Electron's file: fetch returns the
+  // requested byte slice but labels it 200 and strips Content-Range, which
+  // makes Chromium mark large videos as non-seekable. Handle ranges ourselves
+  // and report a truthful 206 response so the player can jump anywhere.
   protocol.handle(FILE_PROTOCOL, async (request) => {
     try {
       const id = new URL(request.url).pathname.split("/").filter(Boolean).pop() || "";
       const p = downloadPathFor(decodeURIComponent(id));
       if (!fs.existsSync(p)) return new Response("not found", { status: 404 });
+      const stat = await fs.promises.stat(p);
+      const size = stat.size;
+      const range = request.headers.get("range");
+      const commonHeaders = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "video/mp4",
+        "Cache-Control": "no-store",
+      };
+
+      if (request.method === "HEAD") {
+        return new Response(null, {
+          status: 200,
+          headers: { ...commonHeaders, "Content-Length": String(size) },
+        });
+      }
+
+      if (range) {
+        const match = range.match(/^bytes=(\d*)-(\d*)$/i);
+        if (!match || (!match[1] && !match[2])) {
+          return new Response(null, {
+            status: 416,
+            headers: { ...commonHeaders, "Content-Range": `bytes */${size}` },
+          });
+        }
+
+        const MAX_LOCAL_CHUNK = 4 * 1024 * 1024;
+        let start: number;
+        let end: number;
+        if (!match[1]) {
+          const suffix = Math.min(MAX_LOCAL_CHUNK, Math.max(1, parseInt(match[2], 10) || 0));
+          start = Math.max(0, size - suffix);
+          end = size - 1;
+        } else {
+          start = parseInt(match[1], 10);
+          const requestedEnd = match[2] ? parseInt(match[2], 10) : size - 1;
+          end = Math.min(requestedEnd, start + MAX_LOCAL_CHUNK - 1, size - 1);
+        }
+
+        if (!Number.isFinite(start) || start < 0 || start >= size || end < start) {
+          return new Response(null, {
+            status: 416,
+            headers: { ...commonHeaders, "Content-Range": `bytes */${size}` },
+          });
+        }
+
+        const length = end - start + 1;
+        const handle = await fs.promises.open(p, "r");
+        try {
+          const buffer = Buffer.allocUnsafe(length);
+          const { bytesRead } = await handle.read(buffer, 0, length, start);
+          const actualEnd = start + bytesRead - 1;
+          return new Response(buffer.subarray(0, bytesRead), {
+            status: 206,
+            headers: {
+              ...commonHeaders,
+              "Content-Length": String(bytesRead),
+              "Content-Range": `bytes ${start}-${actualEnd}/${size}`,
+            },
+          });
+        } finally {
+          await handle.close();
+        }
+      }
+
       return net.fetch(pathToFileURL(p).href, {
-        headers: request.headers, // forward Range so seeking works
+        headers: request.headers,
       });
     } catch (e) {
       console.warn("[pantoufa-file] failed:", e);
