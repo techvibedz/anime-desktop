@@ -254,7 +254,7 @@ export function WatchPage() {
     if (Number.isFinite(epParam) && epParam > 0) p.ep = String(epParam);
     return p;
   }, [up4Param, a3rbParam, imgParam, animeParam, titleParam, epParam]);
-  const party = useWatchPartySync({ videoRef, episode: episodeUrl, navParams: partyNavParams });
+  const party = useWatchPartySync({ videoRef, episode: episodeUrl, navParams: partyNavParams, onPaused: (paused) => { userPausedRef.current = paused; } });
   const isPartyClient = party.role === "client";
   // Read through a ref so the control handlers can see the live role.
   const partyClientRef = useRef(false);
@@ -1755,11 +1755,11 @@ export function WatchPage() {
   }, [episodeUrl, isOffline, meta, animeTitleFromDetail, currentEpNumber, imgParam, posterFromDetail, resolvedAnimeHref, effectiveUp4, a3rbParam]);
 
   const togglePlay = useCallback(() => {
-    if (partyClientRef.current) return; // host controls playback in a party
+    if (partyClientRef.current) { party.requestPlayback(!!videoRef.current?.paused); return; }
     const v = videoRef.current; if (!v) return;
     if (v.paused) { userPausedRef.current = false; v.play().catch(() => {}); }
     else { userPausedRef.current = true; v.pause(); }
-  }, []);
+  }, [party.requestPlayback]);
   const onSeek = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     if (partyClientRef.current) return; // host controls seeking in a party
     const v = videoRef.current; if (!v || !duration) return;

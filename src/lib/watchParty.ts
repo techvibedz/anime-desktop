@@ -51,6 +51,7 @@ let lastState: PartyState | null = null;
 let lastNavTarget: string | null = null;
 const memberListeners = new Set<(m: PartyMember[]) => void>();
 const stateListeners = new Set<(s: PartyState) => void>();
+const controlListeners = new Set<(p: { episode: string; playing: boolean }) => void>();
 const roomListeners = new Set<(r: { code: string; role: PartyRole } | null) => void>();
 
 function computeMembers(): PartyMember[] {
@@ -101,8 +102,30 @@ async function openChannel(): Promise<void> {
     .on("presence", { event: "sync" }, emitMembers)
     .on("presence", { event: "join" }, emitMembers)
     .on("presence", { event: "leave" }, emitMembers)
+    .on("broadcast", { event: "control" }, ({ payload }) => {
+      if (room?.role !== "host" || !payload || typeof payload.episode !== "string" || typeof payload.playing !== "boolean") return;
+      for (const cb of controlListeners) cb(payload);
+    })
     .on("broadcast", { event: "sync" }, ({ payload }) => {
-      lastState = payload as PartyState;
+      if (!payload || typeof payload.episode !== "string" || typeof payload.playing !== "boolean" ||
+          !Number.isFinite(payload.positionMs) || payload.positionMs < 0 || !Number.isFinite(payload.at) ||
+          !payload.params || Object.values(payload.params).some((v) => typeof v !== "string")) return;
+      lastState = { ...payload, params: { ...payload.params,
+        url4up: payload.params.url4up || payload.params.up4 || "",
+        up4: payload.params.up4 || payload.params.url4up || "",
+        url3rb: payload.params.url3rb || payload.params.a3rb || "",
+        a3rb: payload.params.a3rb || payload.params.url3rb || "",
+        animeTitle: payload.params.animeTitle || payload.params.title || "",
+        title: payload.params.title || payload.params.animeTitle || "",
+        epNum: payload.params.epNum || payload.params.ep || "",
+        ep: payload.params.ep || payload.params.epNum || "",
+      } } as PartyState;
+      // Mobile route values carry an extra URI-encoding layer.
+      if ("url4up" in payload.params || "animeTitle" in payload.params) {
+        for (const key of Object.keys(lastState.params)) {
+          try { lastState.params[key] = decodeURIComponent(lastState.params[key]); } catch {}
+        }
+      }
       for (const cb of stateListeners) cb(lastState);
     })
     .subscribe(async (status) => {
@@ -187,7 +210,7 @@ function attach(): void {
 }
 
 function detach(): void {
-  if (!room) return;
+  if (!room || room.role === "host") return;
   if (leaveTimer) clearTimeout(leaveTimer);
   leaveTimer = setTimeout(() => { void leaveRoom(); }, DETACH_LEAVE_MS);
 }
@@ -198,6 +221,7 @@ export function useWatchPartySync(opts: {
   videoRef: React.RefObject<HTMLVideoElement | null>;
   episode: string;
   navParams: Record<string, string>;
+  onPaused: (paused: boolean) => void;
 }) {
   const navigate = useNavigate();
   const [role, setRole] = useState<PartyRole | null>(() => getRoom()?.role ?? null);
@@ -259,6 +283,25 @@ export function useWatchPartySync(opts: {
     };
   }, [role, opts.episode]);
 
+  useEffect(() => {
+    if (role !== "host") return;
+    const onControl = (p: { episode: string; playing: boolean }) => {
+      const o = optsRef.current;
+      const v = o.videoRef.current;
+      if (p.episode !== o.episode || !v) return;
+      o.onPaused(!p.playing);
+      if (p.playing) void v.play().catch(() => {});
+      else v.pause();
+      sendState({ episode: o.episode, params: o.navParams, positionMs: Math.round(v.currentTime * 1000), playing: p.playing, at: Date.now() });
+    };
+    controlListeners.add(onControl);
+    return () => { controlListeners.delete(onControl); };
+  }, [role]);
+
+  const requestPlayback = (playing: boolean) => {
+    if (role === "client" && channel) void channel.send({ type: "broadcast", event: "control", payload: { episode: optsRef.current.episode, playing } });
+  };
+
   // CLIENT → follow the host on each broadcast.
   useEffect(() => {
     if (role !== "client") return;
@@ -284,10 +327,11 @@ export function useWatchPartySync(opts: {
       if (!v) return; // iframe server / not ready — can't position-sync
       const { shouldSeekTo, play } = computeSync(s, Math.round(v.currentTime * 1000), Date.now());
       if (shouldSeekTo != null) { try { v.currentTime = shouldSeekTo / 1000; } catch {} }
+      o.onPaused(!play);
       if (play && v.paused) v.play().catch(() => {});
       else if (!play && !v.paused) v.pause();
     });
   }, [role, navigate]);
 
-  return { role, code, members, hostPaused, leaveParty: leaveRoom };
+  return { role, code, members, hostPaused, requestPlayback, leaveParty: leaveRoom };
 }
