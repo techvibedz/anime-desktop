@@ -4,7 +4,7 @@
 //   • Presence  → who's in the room (avatar row in the overlay/lobby).
 //   • Broadcast → the host's player state (episode, position, play/pause).
 //
-// The host broadcasts its <video> state on a fixed 1.5s heartbeat; clients
+// The host broadcasts its <video> state on a fixed 0.5s heartbeat; clients
 // reconcile each beat against their local player (see computeSync). That single
 // periodic message covers play, pause AND seek with no per-event wiring. The
 // drift tolerance (DRIFT_TOLERANCE_MS) is the "buffer window" so clients don't
@@ -18,7 +18,7 @@
 // element. Iframe-embed servers can't be read/seeked cross-origin, so those
 // degrade to episode-sync only (everyone on the same episode, not the same ms).
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { RealtimeChannel, User } from "@supabase/supabase-js";
 import { supabase } from "./supabase";
@@ -34,10 +34,12 @@ export interface PartyMember {
   name: string;
   avatarUrl: string | null;
   isHost: boolean;
+  ready: boolean;
 }
 
-const HEARTBEAT_MS = 1500;
+const HEARTBEAT_MS = 500;
 const DETACH_LEAVE_MS = 2000; // grace so an episode-hop remount keeps the room
+const START_ANYWAY_MS = 20000;
 
 // ── Channel state (one room at a time) ────────────────────────────
 let channel: RealtimeChannel | null = null;
@@ -46,6 +48,7 @@ let leaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 let lastMembers: PartyMember[] = [];
 let lastState: PartyState | null = null;
+let myReady = false;
 // Last episode a client navigated to, so the immediate state replay on (re)mount
 // can't re-fire navigate() and spin into an infinite remount loop.
 let lastNavTarget: string | null = null;
@@ -61,6 +64,7 @@ function computeMembers(): PartyMember[] {
     name: string;
     avatar_url: string | null;
     is_host: boolean;
+    ready?: boolean;
   }>();
   const out: PartyMember[] = [];
   for (const presences of Object.values(state)) {
@@ -71,6 +75,7 @@ function computeMembers(): PartyMember[] {
       name: p.name,
       avatarUrl: p.avatar_url ?? null,
       isHost: !!p.is_host,
+      ready: p.ready !== false,
     });
   }
   return out.sort((a, b) => (a.isHost === b.isHost ? a.name.localeCompare(b.name) : a.isHost ? -1 : 1));
@@ -86,13 +91,22 @@ function emitRoom() {
   for (const cb of roomListeners) cb(snap);
 }
 
+function presencePayload() {
+  if (!room) return null;
+  const { user, role } = room;
+  const meta = user.user_metadata ?? {};
+  return {
+    user_id: user.id,
+    name: meta.full_name || meta.name || (user.email ? user.email.split("@")[0] : "User"),
+    avatar_url: meta.avatar_url || meta.picture || null,
+    is_host: role === "host",
+    ready: myReady,
+  };
+}
+
 async function openChannel(): Promise<void> {
   if (!room || channel) return;
-  const { user, code, role } = room;
-  const meta = user.user_metadata ?? {};
-  const name =
-    meta.full_name || meta.name || (user.email ? user.email.split("@")[0] : "User");
-  const avatarUrl = meta.avatar_url || meta.picture || null;
+  const { user, code } = room;
 
   channel = supabase.channel(`watch-party-${code}`, {
     config: { presence: { key: user.id }, broadcast: { self: false } },
@@ -130,14 +144,17 @@ async function openChannel(): Promise<void> {
     })
     .subscribe(async (status) => {
       if (status === "SUBSCRIBED" && channel) {
-        await channel.track({
-          user_id: user.id,
-          name,
-          avatar_url: avatarUrl,
-          is_host: role === "host",
-        });
+        const payload = presencePayload();
+        if (payload) await channel.track(payload);
       }
     });
+}
+
+export async function setReady(ready: boolean): Promise<void> {
+  if (myReady === ready) return;
+  myReady = ready;
+  const payload = presencePayload();
+  if (channel && payload) { try { await channel.track(payload); } catch {} }
 }
 
 async function closeChannel(): Promise<void> {
@@ -156,6 +173,7 @@ export function getRoom(): { code: string; role: PartyRole } | null {
 
 export async function createRoom(user: User): Promise<string> {
   await leaveRoom();
+  myReady = false;
   const code = genCode();
   room = { code, role: "host", user };
   await openChannel();
@@ -165,6 +183,7 @@ export async function createRoom(user: User): Promise<string> {
 
 export async function joinRoom(code: string, user: User): Promise<void> {
   await leaveRoom();
+  myReady = false;
   room = { code: code.trim().toUpperCase(), role: "client", user };
   await openChannel();
   emitRoom();
@@ -174,6 +193,7 @@ export async function leaveRoom(): Promise<void> {
   if (leaveTimer) { clearTimeout(leaveTimer); leaveTimer = null; }
   await closeChannel();
   room = null;
+  myReady = false;
   lastMembers = [];
   lastState = null;
   lastNavTarget = null;
@@ -222,12 +242,16 @@ export function useWatchPartySync(opts: {
   episode: string;
   navParams: Record<string, string>;
   onPaused: (paused: boolean) => void;
+  selfReady?: boolean;
 }) {
   const navigate = useNavigate();
   const [role, setRole] = useState<PartyRole | null>(() => getRoom()?.role ?? null);
   const [code, setCode] = useState<string | null>(() => getRoom()?.code ?? null);
   const [members, setMembers] = useState<PartyMember[]>([]);
   const [hostPaused, setHostPaused] = useState(false);
+  const [released, setReleased] = useState(false);
+  const [startAnywayAvailable, setStartAnywayAvailable] = useState(false);
+  const [waitingForHost, setWaitingForHost] = useState(() => getRoom()?.role === "client");
 
   const optsRef = useRef(opts);
   optsRef.current = opts;
@@ -235,6 +259,66 @@ export function useWatchPartySync(opts: {
   useEffect(() => { attach(); return () => detach(); }, []);
   useEffect(() => subscribeRoom((r) => { setRole(r?.role ?? null); setCode(r?.code ?? null); }), []);
   useEffect(() => subscribeMembers(setMembers), []);
+  useEffect(() => { void setReady(!!opts.selfReady); }, [opts.selfReady, role, code]);
+
+  useEffect(() => {
+    setReleased(false);
+    setStartAnywayAvailable(false);
+    if (role === "client") setWaitingForHost(true);
+  }, [opts.episode, role]);
+
+  useEffect(() => {
+    if (role !== "host" || released || startAnywayAvailable) return;
+    const timer = setTimeout(() => setStartAnywayAvailable(true), START_ANYWAY_MS);
+    return () => clearTimeout(timer);
+  }, [role, released, startAnywayAvailable, opts.episode]);
+
+  const viewers = members.filter((member) => !member.isHost);
+  const allReady = viewers.every((member) => member.ready);
+  const readyCount = viewers.filter((member) => member.ready).length;
+  const waitingCount = viewers.length - readyCount;
+
+  const applyPaused = useCallback((paused: boolean) => {
+    const o = optsRef.current;
+    const video = o.videoRef.current;
+    o.onPaused(paused);
+    if (!video) return;
+    if (paused) video.pause();
+    else void video.play().catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (role !== "host" || released) return;
+    applyPaused(true);
+  }, [role, released, opts.episode, applyPaused]);
+
+  const holdPlayback = (role === "host" && !released) || (role === "client" && waitingForHost);
+
+  const pulse = useCallback((playingOverride?: boolean) => {
+    const o = optsRef.current;
+    if (role === "client") {
+      if (channel && typeof playingOverride === "boolean") {
+        void channel.send({ type: "broadcast", event: "control", payload: { episode: o.episode, playing: playingOverride } });
+      }
+      return;
+    }
+    if (role !== "host") return;
+    const video = o.videoRef.current;
+    sendState({
+      episode: o.episode,
+      params: o.navParams,
+      positionMs: video ? Math.round(video.currentTime * 1000) : 0,
+      playing: playingOverride ?? (video ? !video.paused : false),
+      at: Date.now(),
+    });
+  }, [role]);
+
+  const start = useCallback(() => {
+    if (role !== "host" || released || (!allReady && !startAnywayAvailable)) return;
+    setReleased(true);
+    applyPaused(false);
+    pulse(true);
+  }, [role, released, allReady, startAnywayAvailable, applyPaused, pulse]);
 
   // HOST → broadcast the live <video> state every heartbeat.
   useEffect(() => {
@@ -254,49 +338,37 @@ export function useWatchPartySync(opts: {
   }, [role]);
 
   // HOST → also broadcast IMMEDIATELY on every play/pause/seek, not just on the
-  // heartbeat, so clients move in lock-step instead of waiting up to 1.5s (the
-  // "no delay" feel). Effects run after DOM commit, so re-keying on `episode`
+  // heartbeat, so clients move in lock-step instead of waiting for the next beat.
+  // Effects run after DOM commit, so re-keying on `episode`
   // re-attaches once the new <video> element for that episode is mounted; iframe
   // servers have no videoRef and stay heartbeat/episode-sync only.
   useEffect(() => {
     if (role !== "host") return;
     const v = optsRef.current.videoRef.current;
     if (!v) return;
-    const pulse = () => {
-      const o = optsRef.current;
-      const el = o.videoRef.current;
-      sendState({
-        episode: o.episode,
-        params: o.navParams,
-        positionMs: el ? Math.round(el.currentTime * 1000) : 0,
-        playing: el ? !el.paused : false,
-        at: Date.now(),
-      });
-    };
-    v.addEventListener("play", pulse);
-    v.addEventListener("pause", pulse);
-    v.addEventListener("seeked", pulse);
+    const onPlaybackChange = () => pulse();
+    v.addEventListener("play", onPlaybackChange);
+    v.addEventListener("pause", onPlaybackChange);
+    v.addEventListener("seeked", onPlaybackChange);
     return () => {
-      v.removeEventListener("play", pulse);
-      v.removeEventListener("pause", pulse);
-      v.removeEventListener("seeked", pulse);
+      v.removeEventListener("play", onPlaybackChange);
+      v.removeEventListener("pause", onPlaybackChange);
+      v.removeEventListener("seeked", onPlaybackChange);
     };
-  }, [role, opts.episode]);
+  }, [role, opts.episode, pulse]);
 
   useEffect(() => {
     if (role !== "host") return;
     const onControl = (p: { episode: string; playing: boolean }) => {
       const o = optsRef.current;
       const v = o.videoRef.current;
-      if (p.episode !== o.episode || !v) return;
-      o.onPaused(!p.playing);
-      if (p.playing) void v.play().catch(() => {});
-      else v.pause();
-      sendState({ episode: o.episode, params: o.navParams, positionMs: Math.round(v.currentTime * 1000), playing: p.playing, at: Date.now() });
+      if (p.episode !== o.episode || !v || !released) return;
+      applyPaused(!p.playing);
+      pulse(p.playing);
     };
     controlListeners.add(onControl);
     return () => { controlListeners.delete(onControl); };
-  }, [role]);
+  }, [role, released, applyPaused, pulse]);
 
   const requestPlayback = (playing: boolean) => {
     if (role === "client" && channel) void channel.send({ type: "broadcast", event: "control", payload: { episode: optsRef.current.episode, playing } });
@@ -313,6 +385,7 @@ export function useWatchPartySync(opts: {
     return subscribeState((s) => {
       const o = optsRef.current;
       setHostPaused(!s.playing);
+      if (s.playing) setWaitingForHost(false);
       // Host moved to a different episode → reopen it locally (room persists).
       const target = norm(s.episode);
       if (target && target !== norm(o.episode)) {
@@ -327,11 +400,24 @@ export function useWatchPartySync(opts: {
       if (!v) return; // iframe server / not ready — can't position-sync
       const { shouldSeekTo, play } = computeSync(s, Math.round(v.currentTime * 1000), Date.now());
       if (shouldSeekTo != null) { try { v.currentTime = shouldSeekTo / 1000; } catch {} }
-      o.onPaused(!play);
-      if (play && v.paused) v.play().catch(() => {});
-      else if (!play && !v.paused) v.pause();
+      applyPaused(!play);
     });
-  }, [role, navigate]);
+  }, [role, navigate, applyPaused]);
 
-  return { role, code, members, hostPaused, requestPlayback, leaveParty: leaveRoom };
+  return {
+    role,
+    code,
+    members,
+    hostPaused,
+    allReady,
+    readyCount,
+    waitingCount,
+    viewerCount: viewers.length,
+    holdPlayback,
+    start,
+    startAnywayAvailable,
+    waitingForHost,
+    requestPlayback,
+    leaveParty: leaveRoom,
+  };
 }

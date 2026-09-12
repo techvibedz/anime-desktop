@@ -242,6 +242,7 @@ export function WatchPage() {
   // heartbeat; client follows it (see lib/watchParty). Inert when not in a room.
   const { user } = useAuth();
   const [partyPanelOpen, setPartyPanelOpen] = useState(false);
+  const [partyReadyUrl, setPartyReadyUrl] = useState("");
   const autoStart = params.get("auto") === "1";
   // Query params re-broadcast so a client can reopen the SAME episode.
   const partyNavParams = useMemo<Record<string, string>>(() => {
@@ -254,11 +255,22 @@ export function WatchPage() {
     if (Number.isFinite(epParam) && epParam > 0) p.ep = String(epParam);
     return p;
   }, [up4Param, a3rbParam, imgParam, animeParam, titleParam, epParam]);
-  const party = useWatchPartySync({ videoRef, episode: episodeUrl, navParams: partyNavParams, onPaused: (paused) => { userPausedRef.current = paused; } });
+  const party = useWatchPartySync({
+    videoRef,
+    episode: episodeUrl,
+    navParams: partyNavParams,
+    selfReady: !!resolved && partyReadyUrl === resolved.url,
+    onPaused: (paused) => { userPausedRef.current = paused; },
+  });
   const isPartyClient = party.role === "client";
   // Read through a ref so the control handlers can see the live role.
   const partyClientRef = useRef(false);
   useEffect(() => { partyClientRef.current = isPartyClient; }, [isPartyClient]);
+  const partyHoldPlaybackRef = useRef(party.holdPlayback);
+  useEffect(() => { partyHoldPlaybackRef.current = party.holdPlayback; }, [party.holdPlayback]);
+  useEffect(() => {
+    if (party.role === "host" && party.holdPlayback) setPartyPanelOpen(true);
+  }, [party.role, party.holdPlayback]);
   const startParty = useCallback(() => {
     if (!user) return;
     createRoom(user).catch(() => {});
@@ -1105,7 +1117,7 @@ export function WatchPage() {
     // source handoff because every resolved URL creates a fresh effect run.
     let startupReleased = false;
     const maybeStartPlayback = () => {
-      if (startupReleased || userPausedRef.current) return;
+      if (startupReleased || userPausedRef.current || partyHoldPlaybackRef.current) return;
       let end = 0;
       try { end = v.buffered.length ? v.buffered.end(v.buffered.length - 1) : 0; } catch {}
       const ahead = bufferAheadSeconds(v.currentTime, end) || 0;
@@ -1917,6 +1929,7 @@ export function WatchPage() {
                    console.info(`[player] iframe loaded: ${resolved.url}`);
                    iframeLoadedRef.current = true;
                    setIframeLoaded(true);
+                   setPartyReadyUrl(resolved.url);
                    // Cancel any pending failure-advance — the embed is alive.
                    if (pendingAdvanceTimer.current) {
                      clearTimeout(pendingAdvanceTimer.current);
@@ -1964,6 +1977,7 @@ export function WatchPage() {
               className="h-full w-full bg-black"
               onClick={togglePlay}
               onDoubleClick={toggleFs}
+              onCanPlay={() => setPartyReadyUrl(resolved.url)}
               onError={(e) => {
                 const err = (e.target as HTMLVideoElement).error;
                 const code = err?.code;
@@ -2021,22 +2035,48 @@ export function WatchPage() {
                   <span className="flex-1 text-right text-sm font-bold text-white">
                     {party.role === "host" ? `${t.wpRoomCode}: ${party.code}` : t.wpFollowing}
                   </span>
+                  {party.viewerCount > 0 && (
+                    <span className="rounded-full bg-white/10 px-2 py-0.5 text-[10px] font-bold text-white/75">
+                      {t.wpReadyOf(party.readyCount, party.viewerCount)}
+                    </span>
+                  )}
                 </div>
                 <p className="mt-1 text-right text-xs text-text-muted">
                   {isPartyClient
-                    ? (party.hostPaused ? t.wpHostPaused : t.wpHostPlaying)
-                    : t.wpInRoom(party.members.length)}
+                    ? (party.hostPaused ? t.wpWaitingToStart : t.wpHostPlaying)
+                    : (party.holdPlayback
+                        ? (party.allReady ? t.wpAllReady : t.wpWaitingReady(party.waitingCount))
+                        : t.wpHostPlaying)}
                 </p>
                 <div className="mt-3 flex flex-row-reverse flex-wrap gap-1.5">
-                  {party.members.slice(0, 6).map((m) => (
-                    <div
-                      key={m.userId}
-                      className={`flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold text-white ${m.isHost ? "bg-accent" : "border border-white/10 bg-white/10"}`}
-                    >
-                      {(m.name || "?").trim().charAt(0).toUpperCase()}
-                    </div>
-                  ))}
+                  {party.members.slice(0, 6).map((m) => {
+                    const ready = m.isHost || m.ready;
+                    return (
+                      <div key={m.userId} className="relative" title={`${m.name} · ${ready ? t.wpReady : t.wpBuffering}`}>
+                        <div className={`flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold text-white ${m.isHost ? "bg-accent" : "border border-white/10 bg-white/10"}`}>
+                          {(m.name || "?").trim().charAt(0).toUpperCase()}
+                        </div>
+                        <span className={`absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-bg ${ready ? "bg-green-400" : "animate-pulse bg-amber-400"}`} />
+                      </div>
+                    );
+                  })}
                 </div>
+                {party.role === "host" && party.holdPlayback && (() => {
+                  const canStart = party.allReady || party.startAnywayAvailable;
+                  return (
+                    <button
+                      disabled={!canStart}
+                      onClick={party.start}
+                      className="mt-3 w-full rounded-lg bg-accent py-2 text-xs font-bold text-black transition hover:bg-accent-bright disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-text-muted"
+                    >
+                      {party.allReady
+                        ? t.wpStartForEveryone
+                        : party.startAnywayAvailable
+                          ? t.wpStartAnyway
+                          : t.wpWaitingReady(party.waitingCount)}
+                    </button>
+                  );
+                })()}
                 <button
                   onClick={() => { party.leaveParty(); setPartyPanelOpen(false); }}
                   className="mt-3 w-full rounded-lg border border-red-500/25 bg-red-500/10 py-2 text-xs font-bold text-red-400 transition hover:bg-red-500/20"

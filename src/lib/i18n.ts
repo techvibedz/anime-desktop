@@ -190,6 +190,14 @@ export const ar = {
   wpHostPlaying: "يتحكم المضيف بالتشغيل",
   wpFollowing: "تتابع المضيف",
   wpPartyBtn: "شاهد معاً",
+  wpReady: "جاهز",
+  wpBuffering: "يحمّل…",
+  wpAllReady: "الجميع جاهز",
+  wpWaitingReady: (n: number) => `بانتظار جاهزية ${n} ${n === 1 ? "مشاهد" : "مشاهدين"}…`,
+  wpStartForEveryone: "ابدأ للجميع",
+  wpWaitingToStart: "بانتظار أن يبدأ المضيف…",
+  wpReadyOf: (r: number, n: number) => `${r}/${n} جاهز`,
+  wpStartAnyway: "ابدأ على أي حال",
 };
 
 export const t = ar;

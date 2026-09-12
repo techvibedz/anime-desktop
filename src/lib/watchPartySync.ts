@@ -13,16 +13,19 @@ export interface PartyState {
   at: number;
 }
 
-export const DRIFT_TOLERANCE_MS = 2000; // buffer window — only seek past this
+// Keep players visually aligned without seeking on normal Realtime jitter.
+// Supabase Broadcast is typically tens of milliseconds; 200ms absorbs a slow
+// packet while removing the old, visibly-late two-second window.
+export const DRIFT_TOLERANCE_MS = 200;
 
 // Cap on the sender-clock compensation applied to a broadcast position. Two
 // devices with unsynced clocks (manual time, bad NTP) produce a `now - at` of
 // minutes; adding that to the expected position made the client seek past the
 // drift tolerance on EVERY heartbeat — a perpetual rebuffer storm where the
 // video never settles. Transit/processing delay is realistically <1s and the
-// drift tolerance already absorbs it, so clamp hard at 1s: legit late delivery
-// is still compensated, skewed clocks degrade to "no compensation" (in-sync).
-export const MAX_COMPENSATION_MS = 1000;
+// drift tolerance already absorbs it, so cap compensation below that window:
+// legit transit is covered and clock skew cannot trigger a seek storm.
+export const MAX_COMPENSATION_MS = 100;
 
 // Unambiguous alphabet (no 0/O/1/I) for spoken/typed room codes.
 const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
