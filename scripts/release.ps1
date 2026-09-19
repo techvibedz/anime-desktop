@@ -83,7 +83,11 @@ if (-not $SkipBuild) {
   $linuxTargets = if ($env:OS -eq "Windows_NT") { @("tar.gz") } else { @("AppImage", "tar.gz") }
   Write-Host "  > electron-builder --linux $($linuxTargets -join ' ')"
   if (-not $DryRun) {
-    npx electron-builder --linux @linuxTargets --publish never
+    if ($env:OS -eq "Windows_NT") {
+      npx electron-builder --linux tar.gz --publish never
+    } else {
+      npx electron-builder --linux AppImage tar.gz --publish never
+    }
     if ($LASTEXITCODE -ne 0) { throw "Linux build failed" }
   }
 }
