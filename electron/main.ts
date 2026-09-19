@@ -193,6 +193,9 @@ function handleAuthCallbackUrl(url: string) {
 // video CDNs but are heavily abused by popup ad networks. Match them only
 // when preceded by a dot (they're the top-level domain).
 const AD_HOST_RE = /doubleclick|googletagmanager|google-analytics|googleadservices|googlesyndication|adservice\.google|adnxs|facebook\.com\/tr|pixel\.facebook|popads|popcash|popmyads|popunder|propeller|propellerads|trafficjunky|adsterra|hilltopads|onclkds|onclickbid|onclickpredictiv|exoclick|magsrv|tsyndicate|clickadu|adcash|ad-maven|admaven|adsupply|servedbyadbutler|mgid|revcontent|adskeeper|trustedclicks|outbrain|taboola|etymonstheine|savorsaveragereaudit|offletsoroche|horizonungyve|visageagar|protrafficinspector|spendsdetachment|\.(?:cfd|cyou|life|shop|sbs|quest|buzz|top|ooo|live|today|icu|site|click|link|bid|trade|webcam|date|download|party|review|science|stream|racing|accountant|win|men|loan|faith|gdn)$/i;
+function isAdHost(host: string): boolean {
+  return !/(^|\.)witanime\.site$/i.test(host) && AD_HOST_RE.test(host);
+}
 
 // Canonical Referer/Origin a provider's embed expects, keyed by hostname.
 // Used both for proxy fetches AND (critically) for the embed iframe's own
@@ -284,7 +287,7 @@ function createMainWindow() {
   mainWindow.webContents.on("will-frame-navigate", (evt) => {
     if (evt.isMainFrame) return;
     const host = (() => { try { return new URL(evt.url).hostname.toLowerCase(); } catch { return ""; } })();
-    if (AD_HOST_RE.test(host)) {
+    if (isAdHost(host)) {
       console.info(`[ad-block] blocked iframe nav → ${host}`);
       evt.preventDefault();
     }
@@ -2119,7 +2122,7 @@ app.whenReady().then(() => {
       (details as any).resourceType === "media";
     const isVideoCdn =
       /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix|mp4upload|voe|dood|uqload|share4max|megamax|dailymotion|dmcdn/.test(host) ||
-      (looksLikeStream && host.includes(".") && !AD_HOST_RE.test(host) && !isSupabase);
+      (looksLikeStream && host.includes(".") && !isAdHost(host) && !isSupabase);
     if (isSupabase) {
       const origin = (() => {
         try { return new URL(details.referrer || "").origin; } catch { return "*"; }
@@ -2170,7 +2173,7 @@ app.whenReady().then(() => {
     // needing manual additions to every regex list in the codebase.
     // AD_HOST_RE already cancels ad-network requests before they reach
     // this check, and the renderer gates captures by captureForEmbed.
-    if (AD_HOST_RE.test(h)) return false;
+    if (isAdHost(h)) return false;
     if (/test-videos\.co\.uk|bigbuckbunny|sample[-_.]|placeholder/.test(h)) return false;
     return h.includes(".") && !/^\d+\.\d+/.test(h);
   }
@@ -2189,7 +2192,7 @@ app.whenReady().then(() => {
       // loads but its player JS / token request returns blocked, page
       // renders black). Hostname-only avoids the false positives.
       const host = (() => { try { return new URL(u).hostname.toLowerCase(); } catch { return ""; } })();
-      if (host && AD_HOST_RE.test(host)) {
+      if (host && isAdHost(host)) {
         console.info(`[ad-block] cancelled request to ${host}`);
         return callback({ cancel: true });
       }
@@ -2361,7 +2364,7 @@ app.whenReady().then(() => {
           // ok.ru embed Referer — not its own CDN domain.
           ref = "https://ok.ru/";
           ori = "https://ok.ru";
-        } else if (!AD_HOST_RE.test(host) && host.includes(".") && !/^\d+\.\d+/.test(host)) {
+        } else if (!isAdHost(host) && host.includes(".") && !/^\d+\.\d+/.test(host)) {
           // Sub-resource on a CDN host that doesn't match any provider regex
           // (e.g. a rotating streamwish/voe mirror, or ok.ru's mycdn.me). Use
           // the EMBED FRAME's origin to pick the canonical Referer the CDN

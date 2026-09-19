@@ -29,6 +29,46 @@ const HELPERS = `
     if (href.indexOf('//') === 0) return 'https:' + href;
     return base + (href.charAt(0) === '/' ? '' : '/') + href;
   };
+  window.__pSiteCards = function () {
+    var seen = {};
+    var out = [];
+    document.querySelectorAll('a[href*="/anime/"], a[href*="/movie/"]').forEach(function (a) {
+      var href = window.__pAbsUrl(a.getAttribute('href') || '', location.origin);
+      var titleEl = a.querySelector('h3');
+      var img = a.querySelector('img');
+      var title = (titleEl && titleEl.textContent.trim()) || '';
+      if (!href || !title || !img || seen[href]) return;
+      seen[href] = true;
+      var type = null;
+      a.querySelectorAll('div[class*="top-2"]').forEach(function (badge) {
+        var value = (badge.textContent || '').trim();
+        if (/^(TV|TV Short|OVA|ONA|Special|Music|PV|CM|فيلم)$/i.test(value)) type = value;
+      });
+      out.push({ title: title, href: href, image: window.__pBestImg(a), type: type, status: null, synopsis: null });
+    });
+    return out;
+  };
+  window.__pSiteEpisodes = function () {
+    var seen = {};
+    var out = [];
+    document.querySelectorAll('a[href*="/watch/"]').forEach(function (a) {
+      var href = window.__pAbsUrl(a.getAttribute('href') || '', location.origin);
+      var match = href.match(/\\/watch\\/(?!movie\\/)([^/?#]+)\\/(\\d+)(?:[/?#]|$)/i);
+      var titleEl = a.querySelector('h3');
+      var img = a.querySelector('img');
+      if (!match || !titleEl || !img || seen[href]) return;
+      seen[href] = true;
+      out.push({
+        title: 'الحلقة ' + match[2],
+        href: href,
+        image: window.__pBestImg(a),
+        animeTitle: titleEl.textContent.trim(),
+        animeHref: location.origin + '/anime/' + match[1],
+        isNew: true,
+      });
+    });
+    return out;
+  };
   window.__pWaitFor = function (checkFn, timeoutMs, intervalMs) {
     timeoutMs = timeoutMs || 25000;
     intervalMs = intervalMs || 500;
@@ -48,16 +88,30 @@ const HELPERS = `
 })();
 `;
 
-const WIT = "https://witanime.you";
+const WIT = "https://witanime.site";
 const UP4 = "https://w1.anime4up.rest";
 
 /* ── HOME (witanime) ──────────────────────────── */
 
 export const EXTRACT_HOME_WIT = `(async function(){${HELPERS}
 var ok = await window.__pWaitFor(function () {
-  return !!document.querySelector('.anime-card-container, .lucodeia-slider-slide-item, .episodes-card-container');
+  return !!document.querySelector('a[href*="/anime/"] h3, a[href*="/watch/"] h3, .anime-card-container, .lucodeia-slider-slide-item, .episodes-card-container');
 }, 18000);
 if (!ok) return null;
+
+var siteAnimes = window.__pSiteCards().filter(function (item) { return item.href.indexOf('/anime/') >= 0; });
+var siteEpisodes = window.__pSiteEpisodes();
+if (siteAnimes.length || siteEpisodes.length) {
+  return {
+    featured: siteAnimes.slice(0, 5).map(function (item) {
+      return { title: item.title, href: item.href, image: item.image, description: null, genres: [] };
+    }),
+    animes: siteAnimes.map(function (item) {
+      return { title: item.title, href: item.href, image: item.image, type: item.type, status: item.status, description: null, isNew: false, rating: null };
+    }),
+    episodes: siteEpisodes,
+  };
+}
 
 var featured = [];
 document.querySelectorAll('.lucodeia-slider-slide-item').forEach(function (el) {
@@ -157,9 +211,47 @@ function findRaw() {
   return null;
 }
 var ok = await window.__pWaitFor(function () {
-  return !!findRaw() || !!document.querySelector('.anime-details-title, .anime-page-link, .anime-thumbnail');
+  return !!findRaw() || !!document.querySelector('main a[href*="/watch/"], .anime-details-title, .anime-page-link, .anime-thumbnail');
 }, 22000);
 if (!ok) return null;
+var currentTitle = document.querySelector('main h1');
+var currentLinks = document.querySelectorAll('main a[href*="/watch/"]');
+if (currentTitle && currentLinks.length) {
+  var currentPoster = document.querySelector('main section img[alt]:not([alt=""])');
+  var info = currentTitle.closest('.flex-1') || currentTitle.parentElement;
+  var currentSynopsis = info && info.querySelector('p[class*="leading-relaxed"]');
+  var currentGenres = [];
+  if (info) info.querySelectorAll('div.mb-6.flex.flex-wrap.gap-2 span').forEach(function (el) {
+    var value = el.textContent.trim();
+    if (value) currentGenres.push(value);
+  });
+  var currentEpisodes = [];
+  var currentSeen = {};
+  currentLinks.forEach(function (a) {
+    var href = window.__pAbsUrl(a.getAttribute('href') || '', location.origin);
+    var match = href.match(/\\/watch\\/([^/?#]+)\\/(\\d+)(?:[/?#]|$)/i);
+    var movie = href.match(/\\/watch\\/movie\\/([^/?#]+)(?:[/?#]|$)/i);
+    if ((!match && !movie) || currentSeen[href]) return;
+    currentSeen[href] = true;
+    var number = match ? parseInt(match[2], 10) : 1;
+    currentEpisodes.push({
+      title: movie ? 'فيلم' : ('الحلقة ' + number),
+      number: number,
+      type: movie ? 'فيلم' : '',
+      screenshot: (currentPoster && currentPoster.getAttribute('src')) || '',
+      href: href,
+    });
+  });
+  currentEpisodes.sort(function (a, b) { return a.number - b.number; });
+  return {
+    title: currentTitle.textContent.trim(),
+    poster: (currentPoster && currentPoster.getAttribute('src')) || '',
+    synopsis: (currentSynopsis && currentSynopsis.textContent.trim()) || '',
+    genres: currentGenres,
+    episodes: currentEpisodes,
+    up4Url: null,
+  };
+}
 // Used to be 2500ms — too slow; 600ms is enough for the late-bound scripts.
 await new Promise(function (r) { setTimeout(r, 600); });
 
@@ -275,8 +367,10 @@ return {
 
 export const EXTRACT_SEARCH = `(async function(){${HELPERS}
 var ok = await window.__pWaitFor(function () {
-  return !!document.querySelector('.anime-card-container, .no-results, .search-empty');
+  return !!document.querySelector('a[href*="/anime/"] h3, a[href*="/movie/"] h3, .anime-card-container, .no-results, .search-empty');
 }, 18000);
+var current = window.__pSiteCards();
+if (current.length) return { results: current };
 var seen = {};
 var results = [];
 document.querySelectorAll('.anime-card-container').forEach(function (el) {
@@ -290,8 +384,10 @@ return { results: results };
 })();`;
 
 export const EXTRACT_LISTING = `(async function(){${HELPERS}
-var ok = await window.__pWaitFor(function () { return !!document.querySelector('.anime-card-container'); }, 20000);
+var ok = await window.__pWaitFor(function () { return !!document.querySelector('a[href*="/anime/"] h3, a[href*="/movie/"] h3, .anime-card-container'); }, 20000);
 if (!ok) return { items: [] };
+var current = window.__pSiteCards();
+if (current.length) return { items: current };
 var seen = {};
 var items = [];
 document.querySelectorAll('.anime-card-container').forEach(function (el) {
@@ -307,6 +403,54 @@ document.querySelectorAll('.anime-card-container').forEach(function (el) {
   });
 });
 return { items: items };
+})();`;
+
+export const EXTRACT_WIT_GENRE = (genre: string, page = 1) => `(async function(){${HELPERS}
+var GENRE = ${JSON.stringify(genre)};
+var PAGE = ${page};
+var ok = await window.__pWaitFor(function () {
+  return !!window.Livewire && Array.prototype.some.call(document.querySelectorAll('input[wire\\\\:model="selectedGenres"]'), function (el) {
+    return el.value === GENRE;
+  });
+}, 20000);
+if (!ok) return { items: [] };
+var input = Array.prototype.find.call(document.querySelectorAll('input[wire\\\\:model="selectedGenres"]'), function (el) {
+  return el.value === GENRE;
+});
+if (!input) return { items: [] };
+var before = (window.__pSiteCards()[0] || {}).href || '';
+input.click();
+var apply = document.querySelector('button[wire\\\\:click="applyFilters"]');
+if (apply) apply.click();
+await new Promise(function (resolve) {
+  var started = Date.now();
+  var iv = setInterval(function () {
+    var first = (window.__pSiteCards()[0] || {}).href || '';
+    if ((input.checked && first !== before) || Date.now() - started > 3500) {
+      clearInterval(iv);
+      resolve();
+    }
+  }, 200);
+});
+if (PAGE > 1) {
+  var component = (window.Livewire.all() || []).find(function (item) {
+    return Array.isArray(item.reactive && item.reactive.selectedGenres);
+  });
+  if (component && component.$wire && component.$wire.$set) {
+    var pageBefore = (window.__pSiteCards()[0] || {}).href || '';
+    await component.$wire.$set('page', PAGE, true);
+    await new Promise(function (resolve) {
+      var started = Date.now();
+      var iv = setInterval(function () {
+        if (((window.__pSiteCards()[0] || {}).href || '') !== pageBefore || Date.now() - started > 3500) {
+          clearInterval(iv);
+          resolve();
+        }
+      }, 200);
+    });
+  }
+}
+return { items: window.__pSiteCards().filter(function (item) { return item.href.indexOf('/anime/') >= 0; }) };
 })();`;
 
 export const EXTRACT_RECENT = `(async function(){${HELPERS}
@@ -331,8 +475,10 @@ function toAnimeUrl(href) {
 }
 
 var ok = await window.__pWaitFor(function () {
-  return !!document.querySelector('.anime-card-container, .episodes-card-container');
+  return !!document.querySelector('a[href*="/watch/"] h3, .anime-card-container, .episodes-card-container');
 }, 20000);
+var current = window.__pSiteEpisodes();
+if (current.length) return { episodes: current };
 var seen = {};
 var episodes = [];
 document.querySelectorAll('.anime-card-container').forEach(function (el) {
@@ -413,9 +559,13 @@ function score(title) {
   return s;
 }
 var ok = await window.__pWaitFor(function () {
-  return !!document.querySelector('.anime-card-container, .no-results, .search-empty');
+  return !!document.querySelector('a[href*="/anime/"] h3, a[href*="/movie/"] h3, .anime-card-container, .no-results, .search-empty');
 }, 15000);
 var best = { url: null, score: 0 };
+window.__pSiteCards().forEach(function (item) {
+  var s = score(item.title);
+  if (s > best.score) best = { url: item.href, score: s };
+});
 document.querySelectorAll('.anime-card-container').forEach(function (el) {
   var titleEl = el.querySelector('.anime-card-title h3 a');
   var hrefEl = el.querySelector('.anime-card-poster a.overlay');
@@ -558,6 +708,53 @@ function normalizeEmbed(src) {
     }
   } catch (e) {}
   return src;
+}
+
+// Current witanime issues session-bound player tokens. Resolve and prime them
+// in this window so the visible iframe can reuse the same Electron session.
+var currentPlayer = document.querySelector('[x-data*="watchPlayer"]');
+if (currentPlayer) {
+  var config = currentPlayer.getAttribute('x-data') || '';
+  var sourceMatch = config.match(/sourcesUrl:\\s*'([^']+)'/);
+  var csrf = document.querySelector('meta[name="csrf-token"]');
+  if (sourceMatch && csrf) {
+    try {
+      var sourcesUrl = sourceMatch[1].split(String.fromCharCode(92) + '/').join('/');
+      var headers = { Accept: 'application/json', 'X-CSRF-TOKEN': csrf.getAttribute('content') || '' };
+      var response = await fetch(sourcesUrl, { method: 'POST', headers: headers });
+      if (!response.ok) throw new Error('sources-' + response.status);
+      var manifest = await response.json();
+      var entries = [];
+      Object.keys(manifest.players || {}).forEach(function (quality) {
+        (manifest.players[quality] || []).forEach(function (entry) {
+          entries.push({ quality: quality, token: entry.token, label: entry.label || '' });
+        });
+      });
+      var resolved = await Promise.all(entries.map(async function (entry) {
+        if (!/^[a-f0-9]{64}$/.test(entry.token || '')) return null;
+        var ready = await fetch('/watch/stream-source/' + entry.token, { method: 'POST', headers: headers });
+        if (!ready.ok) return null;
+        return {
+          id: entry.token,
+          name: ((entry.label || 'WitAnime') + ' ' + entry.quality).trim(),
+          iframeUrl: location.origin + '/watch/stream-gate/' + entry.token,
+          provider: 'generic',
+        };
+      }));
+      var heading = document.querySelector('h1');
+      var episodeLabel = null;
+      document.querySelectorAll('main h1 ~ span').forEach(function (span) {
+        if (!episodeLabel && /الحلقة|فيلم/.test(span.textContent || '')) episodeLabel = span;
+      });
+      return {
+        servers: resolved.filter(Boolean),
+        episodeTitle: (episodeLabel && episodeLabel.textContent.trim()) || (heading && heading.textContent.trim()) || '',
+        animeTitle: (heading && heading.textContent.trim()) || '',
+        up4EpisodeUrl: null,
+        up4AnimeUrl: null,
+      };
+    } catch (e) {}
+  }
 }
 
 // Fast lane: check for iframes immediately (most pages render them in the

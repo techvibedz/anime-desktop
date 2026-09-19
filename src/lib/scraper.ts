@@ -10,6 +10,7 @@ import {
   EXTRACT_SEARCH,
   EXTRACT_RECENT,
   EXTRACT_LISTING,
+  EXTRACT_WIT_GENRE,
   EXTRACT_TITLE_MATCH,
   EXTRACT_TITLE_MATCH_A3RB,
   EXTRACT_VIDEO_SERVERS,
@@ -18,10 +19,21 @@ import {
 } from "./scripts";
 import { fuzzyScore } from "./fuzzy";
 
-const WIT_BASE = "https://witanime.you";
+const WIT_BASE = "https://witanime.site";
 const UP4_BASE = "https://w1.anime4up.rest";
 const A3RB_BASE = "https://anime3rb.com";
-const ALL_ANIME_PATH = encodeURIComponent("قائمة-الانمي");
+function rewriteWitUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    if (!/(^|\.)witanime\./i.test(url.hostname)) return raw;
+    const current = new URL(WIT_BASE);
+    url.protocol = current.protocol;
+    url.host = current.host;
+    return url.toString();
+  } catch {
+    return raw;
+  }
+}
 
 function enqueue<T>(job: {
   url: string;
@@ -70,39 +82,46 @@ export type RawDetail = {
 export async function scrapeEpisodesPage(animeUrl: string) {
   const is4up = /anime4up/i.test(animeUrl);
   return enqueue<RawDetail>({
-    url: animeUrl,
+    url: is4up ? animeUrl : rewriteWitUrl(animeUrl),
     injectAfter: is4up ? EXTRACT_EPISODES_4UP : EXTRACT_EPISODES_WIT,
     timeoutMs: 35000,
   });
 }
 
 export async function scrapeSearch(query: string) {
-  const url = `${WIT_BASE}/?s=${encodeURIComponent(query)}&search_param=animes`;
+  const url = `${WIT_BASE}/search?q=${encodeURIComponent(query)}`;
   return enqueue<{ results: { title: string; href: string; image: string | null; type: string | null; status: string | null; synopsis: string | null }[] }>({
     url, injectAfter: EXTRACT_SEARCH, timeoutMs: 25000,
   });
 }
 
 export async function scrapeRecent(page = 1) {
-  const url = `${WIT_BASE}/episode/page/${page}/`;
+  // ponytail: the redesigned site publishes one latest batch; stop pagination
+  // cleanly until it exposes a public recent-episodes page again.
+  if (page > 1) return { episodes: [] as RawEpisodeCard[] };
+  const url = `${WIT_BASE}/`;
   return enqueue<{ episodes: RawEpisodeCard[] }>({
     url, injectAfter: EXTRACT_RECENT, timeoutMs: 30000,
   });
 }
 
-export async function scrapeGenre(arabicSlug: string, page = 1) {
-  const url = page === 1
-    ? `${WIT_BASE}/anime-genre/${arabicSlug}/`
-    : `${WIT_BASE}/anime-genre/${arabicSlug}/page/${page}/`;
+const WIT_GENRES: Record<string, string> = {
+  Action: "action", Adventure: "adventure", Comedy: "comedy", Drama: "drama",
+  Fantasy: "fantasy", Horror: "horror", Mystery: "mystery", Romance: "romance",
+  "Sci-Fi": "sci-fi", "Slice of Life": "slice-of-life", Sports: "sports",
+  Supernatural: "supernatural", Thriller: "thriller", Mecha: "mecha",
+  Shounen: "shounen", Seinen: "seinen",
+};
+
+export async function scrapeGenre(genre: string, page = 1) {
+  const url = `${WIT_BASE}/browse?page=${page}`;
   return enqueue<{ items: { title: string; href: string; image: string | null; type: string | null; status: string | null; synopsis: null }[] }>({
-    url, injectAfter: EXTRACT_LISTING, timeoutMs: 30000,
+    url, injectAfter: EXTRACT_WIT_GENRE(WIT_GENRES[genre] || genre.toLowerCase(), page), timeoutMs: 30000,
   });
 }
 
 export async function scrapeAllAnime(page = 1) {
-  const url = page === 1
-    ? `${WIT_BASE}/${ALL_ANIME_PATH}/`
-    : `${WIT_BASE}/${ALL_ANIME_PATH}/page/${page}/`;
+  const url = `${WIT_BASE}/browse?page=${page}`;
   return enqueue<{ items: { title: string; href: string; image: string | null; type: string | null; status: string | null; synopsis: null }[] }>({
     url, injectAfter: EXTRACT_LISTING, timeoutMs: 30000,
   });
@@ -115,7 +134,9 @@ export async function findCrossSourceUrl(
   if (!title) return null;
   const wantTarget = primarySource === "witanime" ? "anime4up" : "witanime";
   const base = wantTarget === "anime4up" ? UP4_BASE : WIT_BASE;
-  const searchUrl = `${base}/?search_param=animes&s=${encodeURIComponent(title)}`;
+  const searchUrl = wantTarget === "anime4up"
+    ? `${base}/?search_param=animes&s=${encodeURIComponent(title)}`
+    : `${base}/search?q=${encodeURIComponent(title)}`;
   try {
     const r = await enqueue<{ url: string | null; score: number }>({
       url: searchUrl, injectAfter: EXTRACT_TITLE_MATCH(title), timeoutMs: 40000,
@@ -129,6 +150,7 @@ export async function findCrossSourceUrl(
 export type RawServer = { id: string; name: string; iframeUrl: string; provider: string };
 
 export async function scrapeVideoServers(episodeUrl: string) {
+  episodeUrl = rewriteWitUrl(episodeUrl);
   console.info(`[scraper] scraping video servers from: ${episodeUrl}`);
   const result = await enqueue<{ servers: RawServer[]; episodeTitle: string; animeTitle: string; up4EpisodeUrl?: string | null; up4AnimeUrl?: string | null }>({
     // priority: the user is sitting on the watch page waiting for this —
@@ -292,7 +314,7 @@ function parseWitServers(html: string): RawServer[] {
 export async function scrapeWitanimeEpisodePageDirect(
   episodeUrl: string,
 ): Promise<{ servers: RawServer[]; episodeTitle: string; animeTitle: string } | null> {
-  const html = await window.pantoufa.fetchHtml?.(episodeUrl, WIT_BASE + "/");
+  const html = await window.pantoufa.fetchHtml?.(rewriteWitUrl(episodeUrl), WIT_BASE + "/");
   if (!html) return null;
   const servers = parseWitServers(html);
   if (servers.length === 0) return null;
@@ -1268,9 +1290,25 @@ function upgradeCardImg(u: string | null): string | null {
 }
 
 // Parse every .anime-card-container in a witanime listing/search page.
-function parseWitCards(html: string): WitCard[] {
+export function parseWitCards(html: string): WitCard[] {
   const out: WitCard[] = [];
   const seen = new Set<string>();
+  const cardRe = /<a\b[^>]*href=["']([^"']*\/(?:anime|movie)\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let card: RegExpExecArray | null;
+  while ((card = cardRe.exec(html))) {
+    const href = htmlDecodeCard(card[1] || "");
+    const body = card[2] || "";
+    if (!href || seen.has(href)) continue;
+    const titleMatch = body.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i);
+    const imageMatch = body.match(/<img[^>]*\bsrc=["']([^"']+)["'][^>]*>/i);
+    const title = htmlDecodeCard((titleMatch?.[1] || "").replace(/<[^>]+>/g, ""));
+    if (!title || !imageMatch) continue;
+    const badges = [...body.matchAll(/<div[^>]*\btop-2\b[^>]*>([\s\S]*?)<\/div>/gi)]
+      .map((m) => htmlDecodeCard(m[1].replace(/<[^>]+>/g, "")));
+    const type = badges.find((value) => /^(?:TV|TV Short|OVA|ONA|Special|Music|PV|CM|فيلم)$/i.test(value)) || null;
+    seen.add(href);
+    out.push({ title, href, image: upgradeCardImg(imageMatch[1]), type, status: null, synopsis: null });
+  }
   const blocks = html.split("anime-card-container");
   for (let i = 1; i < blocks.length; i++) {
     const b = blocks[i];
@@ -1304,7 +1342,7 @@ export async function fetchWitListingDirect(url: string): Promise<WitCard[] | nu
 
 // witanime's full movie listing — every movie in ONE static GET.
 export async function fetchWitMoviesListing(): Promise<WitCard[] | null> {
-  return fetchWitListingDirect(`${WIT_BASE}/anime-type/movie/`);
+  return fetchWitListingDirect(`${WIT_BASE}/movies`);
 }
 
 // Parse anime4up's .anime-card-container cards (season / movie listing pages).
@@ -1400,6 +1438,27 @@ function parseWitHomeAnimes(html: string): HomeAnime[] {
 function parseWitHomeEpisodes(html: string): HomeEpisode[] {
   const out: HomeEpisode[] = [];
   const seen = new Set<string>();
+  const currentRe = /<a\b[^>]*href=["']([^"']*\/watch\/([^"']+?)\/(\d+))["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let current: RegExpExecArray | null;
+  while ((current = currentRe.exec(html))) {
+    const href = htmlDecodeCard(current[1]);
+    const slug = current[2];
+    const number = parseInt(current[3], 10);
+    const body = current[4] || "";
+    if (!href || seen.has(href) || slug === "movie") continue;
+    const title = htmlDecodeCard((body.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i)?.[1] || "").replace(/<[^>]+>/g, ""));
+    const image = body.match(/<img[^>]*\bsrc=["']([^"']+)["'][^>]*>/i)?.[1] || null;
+    if (!title) continue;
+    seen.add(href);
+    out.push({
+      title: `الحلقة ${number}`,
+      href,
+      image: upgradeCardImg(image),
+      animeTitle: title,
+      animeHref: `${new URL(href).origin}/anime/${slug}`,
+      isNew: true,
+    });
+  }
   const blocks = html.split("episodes-card-container");
   for (let i = 1; i < blocks.length; i++) {
     const b = blocks[i];
@@ -1431,7 +1490,10 @@ export async function fetchWitHomeDirect(): Promise<WitHomeDirect | null> {
   const animes = parseWitHomeAnimes(html);
   const episodes = parseWitHomeEpisodes(html);
   if (animes.length === 0 && episodes.length === 0) return null;
-  return { featured: parseWitFeatured(html), animes, episodes };
+  const featured = parseWitFeatured(html);
+  return { featured: featured.length ? featured : animes.slice(0, 5).map((item) => ({
+    title: item.title, href: item.href, image: item.image, description: null, genres: [],
+  })), animes, episodes };
 }
 
 // Search anime4up via a direct GET and return the FULL card list (not just the
@@ -1453,7 +1515,7 @@ export async function searchAnime4upDirectList(query: string): Promise<WitCard[]
 // caller can fall back to the headless scrape (recovers a Cloudflare block).
 export async function searchWitanimeDirectList(query: string): Promise<WitCard[] | null> {
   if (!query) return null;
-  const url = `${WIT_BASE}/?s=${encodeURIComponent(query)}&search_param=animes`;
+  const url = `${WIT_BASE}/search?q=${encodeURIComponent(query)}`;
   const html = await window.pantoufa.fetchHtml?.(url, WIT_BASE + "/");
   if (!html) return null;
   return parseWitCards(html);

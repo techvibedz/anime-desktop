@@ -32,7 +32,7 @@ export function createGenerationGuard() {
 export function episodeNumberFromUrl(raw: string): number | null {
   let decoded = raw;
   try { decoded = decodeURIComponent(raw); } catch {}
-  const match = decoded.match(/الحلقة[\s_-]*(\d+)/) || decoded.match(/\/episode\/[^/]+\/(\d+)(?:\/|$)/i);
+  const match = decoded.match(/الحلقة[\s_-]*(\d+)/) || decoded.match(/\/(?:episode|watch)\/[^/]+\/(\d+)(?:\/|$)/i);
   return match ? parseInt(match[1], 10) : null;
 }
 

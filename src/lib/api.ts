@@ -709,7 +709,8 @@ async function doFetchVideoServers(episodeUrl: string, url4up?: string) {
       // list but are real), and keep the DIRECT-decoded ones (keepGeneric): those
       // are validated real embeds, so a brand-new witanime host still plays via
       // the iframe fallback instead of silently vanishing.
-      if (s.provider === "generic" && source !== "anime4up" && !keepGeneric) continue;
+      const isWitGate = /witanime\.site\/watch\/stream-gate\//i.test(s.iframeUrl);
+      if (s.provider === "generic" && source !== "anime4up" && !keepGeneric && !isWitGate) continue;
       seen.add(s.iframeUrl);
       merged.push({ id: String(merged.length), name: s.name, iframeUrl: s.iframeUrl, provider: s.provider, source });
     }

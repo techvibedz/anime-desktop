@@ -282,7 +282,7 @@ export function WatchPage() {
       // Hide unrecognized witanime embeds (mega.nz etc.), but always keep
       // anime4up-sourced servers — their data-watch URLs often don't match
       // a known provider regex yet still play fine in an iframe.
-      .filter((s) => s.provider !== "generic" || s.source === "anime4up" || s.source === "offline")),
+      .filter((s) => s.provider !== "generic" || s.source === "anime4up" || s.source === "offline" || /witanime\.site\/watch\/stream-gate\//i.test(s.iframeUrl))),
     [servers],
   );
 
