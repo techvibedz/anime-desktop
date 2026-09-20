@@ -179,7 +179,7 @@ function dedupe<T extends { href: string }>(arr: T[]): T[] {
 // The recently-updated feed lists raw episodes newest-first; we want each anime
 // to appear exactly once (its latest episode). Because the feed is newest-first,
 // the first episode seen for an anime is its newest one.
-const FILL_TARGET = 18;        // ≈3 rows on the 6-col grid — fill in one cycle
+const FILL_TARGET = 12;        // 2 rows: paint the cached home batch immediately
 const MAX_PAGES_PER_FILL = 5;  // bound on how many pages a single fetch may walk
 
 function episodeAnimeKey(ep: EpisodeItem): string {

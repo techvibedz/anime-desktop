@@ -725,29 +725,56 @@ if (currentPlayer) {
       if (!response.ok) throw new Error('sources-' + response.status);
       var manifest = await response.json();
       var entries = [];
+      var seenLabels = {};
       Object.keys(manifest.players || {}).forEach(function (quality) {
         (manifest.players[quality] || []).forEach(function (entry) {
-          entries.push({ quality: quality, token: entry.token, label: entry.label || '' });
+          var label = (entry.label || 'witanime').toLowerCase();
+          if (seenLabels[label]) return;
+          seenLabels[label] = true;
+          entries.push({ quality: quality, token: entry.token, label: label });
         });
       });
-      var resolved = await Promise.all(entries.map(async function (entry) {
-        if (!/^[a-f0-9]{64}$/.test(entry.token || '')) return null;
-        var ready = await fetch('/watch/stream-source/' + entry.token, { method: 'POST', headers: headers });
-        if (!ready.ok) return null;
-        return {
+      function witProvider(label) {
+        if (label.indexOf('mp4upload') >= 0) return 'mp4upload';
+        if (label.indexOf('hgcloud') >= 0) return 'streamwish';
+        if (label.indexOf('videa') >= 0) return 'videa';
+        if (label.indexOf('mega') >= 0) return 'mega';
+        return 'generic';
+      }
+      function witPriority(label) {
+        if (label.indexOf('hgcloud') >= 0) return 0;
+        if (label.indexOf('videa') >= 0) return 1;
+        if (label.indexOf('mp4upload') >= 0) return 2;
+        return 3;
+      }
+      entries.sort(function (a, b) { return witPriority(a.label) - witPriority(b.label); });
+      var resolved = [];
+      for (var i = 0; i < entries.length; i++) {
+        var entry = entries[i];
+        if (!/^[a-f0-9]{64}$/.test(entry.token || '')) continue;
+        try {
+          var ready = await fetch('/watch/stream-source/' + entry.token, { method: 'POST', headers: headers });
+          if (ready.status === 429) {
+            await new Promise(function (r) { setTimeout(r, 900); });
+            ready = await fetch('/watch/stream-source/' + entry.token, { method: 'POST', headers: headers });
+          }
+          if (!ready.ok) continue;
+          resolved.push({
           id: entry.token,
           name: ((entry.label || 'WitAnime') + ' ' + entry.quality).trim(),
           iframeUrl: location.origin + '/watch/stream-gate/' + entry.token,
-          provider: 'generic',
-        };
-      }));
+          provider: witProvider(entry.label),
+          });
+        } catch (e) {}
+        if (i + 1 < entries.length) await new Promise(function (r) { setTimeout(r, 300); });
+      }
       var heading = document.querySelector('h1');
       var episodeLabel = null;
       document.querySelectorAll('main h1 ~ span').forEach(function (span) {
         if (!episodeLabel && /الحلقة|فيلم/.test(span.textContent || '')) episodeLabel = span;
       });
       return {
-        servers: resolved.filter(Boolean),
+        servers: resolved,
         episodeTitle: (episodeLabel && episodeLabel.textContent.trim()) || (heading && heading.textContent.trim()) || '',
         animeTitle: (heading && heading.textContent.trim()) || '',
         up4EpisodeUrl: null,

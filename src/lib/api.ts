@@ -35,6 +35,7 @@ import { createRequestCache, withTimeout } from "./requestCache";
 import {
   anime4upEpisodeUrl,
   episodeNumberFromUrl,
+  mergePlayableServers,
   mergeVideoServers,
   normalizeServerUrl,
   isResolvedDownloadServer,
@@ -46,7 +47,7 @@ import {
   videoContentType,
 } from "./videoProviders";
 
-const HOME_CACHE_KEY = "@home_cache_v1";
+const HOME_CACHE_KEY = "@home_cache_v2";
 const HOME_CACHE_TTL = 30 * 60 * 1000;
 const DETAIL_CACHE_PREFIX = "@detail_v4:";
 const DETAIL_CACHE_TTL = 30 * 60 * 1000;
@@ -116,6 +117,7 @@ function cleanAnimeTitle(raw: string | null | undefined): string {
 
 type HomePayload = { success: boolean; data: { featured: FeaturedItem[]; sections: HomeSection[] } };
 let bgRefreshInFlight = false;
+let homeFreshInFlight: Promise<HomePayload> | null = null;
 
 function normalizeHomeSource(wit: { featured?: any[]; animes?: any[]; episodes?: any[] } | null | undefined) {
   return {
@@ -156,6 +158,12 @@ async function fetchHomeFresh(): Promise<HomePayload> {
   return result;
 }
 
+function fetchHomeFreshShared(): Promise<HomePayload> {
+  if (homeFreshInFlight) return homeFreshInFlight;
+  homeFreshInFlight = fetchHomeFresh().finally(() => { homeFreshInFlight = null; });
+  return homeFreshInFlight;
+}
+
 // Cheap change detector for the SWR push: a new episode / new trending entry
 // always alters a section's item count or its first item, so comparing section
 // counts + lead hrefs catches every visible change without a full deep-equal.
@@ -175,7 +183,7 @@ export async function fetchHome(onUpdated?: (p: HomePayload) => void): Promise<H
   if (cached) {
     if (!bgRefreshInFlight) {
       bgRefreshInFlight = true;
-      void fetchHomeFresh()
+      void fetchHomeFreshShared()
         .then((fresh) => {
           if (onUpdated && homeSignature(fresh) !== homeSignature(cached)) onUpdated(fresh);
         })
@@ -184,7 +192,7 @@ export async function fetchHome(onUpdated?: (p: HomePayload) => void): Promise<H
     }
     return cached;
   }
-  return fetchHomeFresh();
+  return fetchHomeFreshShared();
 }
 
 // Drop the home cache so the next fetchHome() re-scrapes from scratch instead
@@ -408,8 +416,13 @@ export async function fetchEpisodesUp4(animeUrl: string, title: string | null, u
 }
 
 export async function fetchRecent(page = 1) {
+  if (page === 1) {
+    const home = await fetchHome();
+    const recent = home.data.sections.find((section) => section.id === "recently_updated");
+    if (recent?.items.length) return { success: true, data: { page, episodes: recent.items as EpisodeItem[], hasNext: true } };
+  }
   const r = await scrapeRecent(page);
-  return { success: true, data: { page, episodes: r.episodes.map((e) => ({ title: e.title, href: e.href, image: imgOrEmpty(e.image), animeTitle: e.animeTitle, animeHref: e.animeHref, isNew: e.isNew })), hasNext: r.episodes.length > 0 } };
+  return { success: true, data: { page, episodes: r.episodes.map((e) => ({ title: e.title, href: e.href, image: imgOrEmpty(e.image), animeTitle: e.animeTitle, animeHref: e.animeHref, isNew: e.isNew })), hasNext: r.hasNext ?? r.episodes.length > 0 } };
 }
 
 // Dedup-by-title-key + stable fuzzy rerank for the multi-source search union.
@@ -1164,7 +1177,7 @@ export function fetchCompleteVideoServers(
     const metadata = () => primaryResult;
     const emitCandidates = (fallback?: CompleteVideoServersPayload | null) => {
       if (Date.now() > deadline) return;
-      const servers = selectServerCandidates(mergeVideoServers([...discovered.values()]));
+      const servers = mergeVideoServers([...discovered.values()]);
       if (!servers.length) return;
       const signature = serverCandidateSignature(servers);
       if (signature === lastCandidateSignature) return;
@@ -1270,10 +1283,11 @@ export function fetchCompleteVideoServers(
       .filter((server) => !warmUrls.has(server.iframeUrl))
       .map(resolveOne));
 
-    const servers = selectServerCandidates(candidates).flatMap((candidate) => {
+    const directServers = selectServerCandidates(candidates).flatMap((candidate) => {
       const hit = playable.get(candidate.iframeUrl);
       return hit ? [hit] : [];
     });
+    const servers = mergePlayableServers(candidates, directServers);
     return completePayload(servers, {
       episodeTitle: primary?.data.episodeTitle || up4?.data.episodeTitle || (episodeNumber != null ? `الحلقة ${episodeNumber}` : ""),
       animeTitle: resolvedTitle,
