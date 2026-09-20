@@ -179,8 +179,9 @@ function dedupe<T extends { href: string }>(arr: T[]): T[] {
 // The recently-updated feed lists raw episodes newest-first; we want each anime
 // to appear exactly once (its latest episode). Because the feed is newest-first,
 // the first episode seen for an anime is its newest one.
-const FILL_TARGET = 12;        // 2 rows: paint the cached home batch immediately
-const MAX_PAGES_PER_FILL = 5;  // bound on how many pages a single fetch may walk
+const FILL_TARGET = 24;
+const MAX_PAGES_PER_FILL = 8;
+const PAGES_PER_BATCH = 4;
 
 function episodeAnimeKey(ep: EpisodeItem): string {
   const href = String(ep.animeHref || "").trim();
@@ -207,12 +208,20 @@ async function fillRecent(fromPage: number, seen: Set<string>) {
   let page = fromPage;
   let more = true;
   const collected: EpisodeItem[] = [];
-  for (let i = 0; i < MAX_PAGES_PER_FILL && more; i++) {
-    const r = await fetchRecent(page);
-    page += 1;
-    more = r.data.hasNext && r.data.episodes.length > 0;
-    for (const e of dedupeEpisodes(r.data.episodes, seen)) collected.push(e);
-    if (collected.length >= FILL_TARGET) break;
+  let fetched = 0;
+  while (fetched < MAX_PAGES_PER_FILL && more && collected.length < FILL_TARGET) {
+    const count = Math.min(PAGES_PER_BATCH, MAX_PAGES_PER_FILL - fetched);
+    const batch = await Promise.all(
+      Array.from({ length: count }, (_, offset) => fetchRecent(page + offset).catch(() => null)),
+    );
+    for (const r of batch) {
+      if (!r?.success) { more = false; break; }
+      page += 1;
+      fetched += 1;
+      more = r.data.hasNext && r.data.episodes.length > 0;
+      for (const e of dedupeEpisodes(r.data.episodes, seen)) collected.push(e);
+      if (!more) break;
+    }
   }
   return { collected, nextPage: page, more };
 }

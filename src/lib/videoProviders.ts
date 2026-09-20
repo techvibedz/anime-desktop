@@ -60,7 +60,7 @@ export const PROVIDER_POLICIES: Record<string, ProviderPolicy> = {
   videas: { patterns: ["app\\.videas\\.fr"], rank: 3, resolution: "directThenIframe", failureMode: "failed", supported: true },
   videa: { patterns: ["videa\\.", "vidvaita", "vidit", "videakid"], rank: 3, resolution: "directThenIframe", failureMode: "failed", supported: true },
   vk: { patterns: ["vk\\.com"], rank: 11, resolution: "iframe", failureMode: "iframe", supported: true },
-  mega: { patterns: ["mega\\.nz"], rank: 12, resolution: "iframe", failureMode: "iframe", supported: true },
+  mega: { patterns: ["mega\\.nz"], rank: 12, resolution: "direct", failureMode: "failed", supported: true },
   vid3rb: { patterns: ["vid3rb", "anime3rb"], rank: -1, resolution: "direct", failureMode: "failed", supported: true, downloadable: true },
   luluvdo: { patterns: ["luluvdo", "lulustream", "luluvid"], rank: 9, resolution: "directThenIframe", failureMode: "failed", supported: true },
   yonaplay: { patterns: ["yonaplay"], rank: 99, resolution: "iframe", failureMode: "failed", supported: false },
@@ -214,7 +214,7 @@ export function mergeVideoServers<T extends { id?: string; name: string; provide
 export function mergePlayableServers<T extends {
   id?: string; name: string; provider: string; iframeUrl: string; videoUrl?: string;
 }>(candidates: readonly T[], playable: readonly T[]): (T & { id: string })[] {
-  return mergeVideoServers([playable, candidates.filter((server) => !isDirectProvider(server.provider))]);
+  return mergeVideoServers([playable, candidates]);
 }
 
 export function normalizeServerUrl(raw: string): string {

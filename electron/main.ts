@@ -7,6 +7,7 @@ import { app, BrowserWindow, ipcMain, net, protocol, session, shell } from "elec
 import path from "node:path";
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
+import { createDecipheriv, randomBytes } from "node:crypto";
 
 // Disable QUIC so Chromium falls back to TCP/HTTP2. Restrictive ISPs
 // often block or mangle QUIC (UDP/443), causing ERR_QUIC_PROTOCOL_ERROR
@@ -460,6 +461,91 @@ app.on("open-url", (event, url) => {
  * v1 format (backwards compat): pantoufa-video://x/?u=<encoded>&ref=<encoded>
  */
 const REF_PARAM = "__pantoufa_ref";
+
+type MegaStream = { downloadUrl: string; size: number; key: Buffer; nonce: Buffer };
+const megaStreams = new Map<string, MegaStream>();
+
+async function resolveMegaStream(embedUrl: string): Promise<{ url: string; type: "mp4" } | null> {
+  const url = new URL(embedUrl);
+  if (!url.hostname.endsWith("mega.nz")) return null;
+  const parts = url.pathname.split("/").filter(Boolean);
+  const marker = parts.findIndex((part) => part === "embed" || part === "file");
+  const handle = marker >= 0 ? parts[marker + 1] : "";
+  if (!handle || !url.hash) return null;
+  const rawKey = Buffer.from(url.hash.slice(1), "base64url");
+  if (rawKey.length < 32) return null;
+  const key = Buffer.alloc(16);
+  for (let i = 0; i < 16; i++) key[i] = rawKey[i] ^ rawKey[i + 16];
+  const nonce = Buffer.alloc(16);
+  rawKey.copy(nonce, 0, 16, 24);
+  const response = await net.fetch(`https://g.api.mega.co.nz/cs?id=${Date.now()}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify([{ a: "g", g: 1, p: handle }]),
+  });
+  if (!response.ok) return null;
+  const result = (await response.json() as any[])?.[0];
+  if (!result?.g || !Number.isFinite(result.s) || result.s <= 0) return null;
+  const token = randomBytes(18).toString("base64url");
+  if (megaStreams.size >= 32) megaStreams.delete(megaStreams.keys().next().value!);
+  megaStreams.set(token, { downloadUrl: result.g, size: result.s, key, nonce });
+  return { url: `${VIDEO_PROTOCOL}://mega/${token}.mp4`, type: "mp4" };
+}
+
+function advanceCtr(iv: Buffer, blocks: number): Buffer {
+  const out = Buffer.from(iv);
+  let carry = blocks;
+  for (let i = out.length - 1; i >= 0 && carry > 0; i--) {
+    const sum = out[i] + (carry & 0xff);
+    out[i] = sum & 0xff;
+    carry = Math.floor(carry / 256) + (sum >>> 8);
+  }
+  return out;
+}
+
+async function serveMegaStream(request: Request, reqUrl: URL): Promise<Response> {
+  const token = reqUrl.pathname.replace(/^\//, "").replace(/\.mp4$/, "");
+  const stream = megaStreams.get(token);
+  if (!stream) return new Response("expired stream", { status: 404 });
+  const cors = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+  };
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+  if (request.method === "HEAD") return new Response(null, { status: 200, headers: {
+    ...cors, "Content-Type": "video/mp4", "Accept-Ranges": "bytes", "Content-Length": String(stream.size),
+  } });
+  const match = request.headers.get("range")?.match(/^bytes=(\d+)-(\d*)$/i);
+  const start = match ? Number(match[1]) : 0;
+  if (!Number.isSafeInteger(start) || start < 0 || start >= stream.size) {
+    return new Response("invalid range", { status: 416, headers: { ...cors, "Content-Range": `bytes */${stream.size}` } });
+  }
+  const chunkSize = start === 0 ? 1024 * 1024 : 4 * 1024 * 1024;
+  const requestedEnd = match?.[2] ? Number(match[2]) : stream.size - 1;
+  const end = Math.min(stream.size - 1, requestedEnd, start + chunkSize - 1);
+  const alignedStart = start - (start % 16);
+  const upstream = await session.defaultSession.fetch(stream.downloadUrl, {
+    headers: { Range: `bytes=${alignedStart}-${end}`, "Accept-Encoding": "identity" },
+    cache: "no-store",
+  });
+  if (!(upstream.status === 206 || (upstream.status === 200 && alignedStart === 0))) {
+    return new Response("MEGA fetch failed", { status: 502, headers: cors });
+  }
+  const encrypted = Buffer.from(await upstream.arrayBuffer());
+  const decipher = createDecipheriv("aes-128-ctr", stream.key, advanceCtr(stream.nonce, alignedStart / 16));
+  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  const body = decrypted.subarray(start - alignedStart, start - alignedStart + end - start + 1);
+  const actualEnd = start + body.length - 1;
+  return new Response(new Uint8Array(body), { status: 206, headers: {
+    ...cors,
+    "Content-Type": "video/mp4",
+    "Accept-Ranges": "bytes",
+    "Content-Length": String(body.length),
+    "Content-Range": `bytes ${start}-${actualEnd}/${stream.size}`,
+    "Cache-Control": "no-store",
+  } });
+}
 
 function proxyUrlFor(absUrl: string, referer: string): string {
   let u: URL;
@@ -1709,6 +1795,7 @@ function registerVideoProxy() {
     let referer = "";
     try {
       const reqUrl = new URL(request.url);
+      if (reqUrl.hostname === "mega") return await serveMegaStream(request, reqUrl);
 
       // Path segments: "" / "<pct-origin>" / "cdn" / "path"...
       // (hostname "x" is not in the path)
@@ -2452,6 +2539,9 @@ app.whenReady().then(() => {
       }
       if (opts.provider === "videa") {
         return await extractVidea(opts.iframeUrl);
+      }
+      if (opts.provider === "mega") {
+        return await resolveMegaStream(opts.iframeUrl);
       }
       if (opts.provider === "streamwish") {
         return await extractStreamwish(opts.iframeUrl);

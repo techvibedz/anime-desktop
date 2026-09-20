@@ -6,6 +6,7 @@ import {
   scrapeEpisodesPage,
   scrapeSearch,
   scrapeRecent,
+  fetchAnime4upRecentPageDirect,
   scrapeGenre,
   scrapeAllAnime,
   scrapeVideoServers,
@@ -146,13 +147,18 @@ async function fetchHomeFresh(): Promise<HomePayload> {
   // Fast path: read the home page's static HTML directly (sub-second, no headless
   // window cold-start / Cloudflare-clear). Fall back to the headless scrape only
   // when the direct fetch comes back empty (CF challenge / cold body).
-  let wit = normalizeHomeSource(await fetchWitHomeDirect().catch(() => null));
+  const [witDirect, anime4upRecent] = await Promise.all([
+    fetchWitHomeDirect().catch(() => null),
+    fetchAnime4upRecentPageDirect(1).catch(() => null),
+  ]);
+  let wit = normalizeHomeSource(witDirect);
   if (!wit || (wit.animes.length === 0 && wit.episodes.length === 0)) {
     wit = normalizeHomeSource(await scrapeWitanimeHome().catch(() => null));
   }
   if (wit.animes.length === 0 && wit.episodes.length === 0) {
     throw new Error("Home content unavailable");
   }
+  if (anime4upRecent?.episodes.length) wit = { ...wit, episodes: anime4upRecent.episodes };
   const result = buildHomePayload(wit);
   void writeCache(HOME_CACHE_KEY, result);
   return result;
@@ -1417,7 +1423,7 @@ export async function enrichServersFromUp4(servers: (VideoServer & { source?: st
 // set covers the ones routed through directExtract generically.
 const CUSTOM_PLAYER_PROVIDERS = new Set([
   "voe", "share4max", "streamruby", "uqload", "okru",
-  "streamwish", "doodstream", "vk",
+  "streamwish", "doodstream", "vk", "mega",
   // anime3rb's first-party host: one static GET on the player page yields
   // direct tokenized .mp4 qualities, so extraction is near-instant and the
   // custom player is the normal path (iframe only as a last resort).

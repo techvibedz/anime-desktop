@@ -75,6 +75,7 @@ function displayName(s: VideoServer): string {
 }
 
 function proxify(rawUrl: string, embedUrl: string): string {
+  if (rawUrl.startsWith("pantoufa-video:")) return rawUrl;
   let u: URL;
   try {
     u = new URL(rawUrl);

@@ -8,7 +8,6 @@ import {
   EXTRACT_EPISODES_WIT,
   EXTRACT_EPISODES_4UP,
   EXTRACT_SEARCH,
-  EXTRACT_RECENT,
   EXTRACT_LISTING,
   EXTRACT_WIT_GENRE,
   EXTRACT_TITLE_MATCH,
@@ -96,16 +95,8 @@ export async function scrapeSearch(query: string) {
 }
 
 export async function scrapeRecent(page = 1) {
-  if (page > 1) {
-    return await fetchWitRecentPageDirect(page) || { episodes: [] as RawEpisodeCard[], hasNext: false };
-  }
-  const direct = await fetchWitHomeDirect().catch(() => null);
-  if (direct?.episodes.length) return { episodes: direct.episodes, hasNext: true };
-  const url = `${WIT_BASE}/`;
-  const result = await enqueue<{ episodes: RawEpisodeCard[] }>({
-    url, injectAfter: EXTRACT_RECENT, timeoutMs: 30000,
-  });
-  return { ...result, hasNext: result.episodes.length > 0 };
+  return await fetchAnime4upRecentPageDirect(page)
+    || { episodes: [] as RawEpisodeCard[], hasNext: false };
 }
 
 const WIT_GENRES: Record<string, string> = {
@@ -360,28 +351,24 @@ export async function scrapeAnime4upEpisodePageDirect(
   if (!html) return null;
   const servers = parseUp4Servers(html);
   if (servers.length === 0) return null;
-  const deent = (s: string) =>
-    s.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#0?39;/g, "'")
-      .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/\s+/g, " ").trim();
-  // Episode title: prefer the page heading, fall back to <title> minus the
-  // site-name suffix.
-  let episodeTitle = "";
-  const h3 = html.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i);
-  if (h3) episodeTitle = deent(h3[1].replace(/<[^>]+>/g, ""));
-  if (!episodeTitle) {
-    const t = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-    if (t) episodeTitle = deent(t[1]).split(/\s*[|–-]\s*(?:anime4up|أنمي فور أب).*/i)[0].trim();
-  }
-  // Anime title: the breadcrumb/anime-page link, else strip "الحلقة N" off
-  // the episode title.
-  let animeTitle = "";
-  const link = html.match(/anime-page-link[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i)
-    || html.match(/<a[^>]*href=["'][^"']*\/anime\/[^"']*["'][^>]*>([\s\S]*?)<\/a>/i);
-  if (link) animeTitle = deent(link[1].replace(/<[^>]+>/g, ""));
-  if (!animeTitle && episodeTitle) {
-    animeTitle = episodeTitle.replace(/الحلقة\s*\d+.*$/, "").replace(/\bepisode\s*\d+.*$/i, "").trim();
-  }
+  const { episodeTitle, animeTitle } = parseAnime4upEpisodeTitles(html);
   return { servers, episodeTitle, animeTitle };
+}
+
+export function parseAnime4upEpisodeTitles(html: string): { episodeTitle: string; animeTitle: string } {
+  const raw = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "";
+  const pageTitle = htmlDecodeCard(raw.replace(/<[^>]+>/g, ""))
+    .split(/\s*[|–—]\s*(?:anime4up|أنمي فور أب).*/i)[0]
+    .trim();
+  const number = (pageTitle.match(/(?:الحلقة|episode)\s*(\d+)/i) || [])[1];
+  const animeTitle = pageTitle
+    .replace(/^\s*(?:مشاهدة|تحميل)?\s*(?:انمي|أنمي|انيمي)\s+/i, "")
+    .replace(/\s+(?:الحلقة|episode)\s*\d+.*$/i, "")
+    .trim();
+  return {
+    episodeTitle: number ? `الحلقة ${number}` : pageTitle,
+    animeTitle: /روابط\s+تحميل\s+الحلقة/i.test(animeTitle) ? "" : animeTitle,
+  };
 }
 
 // ── Direct (no-headless) cross-source search + episode list for anime4up ──
@@ -1294,6 +1281,57 @@ function htmlDecodeCard(s: string): string {
     .replace(/&gt;/g, ">")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function up4AbsoluteUrl(href: string): string {
+  try { return new URL(htmlDecodeCard(href), UP4_BASE).toString(); }
+  catch { return htmlDecodeCard(href); }
+}
+
+export function parseAnime4upRecentHtml(
+  html: string,
+  page = 1,
+): { episodes: RawEpisodeCard[]; hasNext: boolean } {
+  const episodes: RawEpisodeCard[] = [];
+  const seenAnime = new Set<string>();
+  for (const block of html.split("anime-card-container").slice(1)) {
+    const episodeAnchor = [...block.matchAll(/<a\b[^>]*href=["']([^"']*\/episode\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)][0];
+    if (!episodeAnchor) continue;
+    const animeAnchor = [...block.matchAll(/<a\b[^>]*href=["']([^"']*\/anime\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)]
+      .find((match) => htmlDecodeCard(match[2].replace(/<[^>]+>/g, "")));
+    const href = up4AbsoluteUrl(episodeAnchor[1]);
+    const animeHref = animeAnchor ? up4AbsoluteUrl(animeAnchor[1]) : href;
+    const animeTitle = animeAnchor ? htmlDecodeCard(animeAnchor[2].replace(/<[^>]+>/g, "")) : "";
+    const episodeText = htmlDecodeCard(episodeAnchor[2].replace(/<[^>]+>/g, ""));
+    let decodedHref = href;
+    try { decodedHref = decodeURIComponent(href); } catch {}
+    const number = Number((episodeText.match(/(?:الحلقة|episode)\s*(\d+)/i) || decodedHref.match(/الحلقة[-\s]*(\d+)/i) || [])[1]);
+    const key = (animeHref || animeTitle || href).toLowerCase().replace(/\/+$/, "");
+    if (!href || !animeTitle || seenAnime.has(key)) continue;
+    seenAnime.add(key);
+    const image = block.match(/<img[^>]*\b(?:data-image|data-src|data-original|src)=["']([^"']+)["']/i)?.[1] || null;
+    episodes.push({
+      title: Number.isFinite(number) && number > 0 ? `الحلقة ${number}` : episodeText,
+      href,
+      image: upgradeCardImg(image),
+      animeTitle,
+      animeHref,
+      isNew: true,
+    });
+  }
+  const nextPage = Math.max(1, page) + 1;
+  return { episodes, hasNext: new RegExp(`/episode/page/${nextPage}/?(?:["'#?]|$)`, "i").test(html) };
+}
+
+export async function fetchAnime4upRecentPageDirect(
+  page = 1,
+): Promise<{ episodes: RawEpisodeCard[]; hasNext: boolean } | null> {
+  const safePage = Math.max(1, Math.floor(page));
+  const url = safePage === 1 ? `${UP4_BASE}/episode/` : `${UP4_BASE}/episode/page/${safePage}/`;
+  const html = await window.pantoufa.fetchHtml?.(url, UP4_BASE + "/");
+  if (!html) return null;
+  const result = parseAnime4upRecentHtml(html, safePage);
+  return result.episodes.length ? result : null;
 }
 
 // Strip WordPress' resize suffix (…-323x470.jpg → ….jpg) + CDN resize params.
