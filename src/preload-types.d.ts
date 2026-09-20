@@ -40,6 +40,11 @@ declare global {
         opts?: { attempts?: number; timeoutMs?: number },
       ) => Promise<string | null>;
       fetchJson: (opts: { url: string; method?: string; body?: string; headers?: Record<string, string> }) => Promise<string | null>;
+      resolveWitServers: (url: string) => Promise<{
+        servers: { id: string; name: string; iframeUrl: string }[];
+        episodeTitle: string;
+        animeTitle: string;
+      } | null>;
       downloadStart: (opts: { id: string; url: string; provider: string }) => Promise<{ ok: boolean; total?: number }>;
       downloadDelete: (id: string) => Promise<boolean>;
       downloadQuery: (id: string) => Promise<{ exists: boolean; valid: boolean; size: number }>;

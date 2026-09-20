@@ -72,6 +72,11 @@ contextBridge.exposeInMainWorld("pantoufa", {
   // Privileged JSON/text fetch (AniList, translate) from the main process.
   fetchJson: (opts: { url: string; method?: string; body?: string; headers?: Record<string, string> }) =>
     ipcRenderer.invoke("pantoufa:fetch-json", opts) as Promise<string | null>,
+  resolveWitServers: (url: string) => ipcRenderer.invoke("pantoufa:wit-servers", url) as Promise<{
+    servers: { id: string; name: string; iframeUrl: string }[];
+    episodeTitle: string;
+    animeTitle: string;
+  } | null>,
 
   // ── Offline downloads ──
   downloadStart: (opts: { id: string; url: string; provider: string }) =>

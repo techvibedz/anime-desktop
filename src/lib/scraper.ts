@@ -317,7 +317,20 @@ function parseWitServers(html: string): RawServer[] {
 export async function scrapeWitanimeEpisodePageDirect(
   episodeUrl: string,
 ): Promise<{ servers: RawServer[]; episodeTitle: string; animeTitle: string } | null> {
-  const html = await window.pantoufa.fetchHtml?.(rewriteWitUrl(episodeUrl), WIT_BASE + "/");
+  const resolvedUrl = rewriteWitUrl(episodeUrl);
+  const current = await window.pantoufa.resolveWitServers?.(resolvedUrl);
+  if (current?.servers.length) {
+    return {
+      episodeTitle: current.episodeTitle,
+      animeTitle: current.animeTitle,
+      servers: current.servers.map((server) => ({
+        ...server,
+        iframeUrl: normalizeEmbedUrl(server.iframeUrl),
+        provider: classifyProvider(server.iframeUrl),
+      })),
+    };
+  }
+  const html = await window.pantoufa.fetchHtml?.(resolvedUrl, WIT_BASE + "/");
   if (!html) return null;
   const servers = parseWitServers(html);
   if (servers.length === 0) return null;
@@ -1499,15 +1512,21 @@ export async function fetchWitHomeDirect(): Promise<WitHomeDirect | null> {
   })), animes, episodes };
 }
 
-export type WitRecentSitemapEntry = { href: string; slug: string; number: number };
+export type WitRecentSitemapEntry = { href: string; slug: string; number: number; updatedAt: number };
 
 export function parseWitEpisodeSitemap(xml: string): WitRecentSitemapEntry[] {
   const entries: WitRecentSitemapEntry[] = [];
-  for (const match of xml.matchAll(/<loc>([\s\S]*?)<\/loc>/gi)) {
-    const href = htmlDecodeCard(match[1]);
+  for (const match of xml.matchAll(/<url\b[^>]*>([\s\S]*?)<\/url>/gi)) {
+    const body = match[1];
+    const href = htmlDecodeCard(body.match(/<loc>([\s\S]*?)<\/loc>/i)?.[1] || "");
     try {
       const path = new URL(href).pathname.match(/^\/watch\/(.+)\/(\d+)\/?$/i);
-      if (path) entries.push({ href, slug: decodeURIComponent(path[1]), number: Number(path[2]) });
+      if (path) entries.push({
+        href,
+        slug: decodeURIComponent(path[1]),
+        number: Number(path[2]),
+        updatedAt: Date.parse(body.match(/<lastmod>([\s\S]*?)<\/lastmod>/i)?.[1] || "") || 0,
+      });
     } catch {}
   }
   return entries;
@@ -1521,18 +1540,14 @@ export function selectWitRecentEntries(
 ): { entries: WitRecentSitemapEntry[]; hasNext: boolean } {
   const offset = Math.max(0, page - 2) * pageSize;
   const seen = new Set(excludedSlugs);
-  const recent: WitRecentSitemapEntry[] = [];
-  for (const xml of sitemapXmlsNewestFirst) {
-    const entries = parseWitEpisodeSitemap(xml);
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const entry = entries[i];
-      if (seen.has(entry.slug)) continue;
+  const recent = sitemapXmlsNewestFirst
+    .flatMap(parseWitEpisodeSitemap)
+    .sort((a, b) => b.updatedAt - a.updatedAt || b.number - a.number)
+    .filter((entry) => {
+      if (seen.has(entry.slug)) return false;
       seen.add(entry.slug);
-      recent.push(entry);
-      if (recent.length > offset + pageSize) break;
-    }
-    if (recent.length > offset + pageSize) break;
-  }
+      return true;
+    });
   return { entries: recent.slice(offset, offset + pageSize), hasNext: recent.length > offset + pageSize };
 }
 
@@ -1551,6 +1566,42 @@ export function parseWitEpisodeMeta(html: string, entry: WitRecentSitemapEntry):
     } catch {}
   }
   return { title: `الحلقة ${entry.number}`, href: entry.href, image: upgradeCardImg(image), animeTitle, animeHref, isNew: true };
+}
+
+async function hydrateWitRecentFromAniList(entries: readonly WitRecentSitemapEntry[]): Promise<HomeEpisode[]> {
+  const media = new Map<number, any>();
+  const lookup = async (index: number, search: string) => {
+    const raw = await window.pantoufa.fetchJson({
+      url: "https://graphql.anilist.co",
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        query: `query ($search: String) { Media(search: $search, type: ANIME) { title { romaji english } coverImage { large } } }`,
+        variables: { search },
+      }),
+    });
+    try {
+      const match = raw ? JSON.parse(raw)?.data?.Media : null;
+      if (match) media.set(index, match);
+    } catch {}
+  };
+  await Promise.all(entries.map((entry, index) => lookup(index, entry.slug.replace(/[-_]+/g, " "))));
+  await Promise.all(entries.map(async (entry, index) => {
+    if (media.has(index)) return;
+    const words = entry.slug.replace(/[-_]+/g, " ").split(/\s+/);
+    if (words.length > 4) await lookup(index, words.slice(0, 4).join(" "));
+  }));
+  return entries.map((entry, index) => {
+    const match = media.get(index);
+    return {
+      title: `الحلقة ${entry.number}`,
+      href: entry.href,
+      image: match?.coverImage?.large || null,
+      animeTitle: match?.title?.romaji || match?.title?.english || entry.slug.replace(/[-_]+/g, " "),
+      animeHref: `${new URL(entry.href).origin}/anime/${entry.slug}`,
+      isNew: true,
+    };
+  });
 }
 
 export async function fetchWitRecentPageDirect(
@@ -1582,24 +1633,7 @@ export async function fetchWitRecentPageDirect(
     if (selected.hasNext) break;
   }
 
-  const episodes = new Array<HomeEpisode>(selected.entries.length);
-  const missed: number[] = [];
-  let cursor = 0;
-  async function hydrate() {
-    while (cursor < selected.entries.length) {
-      const index = cursor++;
-      const entry = selected.entries[index];
-      const html = await window.pantoufa.fetchHtml?.(entry.href, `${WIT_BASE}/`);
-      if (!html) missed.push(index);
-      episodes[index] = parseWitEpisodeMeta(html || "", entry);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(2, selected.entries.length) }, hydrate));
-  for (const index of missed) {
-    const entry = selected.entries[index];
-    const html = await window.pantoufa.fetchHtml?.(entry.href, `${WIT_BASE}/`);
-    if (html) episodes[index] = parseWitEpisodeMeta(html, entry);
-  }
+  const episodes = await hydrateWitRecentFromAniList(selected.entries);
   return { episodes, hasNext: selected.hasNext };
 }
 

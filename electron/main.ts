@@ -2499,6 +2499,93 @@ app.whenReady().then(() => {
     return true;
   });
 
+  // WitAnime's current player is a same-session handshake: episode page →
+  // sources manifest → prime token → gate redirect. Resolve that redirect in
+  // the privileged main process so the renderer receives real provider embeds
+  // that its native extractors can play.
+  ipcMain.handle("pantoufa:wit-servers", async (_evt, rawUrl: string) => {
+    try {
+      const episode = new URL(rawUrl);
+      if (episode.protocol !== "https:" || episode.hostname !== "witanime.site" || !episode.pathname.startsWith("/watch/")) return null;
+      const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+      const request = async (url: string, init: RequestInit) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 12000);
+        try { return await session.defaultSession.fetch(url, { ...init, signal: controller.signal }); }
+        finally { clearTimeout(timer); }
+      };
+      const page = await request(episode.toString(), { headers: { "User-Agent": ua, Accept: "text/html", Referer: "https://witanime.site/" } });
+      if (!page.ok) return null;
+      const html = await page.text();
+      const source = html.match(/sourcesUrl:\s*'([^']+)'/i)?.[1]?.replace(/\\\//g, "/");
+      const csrf = html.match(/<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i)?.[1];
+      if (!source || !csrf) return null;
+      const headers = {
+        "User-Agent": ua,
+        Accept: "application/json",
+        "X-CSRF-TOKEN": csrf,
+        "X-Requested-With": "XMLHttpRequest",
+        Referer: episode.toString(),
+        Origin: episode.origin,
+      };
+      const manifestResponse = await request(new URL(source, episode).toString(), { method: "POST", headers });
+      if (!manifestResponse.ok) return null;
+      const manifest = await manifestResponse.json() as any;
+      const seenLabels = new Set<string>();
+      const entries: { quality: string; label: string; token: string }[] = [];
+      for (const [quality, group] of Object.entries(manifest?.players || {})) {
+        if (!Array.isArray(group)) continue;
+        for (const item of group as any[]) {
+          const label = String(item?.label || "witanime").toLowerCase();
+          const token = String(item?.token || "");
+          if (seenLabels.has(label) || !/^[a-f0-9]{64}$/i.test(token)) continue;
+          seenLabels.add(label);
+          entries.push({ quality, label, token });
+        }
+      }
+      const rank = (label: string) => label.includes("hgcloud") ? 0 : label.includes("videa") ? 1 : label.includes("mp4upload") ? 2 : 3;
+      entries.sort((a, b) => rank(a.label) - rank(b.label));
+      const servers: { id: string; name: string; iframeUrl: string }[] = [];
+      for (const entry of entries) {
+        const sourceUrl = `${episode.origin}/watch/stream-source/${entry.token}`;
+        let ready = await request(sourceUrl, { method: "POST", headers }).catch(() => null);
+        if (ready?.status === 429) {
+          await new Promise((resolve) => setTimeout(resolve, 800));
+          ready = await request(sourceUrl, { method: "POST", headers }).catch(() => null);
+        }
+        if (!ready?.ok) continue;
+        const gateUrl = `${episode.origin}/watch/stream-gate/${entry.token}`;
+        let target = "";
+        try {
+          const gate = await request(gateUrl, { headers, redirect: "manual" });
+          const body = await gate.text();
+          target = gate.headers.get("location")
+            || body.match(/http-equiv=["']refresh["'][^>]+content=["'][^"']*url=['"]?([^'"\s>]+)/i)?.[1]
+            || body.match(/<a[^>]+href=["']([^"']+)["']/i)?.[1]
+            || (gate.url !== gateUrl ? gate.url : "");
+        } catch {}
+        if (!target) {
+          const followed = await request(gateUrl, { headers, redirect: "follow" }).catch(() => null);
+          if (followed?.url && followed.url !== gateUrl) target = followed.url;
+        }
+        try { target = new URL(target, gateUrl).toString(); } catch { target = ""; }
+        if (!target || target === gateUrl || servers.some((server) => server.iframeUrl === target)) continue;
+        servers.push({ id: entry.token, name: `${entry.label} ${entry.quality}`.trim(), iframeUrl: target });
+      }
+      const deent = (value: string) => value.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+      const heading = html.match(/<main[\s\S]*?<h1[^>]*>([\s\S]*?)<\/h1>/i) || html.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i);
+      const animeLink = html.match(/anime-page-link[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i)
+        || html.match(/<a[^>]+href=["'][^"']*\/anime\/[^"']+["'][^>]*>([\s\S]*?)<\/a>/i);
+      return {
+        servers,
+        episodeTitle: heading ? deent(heading[1]) : "",
+        animeTitle: animeLink ? deent(animeLink[1]) : "",
+      };
+    } catch {
+      return null;
+    }
+  });
+
   // Privileged JSON/text fetch from the main process. Used for AniList (schedule,
   // seasons, upcoming, title detail) and the translate endpoint: net.fetch rides
   // the DoH resolver and has NO CORS, so it works where the renderer's
