@@ -467,13 +467,13 @@ const megaStreams = new Map<string, MegaStream>();
 
 async function resolveMegaStream(embedUrl: string): Promise<{ url: string; type: "mp4" } | null> {
   const url = new URL(embedUrl);
-  if (!url.hostname.endsWith("mega.nz")) return null;
+  if (url.protocol !== "https:" || !(url.hostname === "mega.nz" || url.hostname.endsWith(".mega.nz"))) return null;
   const parts = url.pathname.split("/").filter(Boolean);
   const marker = parts.findIndex((part) => part === "embed" || part === "file");
   const handle = marker >= 0 ? parts[marker + 1] : "";
   if (!handle || !url.hash) return null;
   const rawKey = Buffer.from(url.hash.slice(1), "base64url");
-  if (rawKey.length < 32) return null;
+  if (rawKey.length !== 32 || !/^[A-Za-z0-9_-]{8}$/.test(handle)) return null;
   const key = Buffer.alloc(16);
   for (let i = 0; i < 16; i++) key[i] = rawKey[i] ^ rawKey[i + 16];
   const nonce = Buffer.alloc(16);
@@ -481,11 +481,12 @@ async function resolveMegaStream(embedUrl: string): Promise<{ url: string; type:
   const response = await net.fetch(`https://g.api.mega.co.nz/cs?id=${Date.now()}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify([{ a: "g", g: 1, p: handle }]),
+    body: JSON.stringify([{ a: "g", g: 1, ssl: 2, p: handle }]),
+    signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) return null;
   const result = (await response.json() as any[])?.[0];
-  if (!result?.g || !Number.isFinite(result.s) || result.s <= 0) return null;
+  if (typeof result?.g !== "string" || !result.g.startsWith("https://") || !Number.isSafeInteger(result.s) || result.s <= 0) return null;
   const token = randomBytes(18).toString("base64url");
   if (megaStreams.size >= 32) megaStreams.delete(megaStreams.keys().next().value!);
   megaStreams.set(token, { downloadUrl: result.g, size: result.s, key, nonce });
@@ -523,16 +524,21 @@ async function serveMegaStream(request: Request, reqUrl: URL): Promise<Response>
   }
   const chunkSize = start === 0 ? 1024 * 1024 : 4 * 1024 * 1024;
   const requestedEnd = match?.[2] ? Number(match[2]) : stream.size - 1;
+  if ((request.headers.has("range") && !match) || !Number.isSafeInteger(requestedEnd) || requestedEnd < start) {
+    return new Response("invalid range", { status: 416, headers: { ...cors, "Content-Range": `bytes */${stream.size}` } });
+  }
   const end = Math.min(stream.size - 1, requestedEnd, start + chunkSize - 1);
   const alignedStart = start - (start % 16);
-  const upstream = await session.defaultSession.fetch(stream.downloadUrl, {
-    headers: { Range: `bytes=${alignedStart}-${end}`, "Accept-Encoding": "identity" },
+  const upstream = await session.defaultSession.fetch(`${stream.downloadUrl.replace(/\/$/, "")}/${alignedStart}-${end}`, {
+    headers: { "Accept-Encoding": "identity" },
     cache: "no-store",
+    signal: AbortSignal.timeout(30_000),
   });
-  if (!(upstream.status === 206 || (upstream.status === 200 && alignedStart === 0))) {
+  if (!(upstream.status === 200 || upstream.status === 206)) {
     return new Response("MEGA fetch failed", { status: 502, headers: cors });
   }
   const encrypted = Buffer.from(await upstream.arrayBuffer());
+  if (encrypted.length !== end - alignedStart + 1) return new Response("incomplete MEGA range", { status: 502, headers: cors });
   const decipher = createDecipheriv("aes-128-ctr", stream.key, advanceCtr(stream.nonce, alignedStart / 16));
   const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
   const body = decrypted.subarray(start - alignedStart, start - alignedStart + end - start + 1);
@@ -1266,11 +1272,11 @@ async function extractMp4upload(
   // UA (see PLAYBACK_UA) so the token we extract is valid for the <video>
   // request that plays it.
   let html = "";
-  for (let attempt = 0; attempt < 3 && !html; attempt++) {
-    if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
+  for (let attempt = 0; attempt < 1 && !html; attempt++) {
     try {
       const resp = await session.defaultSession.fetch(embedUrl, {
         method: "GET",
+        signal: AbortSignal.timeout(8000),
         headers: {
           "User-Agent": PLAYBACK_UA,
           "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1285,7 +1291,7 @@ async function extractMp4upload(
       });
       console.info(`[extractMp4upload] GET ${embedUrl} (try ${attempt + 1}) → ${resp.status}`);
       if (resp.ok) {
-        const text = await resp.text();
+        const text = (await resp.text()).replace(/\\\//g, "/").replace(/&amp;/g, "&");
         // A Cloudflare interstitial / placeholder returns 200 but carries no
         // player config — only accept a body that actually has a source.
         if (/player\.src|sources?\s*[:=]|\.mp4/i.test(text)) html = text;

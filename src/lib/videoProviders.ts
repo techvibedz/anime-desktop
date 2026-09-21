@@ -246,6 +246,9 @@ const MEDIA_DECOY_RE =
 export function validateMediaUrl(raw: string, provider = "generic"): boolean {
   try {
     const url = new URL(raw);
+    if (provider === "mega" && url.protocol === "pantoufa-video:" && url.hostname === "mega") {
+      return /^\/[A-Za-z0-9_-]{24}\.mp4$/.test(url.pathname);
+    }
     if (url.protocol !== "http:" && url.protocol !== "https:") return false;
     if (MEDIA_DECOY_RE.test(raw) || /\/embed(?:[-/]|$)|\/e\/[^/]*\.(?:mp4|m3u8)/i.test(url.pathname)) return false;
     if (provider === "mp4upload") {

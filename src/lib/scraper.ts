@@ -163,6 +163,7 @@ export async function scrapeVideoServers(episodeUrl: string) {
 // Mirrors the provider() helper inside EXTRACT_VIDEO_SERVERS.
 function classifyProvider(url: string): string {
   const u = (url || "").toLowerCase();
+  if (/^https?:\/\/(?:[^/]+\.)?mega\.nz\//i.test(u)) return "mega";
   if (/mp4upload/.test(u)) return "mp4upload";
   if (/dailymotion|dai\.ly/.test(u)) return "dailymotion";
   if (/streamwish|hlswish|wishembed|wishfast|hgcloud|jwembed|vibuxer|audinifer|masukestin|hanerix|playerwish/.test(u)) return "streamwish";
