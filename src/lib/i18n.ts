@@ -31,9 +31,31 @@ export const ar = {
   haveAccount: "لديك حساب بالفعل؟",
   signInFailed: "فشل تسجيل الدخول",
   authNotConfigured: "خدمة المصادقة غير مهيّأة",
+  // Auth — error reasons. Keys come from lib/authErrors.authErrorKey, so the raw
+  // English GoTrue message never reaches the user.
+  authErrors: {
+    emailNotConfirmed: "بريدك لم يتم تأكيده بعد. افتح رابط التأكيد الذي أرسلناه لك، أو أرسله من جديد.",
+    invalidCredentials: "البريد الإلكتروني أو كلمة المرور غير صحيحة.",
+    emailAlreadyRegistered: "هذا البريد مسجّل بالفعل — سجّل الدخول أو استعد كلمة المرور.",
+    rateLimited: "محاولات كثيرة في وقت قصير. انتظر قليلًا ثم أعد المحاولة.",
+    weakPassword: "كلمة المرور ضعيفة — 8 أحرف على الأقل.",
+    samePassword: "كلمة المرور الجديدة يجب أن تختلف عن القديمة.",
+    invalidEmail: "صيغة البريد الإلكتروني غير صحيحة.",
+    offline: "تعذّر الاتصال بالإنترنت. تحقّق من الشبكة وحاول مجددًا.",
+    unknown: "فشل تسجيل الدخول. حاول مرة أخرى.",
+  },
+  confirmEmailHelp: "إن لم يصلك رابط التأكيد، أعد إرساله أو اطلب رابط دخول لمرة واحدة.",
+  resendConfirmation: "إعادة إرسال رابط التأكيد",
+  resendConfirmationSent: "أرسلنا رابط التأكيد من جديد. افحص بريدك ومجلد الرسائل المزعجة.",
+  sendSignInLink: "أرسل لي رابط دخول لمرة واحدة",
+  signInLinkSent: "أرسلنا رابط دخول إلى بريدك — افتحه على هذا الجهاز لإكمال تسجيل الدخول.",
+  emailAlreadyRegisteredHint: "هذا البريد مسجّل بالفعل. سجّل الدخول بدلًا من إنشاء حساب جديد.",
   checkInbox: "افحص بريدك",
   confirmEmailSent: (e: string) => `أرسلنا رابط التحقق إلى ${e}.`,
   passwordMin8: "ثمانية أحرف على الأقل",
+  emailPasswordRequired: "البريد وكلمة المرور مطلوبان",
+  passwordTooShort: "كلمة المرور يجب أن تكون 8 أحرف على الأقل",
+  passwordsDontMatch: "كلمتا المرور غير متطابقتين",
 
   // Home
   home: "الرئيسية",

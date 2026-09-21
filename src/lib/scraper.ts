@@ -1693,10 +1693,41 @@ export async function searchAnime4upDirectList(query: string): Promise<WitCard[]
 // screen shows its results first and only falls back to the other two sources
 // for queries witanime has nothing for. Returns null on fetch failure so the
 // caller can fall back to the headless scrape (recovers a Cloudflare block).
+// The site answers HTTP 429 after a short burst of /search GETs, and the
+// cross-source episode lookup fires several queries back to back (the title,
+// its normalized spelling, then single words). Firing them together used to
+// 429 every one of them, so an episode opened from anime4up found no Witanime
+// copy and its servers never appeared. Searches now go through one queue with a
+// small gap, and a miss lengthens a shared cooldown (the main-process fetch
+// does not surface the status, so a null result is treated as "possibly rate
+// limited" — the only cost is a slower fallback chain, which is exactly the
+// behaviour a 429 wants).
+let witSearchTail: Promise<unknown> = Promise.resolve();
+let witSearchCooldownUntil = 0;
+const WIT_SEARCH_MIN_GAP_MS = 350;
+const WIT_SEARCH_COOLDOWN_MAX_MS = 8000;
+
+async function witSearchRequest(url: string, referer: string): Promise<string | null> {
+  const task = witSearchTail.then(async () => {
+    const wait = Math.max(0, witSearchCooldownUntil - Date.now());
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    witSearchCooldownUntil = Date.now() + WIT_SEARCH_MIN_GAP_MS;
+    const html = await window.pantoufa.fetchHtml?.(url, referer);
+    // A miss is usually the rate limit: back off before the next query instead
+    // of hammering it into the same window.
+    if (!html) {
+      witSearchCooldownUntil = Date.now() + Math.min(WIT_SEARCH_COOLDOWN_MAX_MS, WIT_SEARCH_COOLDOWN_MAX_MS / 4 + 750);
+    }
+    return html ?? null;
+  });
+  witSearchTail = task.catch(() => {});
+  return task;
+}
+
 export async function searchWitanimeDirectList(query: string): Promise<WitCard[] | null> {
   if (!query) return null;
   const url = `${WIT_BASE}/search?q=${encodeURIComponent(query)}`;
-  const html = await window.pantoufa.fetchHtml?.(url, WIT_BASE + "/");
+  const html = await witSearchRequest(url, WIT_BASE + "/");
   if (!html) return null;
   return parseWitCards(html);
 }

@@ -55,6 +55,10 @@ const DETAIL_CACHE_PREFIX = "@detail_v4:";
 const DETAIL_CACHE_TTL = 30 * 60 * 1000;
 const UP4_CACHE_PREFIX = "@up4_eps_v2:";
 const UP4_CACHE_TTL = 24 * 60 * 60 * 1000;
+// Resolved Witanime ANIME pages per source title (see fetchCompleteVideoServers).
+// Remembers what a free-text search resolved to so later episodes of the same
+// anime skip the site's rate-limited /search and only fetch the anime page.
+const WIT_ANIME_CACHE_PREFIX = "@wit_anime_v1:";
 
 async function readCache<T>(key: string, ttlMs: number): Promise<T | null> {
   try {
@@ -1119,14 +1123,23 @@ export function fetchCompleteVideoServers(
     const episodeNumber = options.episodeNumber ?? episodeNumberFromUrl(episodeUrl);
     const initialTitle = (options.animeTitle || "").trim();
 
+    // Cross-source discovery: an episode opened from anime4up / anime3rb carries
+    // a title the site may spell differently (mixed script, romaji vs English),
+    // so resolveWitanimeEpisode searches for it. Remember what that search
+    // landed on — the next episode of the same anime then skips /search (which
+    // the site rate-limits with HTTP 429) and only fetches the anime page.
+    const witAnimeKey = (title: string) =>
+      WIT_ANIME_CACHE_PREFIX + title.toLowerCase().replace(/\s+/g, " ").trim();
     const loadWit = async (title: string): Promise<CompleteVideoServersPayload | null> => {
       if ((!primaryIsUp4 && !primaryIsA3rb) || episodeNumber == null) return null;
       const knownHref = options.animeHref?.replace(/https?:\/\/[^/]*witanime\.[^/]+/i, "https://witanime.site");
+      const remembered = !knownHref && title ? await readCache<string>(witAnimeKey(title), UP4_CACHE_TTL) : null;
       const href = await resolveWitanimeEpisode(
-        title, episodeNumber, knownHref,
-        (query) => withTimeout(searchWitanimeDirectList(query), 8_000, null),
+        title, episodeNumber, knownHref || remembered,
+        (query) => withTimeout(searchWitanimeDirectList(query), 12_000, null),
         (name) => withTimeout(getAltTitles(name), 5_000, []), tm_seasonNum,
         (url) => withTimeout(window.pantoufa.fetchHtml(url, "https://witanime.site/"), 8_000, null),
+        (animeUrl) => { if (title) void writeCache(witAnimeKey(title), animeUrl); },
       ).catch(() => null);
       if (!href) return null;
       return fetchVideoServers(href, undefined, !!options.force)

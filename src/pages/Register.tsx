@@ -1,25 +1,42 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "../lib/auth";
+import { authErrorKey } from "../lib/authErrors";
 import { t } from "../lib/i18n";
 
 export function RegisterPage() {
-  const { signUpWithEmail } = useAuth();
+  const { signUpWithEmail, resendConfirmation } = useAuth();
   const navigate = useNavigate();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  const errorText = (value: string) =>
+    authErrorKey(value) === "unknown" ? value : t.authErrors[authErrorKey(value)];
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    setErr(null); setMsg(null); setBusy(true);
+    setErr(null); setMsg(null); setNotice(null); setBusy(true);
     const r = await signUpWithEmail(email, password);
     setBusy(false);
-    if (r.error) setErr(r.error);
+    if (r.error) setErr(errorText(r.error));
+    // Supabase reports "success" for an address that already has an account (it
+    // won't leak which addresses exist). Saying "check your inbox" to that user
+    // left them waiting for an email that never comes.
+    else if (r.emailExists) setErr(t.emailAlreadyRegisteredHint);
     else if (r.needsConfirmation) setMsg(t.confirmEmailSent(email));
     else navigate("/");
+  }
+
+  async function resend() {
+    setNotice(null);
+    setBusy(true);
+    const { error } = await resendConfirmation(email);
+    setBusy(false);
+    setNotice(error ? errorText(error) : t.resendConfirmationSent);
   }
 
   return (
@@ -43,6 +60,15 @@ export function RegisterPage() {
         </div>
         {err && <p className="text-sm text-red-400">{err}</p>}
         {msg && <p className="text-sm text-accent">{msg}</p>}
+        {msg && (
+          <button
+            type="button" onClick={resend} disabled={busy}
+            className="w-full rounded-lg border border-accent/40 bg-accent/10 py-2 text-xs font-semibold text-accent transition-colors hover:bg-accent/20 disabled:opacity-50"
+          >
+            {t.resendConfirmation}
+          </button>
+        )}
+        {notice && <p className="text-xs text-accent">{notice}</p>}
         <button
           type="submit" disabled={busy}
           className="w-full rounded-full bg-accent py-3 text-sm font-bold text-black transition-colors hover:bg-accent-bright disabled:opacity-50"

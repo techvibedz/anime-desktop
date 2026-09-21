@@ -2710,6 +2710,16 @@ app.whenReady().then(() => {
     }
   });
 
+  // Server-requested retry delay (Retry-After in seconds or as an HTTP-date).
+  function retryAfterMs(header: string | null, capMs = 10_000): number {
+    if (!header) return 0;
+    const trimmed = header.trim();
+    const seconds = Number(trimmed);
+    if (Number.isFinite(seconds) && seconds > 0) return Math.min(capMs, seconds * 1000);
+    const date = Date.parse(trimmed);
+    return Number.isFinite(date) ? Math.min(capMs, Math.max(0, date - Date.now())) : 0;
+  }
+
   // Privileged HTML fetch from the main process (no CORS, any port). Used to
   // read anime4up episode pages directly: their server list lives in the
   // static HTML (<li data-watch>), so a plain GET is far faster and more
@@ -2738,6 +2748,7 @@ app.whenReady().then(() => {
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), PER_ATTEMPT_TIMEOUT_MS);
+      let retryDelayMs = 600 * attempt;
       try {
         // net.fetch (Chromium net stack) instead of global fetch (Node/undici)
         // so this rides the DoH host resolver configured in whenReady — undici
@@ -2760,13 +2771,20 @@ app.whenReady().then(() => {
         // a hard 4xx (404/410) won't change on retry, so bail immediately.
         const retryable = res.status === 429 || res.status === 403 || res.status >= 500;
         if (!retryable || attempt === ATTEMPTS) return null;
+        // 429/503 mean "too fast": honour the server's Retry-After and step back
+        // harder than the generic 600ms, otherwise the retry lands inside the
+        // same rate-limit window and every attempt is wasted.
+        if (res.status === 429 || res.status === 503) {
+          retryDelayMs = Math.max(retryAfterMs(res.headers.get("retry-after")), 1200 * attempt);
+        }
       } catch {
         clearTimeout(t);
         if (attempt === ATTEMPTS) return null;
       }
-      // Growing backoff between attempts (0.6s, 1.2s) — long enough to ride out
-      // a rate-limit burst, short enough that recovery stays near-instant.
-      await new Promise((r) => setTimeout(r, 600 * attempt));
+      // Growing backoff between attempts (0.6s, 1.2s, or the server's own
+      // Retry-After) — long enough to ride out a rate-limit burst, short enough
+      // that recovery stays near-instant.
+      await new Promise((r) => setTimeout(r, retryDelayMs));
     }
     return null;
   });
