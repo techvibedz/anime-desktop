@@ -101,8 +101,15 @@ export async function resolveWitanimeEpisode(
   if (!Number.isFinite(number) || number < 1) return null;
   const given = animeHref && /^https?:\/\/(?:[^/]+\.)?witanime\.[^/]+\/(?:anime|movie)\//i.test(animeHref)
     ? animeHref : null;
-  let href = given;
-  if (!href && title) {
+
+  const readEpisode = async (animeUrl: string | null) => {
+    if (!animeUrl) return null;
+    const html = await read(animeUrl).catch(() => null);
+    return html ? witEpisodeLink(html, animeUrl, number) : null;
+  };
+
+  const searchForAnime = async (): Promise<string | null> => {
+    if (!title) return null;
     const names = [title, ...[...title.matchAll(/[([]([^)\]]+)[)\]]/g)].map((m) => m[1])];
     const tried = new Set<string>();
     const cards: Card[] = [];
@@ -121,15 +128,23 @@ export async function resolveWitanimeEpisode(
       }
       return null;
     };
-    href = await find(sourceSearchQueries(title, 4));
-    if (!href) {
+    let found = await find(sourceSearchQueries(title, 4));
+    if (!found) {
       const alt = await aliases(title).catch(() => []);
       names.push(...alt.filter((name) => !names.includes(name)).slice(0, 4));
-      href = await find(names.slice(1).flatMap((name) => sourceSearchQueries(name, 2)));
+      found = await find(names.slice(1).flatMap((name) => sourceSearchQueries(name, 2)));
     }
-  }
-  if (!href) return null;
-  if (!given) onResolved?.(href);
-  const html = await read(href).catch(() => null);
-  return html ? witEpisodeLink(html, href, number) : null;
+    if (found) onResolved?.(found);
+    return found;
+  };
+
+  // The known/cached anime page is tried first (no rate-limited search). When it
+  // can't produce THIS episode's link — the anime page was renamed, or the
+  // episode sits beyond what that page lists — the title search still runs
+  // instead of reporting "no Witanime copy".
+  const viaKnown = await readEpisode(given);
+  if (viaKnown) return viaKnown;
+  const discovered = await searchForAnime();
+  if (!discovered) return null;
+  return discovered === given ? null : readEpisode(discovered);
 }
