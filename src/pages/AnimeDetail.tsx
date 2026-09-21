@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback, useMemo } from "react";
 import { useParams, Link } from "react-router-dom";
 import {
   fetchEpisodes, fetchEpisodesUp4, fetchAnime3rbEpisodes,
-  findAnime3rbAnimeUrl, findWitanimeAnimeUrl,
+  findAnime3rbAnimeUrl, findWitanimeAnimeUrl, findAnime4upAnimeUrl,
   type AnimeDetail, type Episode,
 } from "../lib/api";
 import { addFavorite, removeFavorite, favoriteListOf, type FavoriteList } from "../lib/favorites";
@@ -230,21 +230,19 @@ export function AnimeDetailPage() {
       if (cancelled) return;
       // Record EVERY known source href + title so a card from any source rail
       // resolves the badge — not just the URL the anime happened to be opened
-      // under. The witanime URL is only known when the page itself is witanime;
-      // anime4up/anime3rb pages never resolve it, and witanime cards look the
-      // record up by that href, so resolve it by title here (memoized — repeat
-      // records don't re-run the rate-limited search).
+      // under. Any source whose URL isn't already known is resolved by title
+      // here (memoized — repeat records don't re-search), all three in parallel.
       const hrefs: (string | null | undefined)[] = [animeHref, merged?.anime4up];
-      if (!/witanime/i.test(animeHref)) {
-        const wit = await findWitanimeAnimeUrl(data.title);
-        if (cancelled) return;
-        if (wit) hrefs.push(wit);
-      }
-      if (!/anime3rb\.com/i.test(animeHref)) {
-        const a3rb = await findAnime3rbAnimeUrl(data.title);
-        if (cancelled) return;
-        if (a3rb) hrefs.push(a3rb);
-      }
+      const has = (re: RegExp) => hrefs.some((h) => h && re.test(h));
+      const resolvers: Promise<void>[] = [];
+      if (!has(/witanime/i))
+        resolvers.push(findWitanimeAnimeUrl(data.title).then((u) => { if (u) hrefs.push(u); }));
+      if (!has(/anime4up/i))
+        resolvers.push(findAnime4upAnimeUrl(data.title).then((u) => { if (u) hrefs.push(u); }));
+      if (!has(/anime3rb\.com/i))
+        resolvers.push(findAnime3rbAnimeUrl(data.title).then((u) => { if (u) hrefs.push(u); }));
+      await Promise.all(resolvers);
+      if (cancelled) return;
       await recordAnimeCompletion({
         hrefs,
         titles: [data.title],

@@ -240,11 +240,11 @@ export function animeTitleKey(s: string | null | undefined): string {
     .trim()
     .split(" ")
     .filter((tok) => tok && !TITLE_DECORATION.has(tok))
-    .join(" ")
+    // Joined WITHOUT a separator so a title stored with punctuation
+    // ("Re:Zero") keys identically to the same name without it ("Rezero").
+    .join("")
     .normalize("NFKD")
-    .replace(/[̀-ͯ]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/[̀-ͯ]/g, "");
   if (titleKeyCache.size > 2000) titleKeyCache.clear();
   titleKeyCache.set(raw, key);
   return key;

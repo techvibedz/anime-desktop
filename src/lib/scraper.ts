@@ -329,13 +329,28 @@ export async function scrapeWitanimeEpisodePageDirect(
   const deent = (s: string) =>
     s.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#0?39;/g, "'")
       .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/\s+/g, " ").trim();
+  // The new witanime watch page has no dedicated episode heading (its only <h1>
+  // is the anime title and its <h3>s are the "related" rails), so the label
+  // comes from the page <title> or the /watch/<slug>/<n> URL.
   let episodeTitle = "";
-  const h3 = html.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i);
-  if (h3) episodeTitle = deent(h3[1].replace(/<[^>]+>/g, ""));
+  const epHeading = html.match(/class=["'][^"']*(?:episode-title|main-section)[^"']*["'][\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/i);
+  if (epHeading) episodeTitle = deent(epHeading[1].replace(/<[^>]+>/g, ""));
+  if (!episodeTitle) {
+    const pageTitle = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "";
+    const fromTitle = pageTitle.match(/[\u0600-\u06FF]+\s*\d+/);
+    if (fromTitle) episodeTitle = deent(fromTitle[0]);
+  }
+  if (!episodeTitle) {
+    try {
+      const path = new URL(resolvedUrl).pathname;
+      const num = path.match(/\/watch\/(?:movie\/)?[^/]+\/(\d+)/)?.[1];
+      if (num) episodeTitle = (path.includes("/movie/") ? "\u0641\u064a\u0644\u0645 " : "\u0627\u0644\u062d\u0644\u0642\u0629 ") + num;
+    } catch {}
+  }
   let animeTitle = "";
-  const link = html.match(/anime-page-link[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i);
+  const link = html.match(/anime-page-link[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i)
+    || html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
   if (link) animeTitle = deent(link[1].replace(/<[^>]+>/g, ""));
-  if (!animeTitle && episodeTitle) animeTitle = episodeTitle.replace(/الحلقة\s*\d+.*$/, "").trim();
   return { servers, episodeTitle, animeTitle };
 }
 

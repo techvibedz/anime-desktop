@@ -442,6 +442,20 @@ export function findWitanimeAnimeUrl(title: string): Promise<string | null> {
   return witAnimeUrlCache.get(key)!;
 }
 
+// Same idea, the other direction: the anime's anime4up page (or null). The
+// detail page only knows it when episodes merged from anime4up, so a record
+// written on a witanime/anime3rb page would miss it — and anime4up-sourced
+// rails look records up BY that href.
+const up4AnimeUrlCache = new Map<string, Promise<string | null>>();
+export function findAnime4upAnimeUrl(title: string): Promise<string | null> {
+  const key = (title || "").toLowerCase().trim();
+  if (!key) return Promise.resolve(null);
+  if (!up4AnimeUrlCache.has(key)) {
+    up4AnimeUrlCache.set(key, getCrossSourceUrl(title, "witanime").catch(() => null));
+  }
+  return up4AnimeUrlCache.get(key)!;
+}
+
 export async function fetchRecent(page = 1) {
   if (page === 1) {
     const home = await fetchHome();

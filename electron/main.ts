@@ -2669,13 +2669,31 @@ app.whenReady().then(() => {
         servers.push({ id: entry.token, name: `${entry.label} ${entry.quality}`.trim(), iframeUrl: target });
       }
       const deent = (value: string) => value.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-      const heading = html.match(/<main[\s\S]*?<h1[^>]*>([\s\S]*?)<\/h1>/i) || html.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i);
-      const animeLink = html.match(/anime-page-link[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i)
-        || html.match(/<a[^>]+href=["'][^"']*\/anime\/[^"']+["'][^>]*>([\s\S]*?)<\/a>/i);
+      // The new witanime watch page has no dedicated episode heading: its only
+      // <h1> is the anime title and its <h3>s belong to the "related" rails, so
+      // the old <main>…<h1> match returned the anime name as the episode title.
+      // Take the label from the page <title> ("… الحلقة 10 مترجمة …") or, failing
+      // that, from the /watch/<slug>/<n> URL.
+      const epHeading = html.match(/class=["'][^"']*(?:episode-title|main-section)[^"']*["'][\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/i);
+      let episodeTitle = epHeading ? deent(epHeading[1]) : "";
+      if (!episodeTitle) {
+        const pageTitle = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "";
+        const fromTitle = pageTitle.match(/[\u0600-\u06FF]+\s*\d+/);
+        if (fromTitle) episodeTitle = deent(fromTitle[0]);
+      }
+      if (!episodeTitle) {
+        try {
+          const path = new URL(rawUrl).pathname;
+          const num = path.match(/\/watch\/(?:movie\/)?[^/]+\/(\d+)/)?.[1];
+          if (num) episodeTitle = (path.includes("/movie/") ? "\u0641\u064a\u0644\u0645 " : "\u0627\u0644\u062d\u0644\u0642\u0629 ") + num;
+        } catch {}
+      }
+      const animeLink = html.match(/anime-page-link[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i);
+      const h1 = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
       return {
         servers,
-        episodeTitle: heading ? deent(heading[1]) : "",
-        animeTitle: animeLink ? deent(animeLink[1]) : "",
+        episodeTitle,
+        animeTitle: animeLink ? deent(animeLink[1]) : (h1 ? deent(h1[1]) : ""),
       };
     } catch {
       return null;
