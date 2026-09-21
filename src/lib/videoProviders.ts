@@ -47,7 +47,7 @@ export function anime4upEpisodeUrl(title: string, episodeNumber: number): string
 }
 
 export const PROVIDER_POLICIES: Record<string, ProviderPolicy> = {
-  anime4upcdn: { patterns: ["anime4up-s\\d", "z4m2r9t\\.shop"], rank: 0, resolution: "directThenIframe", failureMode: "failed", supported: true },
+  anime4upcdn: { patterns: ["anime4up-s\\d", "44y4h0r\\.shop", "z4m2r9t\\.shop", "k1c6x8p\\.shop"], rank: 0, resolution: "directThenIframe", failureMode: "failed", supported: true, adaptive: true },
   mp4upload: { patterns: ["mp4upload"], rank: 1, resolution: "directThenIframe", failureMode: "failed", supported: true, downloadable: true },
   dailymotion: { patterns: ["dailymotion", "dai\\.ly"], rank: 0, resolution: "directThenIframe", failureMode: "failed", supported: true, adaptive: true },
   streamwish: { patterns: ["streamwish", "hlswish", "wishembed", "wishfast", "hgcloud", "jwembed", "vibuxer", "audinifer", "masukestin", "hanerix", "playerwish"], rank: 2, resolution: "directThenIframe", failureMode: "failed", supported: true, adaptive: true },
@@ -255,6 +255,12 @@ export function validateMediaUrl(raw: string, provider = "generic"): boolean {
       return (url.hostname === "mp4upload.com" || url.hostname.endsWith(".mp4upload.com")) &&
         url.pathname.toLowerCase().endsWith(".mp4");
     }
+    // Anime4up's CDN serves extension-less, token-signed HLS URLs
+    // (https://cdnN.<edge>.shop/?token=…), so the generic media-extension rule
+    // below would reject every valid extraction.
+    if (provider === "anime4upcdn") {
+      return url.searchParams.has("token") || /\.(?:m3u8|mp4)$/i.test(url.pathname);
+    }
     if (provider === "vid3rb" && /(^|\.)vid3rb\.com$/i.test(url.hostname)) {
       return /\.(?:m3u8|mp4)$/i.test(url.pathname) || /^\/video\//i.test(url.pathname);
     }
@@ -270,6 +276,8 @@ export function validateMediaUrl(raw: string, provider = "generic"): boolean {
 
 export function videoContentType(videoUrl: string, provider = "generic"): "hls" | "progressive" {
   if (/\.m3u8(?:\?|$)/i.test(videoUrl)) return "hls";
+  // Anime4up's CDN URLs carry no extension — the resolver always returns HLS.
+  if (provider === "anime4upcdn" && !/\.mp4(?:\?|$)/i.test(videoUrl)) return "hls";
   if (["streamwish", "voe", "dailymotion", "okru"].includes(provider) && !/\.mp4(?:\?|$)/i.test(videoUrl)) return "hls";
   return "progressive";
 }

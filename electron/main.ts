@@ -1243,6 +1243,96 @@ async function extractVk(
   }
 }
 
+/* ── Anime4up CDN (anime4up1 / anime4up2) ──────────────────────────────
+ * The featured servers (Anime4up-S1/S2) embed a VnxPlayer page on a rotating
+ * *.shop host whose STATIC HTML carries the HLS master URL:
+ *     let streamUrl = "https://cdnN.….shop/?token=…"
+ * The master lists 360p/720p/1080p variants, each with its own signed token —
+ * we return the HIGHEST-bandwidth variant so the custom hls.js player runs at
+ * max quality. The generic headless capture never recognised this private
+ * host/URL shape, which is why anime4up1/2 "didn't work"; one plain GET each
+ * resolves them. */
+function parseAnime4upStreamUrl(html: string): string | null {
+  const m = String(html || "").match(/(?:let|const|var)\s+streamUrl\s*=\s*["']([^"']+)["']/i);
+  if (!m) return null;
+  const raw = m[1].replace(/\\\//g, "/").trim();
+  return /^https?:\/\//i.test(raw) ? raw : null;
+}
+
+function pickHighestHlsVariant(playlist: string, masterUrl?: string): string | null {
+  const lines = String(playlist || "").split(/\r?\n/);
+  let best: { bw: number; url: string } | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    const info = lines[i].match(/^#EXT-X-STREAM-INF:.*\bBANDWIDTH=(\d+)/i);
+    if (!info) continue;
+    let j = i + 1;
+    while (j < lines.length && (!lines[j].trim() || lines[j].trim().startsWith("#"))) j++;
+    const uri = (lines[j] || "").trim();
+    if (!uri) continue;
+    let resolved: string;
+    try {
+      resolved = /^https?:\/\//i.test(uri) ? uri : new URL(uri, masterUrl).toString();
+    } catch {
+      continue;
+    }
+    const bw = parseInt(info[1], 10);
+    if (!best || bw > best.bw) best = { bw, url: resolved };
+  }
+  return best?.url || null;
+}
+
+async function extractAnime4upCdn(
+  iframeUrl: string,
+): Promise<{ url: string; type: "hls" } | null> {
+  let html = "";
+  for (const timeout of [6000, 12000]) {
+    try {
+      const resp = await session.defaultSession.fetch(iframeUrl, {
+        method: "GET",
+        signal: AbortSignal.timeout(timeout),
+        headers: {
+          "User-Agent": PLAYBACK_UA,
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "ar,en;q=0.9",
+          "X-Pantoufa-Proxy": "1",
+        },
+        redirect: "follow",
+        cache: "no-store",
+      });
+      if (resp.ok) html = (await resp.text()).replace(/\\\//g, "/");
+    } catch (e) {
+      console.warn(`[extractAnime4upCdn] page fetch failed (${timeout}ms):`, e);
+    }
+    if (html) break;
+  }
+  const stream = parseAnime4upStreamUrl(html);
+  if (!stream) return null;
+  try {
+    const resp = await session.defaultSession.fetch(stream, {
+      method: "GET",
+      signal: AbortSignal.timeout(8000),
+      headers: {
+        "User-Agent": PLAYBACK_UA,
+        "Accept": "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+        "X-Pantoufa-Proxy": "1",
+      },
+      redirect: "follow",
+      cache: "no-store",
+    });
+    if (resp.ok) {
+      const best = pickHighestHlsVariant(await resp.text(), stream);
+      if (best) {
+        console.info(`[extractAnime4upCdn] highest variant → ${best}`);
+        return { url: best, type: "hls" };
+      }
+    }
+  } catch (e) {
+    console.warn("[extractAnime4upCdn] playlist fetch failed:", e);
+  }
+  // Playlist unresolved — hand over the master and let hls.js adapt.
+  return { url: stream, type: "hls" };
+}
+
 // Pull the real .mp4 URL straight out of mp4upload's embed page from the
 // main process, the same way we do for dailymotion/videa/streamwish. The
 // renderer then plays it in the native <video> element via the proxy
@@ -2383,6 +2473,9 @@ app.whenReady().then(() => {
         // through the proxy, so we leave those only-when-missing to avoid
         // clobbering a working full-path embed Referer.
         let force = false;
+        // Set by branches whose CDN wants NO Referer/Origin at all (its own
+        // player fetches with credentials omitted and the WAF rejects extras).
+        let bare = false;
         if (/mp4upload/.test(host)) {
           ref = "https://www.mp4upload.com/";
           ori = "https://www.mp4upload.com";
@@ -2457,6 +2550,14 @@ app.whenReady().then(() => {
           // ok.ru embed Referer — not its own CDN domain.
           ref = "https://ok.ru/";
           ori = "https://ok.ru";
+        } else if (/\.shop$/i.test(host) && /[?&]token=/.test(details.url)) {
+          // Anime4up's featured-server CDN (cdnN.<edge>.shop/?token=…): the
+          // signed URL is accepted without a Referer (the site fetches it with
+          // credentials omitted) and the WAF rejects unexpected headers, so
+          // strip any inherited Referer/Origin instead of injecting a
+          // root-domain one.
+          bare = true;
+          force = true;
         } else if (!isAdHost(host) && host.includes(".") && !/^\d+\.\d+/.test(host)) {
           // Sub-resource on a CDN host that doesn't match any provider regex
           // (e.g. a rotating streamwish/voe mirror, or ok.ru's mycdn.me). Use
@@ -2482,16 +2583,16 @@ app.whenReady().then(() => {
         // when the only Referer is our own app origin (the direct-play XHR case
         // — a real CDN 403s a localhost/file Referer).
         const replaceExisting = force || appOriginRef;
-        if (ref && (replaceExisting || !hasReferer)) {
-          if (replaceExisting) {
-            // Drop any inherited Referer/Origin (any casing) first so we don't
-            // emit a duplicate header — Chromium may have set "Referer" while
-            // we'd add "referer", and the CDN could read the wrong one.
-            for (const k of Object.keys(hdrs)) {
-              const lk = k.toLowerCase();
-              if (lk === "referer" || lk === "origin") delete hdrs[k];
-            }
+        if (replaceExisting) {
+          // Drop any inherited Referer/Origin (any casing) first so we don't
+          // emit a duplicate header — Chromium may have set "Referer" while
+          // we'd add "referer", and the CDN could read the wrong one.
+          for (const k of Object.keys(hdrs)) {
+            const lk = k.toLowerCase();
+            if (lk === "referer" || lk === "origin") delete hdrs[k];
           }
+        }
+        if (!bare && ref && (replaceExisting || !hasReferer)) {
           hdrs["Referer"] = ref;
           // Some CDNs (vid3rb) reject a cross-origin Origin — only set it when
           // a branch actually provides one (force already deleted any inherited
@@ -2554,6 +2655,9 @@ app.whenReady().then(() => {
       }
       if (opts.provider === "mp4upload") {
         return await extractMp4upload(opts.iframeUrl);
+      }
+      if (opts.provider === "anime4upcdn") {
+        return await extractAnime4upCdn(opts.iframeUrl);
       }
       if (opts.provider === "okru") {
         return await extractOkru(opts.iframeUrl);

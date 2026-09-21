@@ -77,7 +77,8 @@ function titleScore(c: any, queries: string[]): number {
     if (!q) continue;
     for (const nt of titles) {
       if (nt === q) score = Math.max(score, 1000);
-      else if (nt.includes(q) || q.includes(nt)) score = Math.max(score, 500);
+      else if (nt.startsWith(q)) score = Math.max(score, 500);
+      else if (nt.includes(q)) score = Math.max(score, 300);
     }
   }
   return score;
@@ -85,20 +86,23 @@ function titleScore(c: any, queries: string[]): number {
 
 function pickAiring(cands: any[], queries: string[]): NextAiring | null {
   if (!cands.length) return null;
-  const ranked = cands.map((c) => ({ c, s: titleScore(c, queries) })).sort((a, b) => b.s - a.s);
-  const good = ranked.filter((x) => x.s >= 500);
-  const pool = (good.length ? good : ranked).map((x) => x.c);
-  for (const c of pool) {
-    const n = validAiring(c.nextAiringEpisode);
+  const ranked = cands
+    .map((c) => ({ c, s: titleScore(c, queries) }))
+    .filter((x) => x.s >= 500)
+    .sort((a, b) => b.s - a.s);
+  for (const x of ranked) {
+    const n = validAiring(x.c.nextAiringEpisode);
     if (n) return n;
   }
   return null;
 }
 
 function rankedCandidates(cands: any[], queries: string[]): any[] {
-  const ranked = cands.map((c) => ({ c, s: titleScore(c, queries) })).sort((a, b) => b.s - a.s);
-  const good = ranked.filter((x) => x.s >= 500);
-  return (good.length ? good : ranked).map((x) => x.c);
+  return cands
+    .map((c) => ({ c, s: titleScore(c, queries) }))
+    .filter((x) => x.s >= 500)
+    .sort((a, b) => b.s - a.s)
+    .map((x) => x.c);
 }
 
 function pickFinished(cands: any[], queries: string[], lastKnownEp?: number | null): boolean | null {

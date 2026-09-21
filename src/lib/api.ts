@@ -1147,7 +1147,7 @@ export function fetchCompleteVideoServers(
   ]);
 
   return completeVideoServerRequests.run(key, async () => {
-    const deadline = Date.now() + 45_000;
+    const deadline = Date.now() + 30_000;
     const primaryIsUp4 = /anime4up/i.test(episodeUrl);
     const primaryIsA3rb = /anime3rb\.com\/episode\//i.test(episodeUrl);
     const episodeNumber = options.episodeNumber ?? episodeNumberFromUrl(episodeUrl);
@@ -1340,7 +1340,7 @@ export function fetchCompleteVideoServers(
     const resolveOne = async (server: VideoServer) => {
       const result = await withTimeout(
         resolveVideo(server.iframeUrl, server.provider, { fresh: !!options.force && !warming.has(server.iframeUrl) }),
-        40_000,
+        25_000,
         { success: false, error: "Timed out" } as ResolvePayload,
       ).catch(() => null);
       if (!result?.success || result.data.type === "iframe" || !validateMediaUrl(result.data.videoUrl, server.provider)) return;
@@ -1513,7 +1513,7 @@ const CUSTOM_PLAYER_PROVIDERS = new Set([
 // TTL, which is exactly why a server "sometimes" refused to run in the custom
 // player. mp4upload and videa are included (their own branches return a
 // direct stream or iframe).
-const EXPECT_DIRECT_PROVIDERS = new Set([...CUSTOM_PLAYER_PROVIDERS, "mp4upload", "videa"]);
+const EXPECT_DIRECT_PROVIDERS = new Set([...CUSTOM_PLAYER_PROVIDERS, "mp4upload", "videa", "anime4upcdn"]);
 
 type ResolvePayload = { success: true; data: { videoUrl: string; type: "hls" | "mp4" | "iframe" } } | { success: false; error: string };
 export type ResolveVideoOptions = { fresh?: boolean; priority?: boolean };
@@ -1570,6 +1570,16 @@ async function doResolveVideo(iframeUrl: string, provider: string) {
   // proxy (which forces the canonical Referer the CDN wants). Fall back to
   // the iframe only if extraction comes up empty.
   if (provider === "mp4upload") {
+    try {
+      const direct = await window.pantoufa.directExtract?.(provider, iframeUrl);
+      if (direct?.url) return { success: true as const, data: { videoUrl: direct.url, type: direct.type } };
+    } catch {}
+    return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
+  }
+  // Anime4up's featured servers (anime4up1/anime4up2) ship their token-signed
+  // HLS master in the embed page's static HTML; the extractor returns the
+  // highest-resolution variant so playback runs at max quality.
+  if (provider === "anime4upcdn") {
     try {
       const direct = await window.pantoufa.directExtract?.(provider, iframeUrl);
       if (direct?.url) return { success: true as const, data: { videoUrl: direct.url, type: direct.type } };
