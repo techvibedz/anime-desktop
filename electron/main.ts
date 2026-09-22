@@ -1368,6 +1368,18 @@ function pickHighestHlsVariant(playlist: string, masterUrl?: string): string | n
 async function extractAnime4upCdn(
   iframeUrl: string,
 ): Promise<{ url: string; type: "hls"; subtitles?: MediaSubtitle[]; denied?: boolean } | null> {
+  // VnxPlayer distinguishes the canonical featured-server path (trailing slash)
+  // from the slash-less form and serves its "domain not authorized" refusal for
+  // the latter. The renderer used to store slash-stripped URLs, so restore the
+  // slash here too — this is the network boundary, and a stored URL from an
+  // older build (or any future caller) must still reach the real player.
+  try {
+    const u = new URL(iframeUrl);
+    if (/\/Anime4up-S\d\/mal\/\d+\/\d+\/(?:sub|dub)$/i.test(u.pathname)) {
+      u.pathname += "/";
+      iframeUrl = u.toString();
+    }
+  } catch {}
   allowHost(iframeUrl);
   let html = "";
   let refused = false;
@@ -1574,11 +1586,18 @@ async function extractVid3rb(
     desiredRes = parseInt(playerUrlWithHint.slice(hashIdx + "#vid3rb=".length), 10) || 0;
     playerUrl = playerUrlWithHint.slice(0, hashIdx);
   }
-  for (let attempt = 0; attempt < 3; attempt++) {
+  // Two cheap attempts: the player page is a static ~7KB GET that answers in
+  // well under a second when the token is alive, and a dead/expired one gets a
+  // fast 403 — so a hang here means the edge is tarpitting, and waiting out a
+  // third 8s timeout just stalls the click. The AbortSignal bounds every
+  // attempt; without it a tarpitted fetch sat for Chromium's multi-minute
+  // default and the server looked "stuck loading" instead of failing over.
+  for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
     try {
       const resp = await session.defaultSession.fetch(playerUrl, {
         method: "GET",
+        signal: AbortSignal.timeout(8000),
         headers: {
           "User-Agent": PLAYBACK_UA,
           "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",

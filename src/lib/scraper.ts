@@ -573,10 +573,18 @@ function parseUp4Episodes(
   // page's range but missing", concludes numbering gap, and gives up even
   // though the neighbouring page actually has it (verified live: One Piece
   // /page/16/ parses as 420–1165 unscoped, 420–467 scoped).
-  const segStart = html.indexOf("episodes-list-content");
-  if (segStart >= 0) {
-    const segEnd = html.indexOf("pagination", segStart);
-    html = html.slice(segStart, segEnd > segStart ? segEnd : undefined);
+  // Match the container ELEMENT, never the bare text: the class name also
+  // appears in the page's inline CSS (`.episodes-list-content { … }`), and
+  // slicing from that CSS block parsed ZERO episodes — which silently starved
+  // anime4up of server discovery entirely (witanime-primary episodes showed no
+  // anime4up1/2 buttons). The theme now uses id="episodesList"; keep the legacy
+  // class as a fallback for older pages.
+  const container = html.match(
+    /<(?:div|section|ul|ol)\b[^>]*(?:id|class)\s*=\s*["'][^"']*(?:episodes-list-content|episodesList)[^"']*["'][^>]*>/i,
+  );
+  if (container && container.index != null) {
+    const segEnd = html.indexOf("pagination", container.index);
+    html = html.slice(container.index, segEnd > container.index ? segEnd : undefined);
   }
   const out: { title: string; number: number; type: string; screenshot: string; href: string }[] = [];
   const seen = new Set<string>();
@@ -592,7 +600,7 @@ function parseUp4Episodes(
     if (!href) continue;
     if (href.indexOf("http") !== 0) href = href.indexOf("//") === 0 ? "https:" + href : UP4_BASE + (href.charAt(0) === "/" ? "" : "/") + href;
     if (seen.has(href)) continue;
-    const titleM = tag.match(/\btitle=["']([^"']*)["']/i);
+    const titleM = tag.match(/\btitle=["']([^"']*)["']/i) || tag.match(/\baria-label=["']([^"']*)["']/i);
     const title = titleM ? titleM[1] : undefined;
     const num = up4EpisodeNumber(href, title);
     if (num == null) continue;

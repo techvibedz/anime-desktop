@@ -230,7 +230,12 @@ export function normalizeServerUrl(raw: string): string {
   try {
     const url = new URL(value.startsWith("//") ? `https:${value}` : value);
     if (url.protocol !== "http:" && url.protocol !== "https:") return "";
-    if (url.pathname.length > 1) url.pathname = url.pathname.replace(/\/+$/, "");
+    // Keep the path EXACTLY as the source published it — trailing slashes are
+    // significant. anime4up's VnxPlayer serves its "domain not authorized"
+    // refusal for /Anime4up-S1/mal/<id>/<ep>/sub but the real player for …/sub/,
+    // so stripping the slash here made every anime4up1/2 click land on the
+    // refusal while the same URL extracted fine in tests (which used the raw
+    // slash form). Identity comparison strips it in serverDedupeKey instead.
     return url.toString();
   } catch {
     return "";
@@ -241,6 +246,7 @@ function serverDedupeKey(raw: string): string {
   try {
     const url = new URL(raw);
     if (!/^#vid3rb=\d+$/i.test(url.hash)) url.hash = "";
+    if (url.pathname.length > 1) url.pathname = url.pathname.replace(/\/+$/, "");
     return url.toString();
   } catch {
     return raw;
