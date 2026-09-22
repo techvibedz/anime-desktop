@@ -29,6 +29,10 @@ async function pushToCloud(entry: WatchEntry) {
   if (!isSupabaseConfigured) return;
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return;
+  // The dismissed flag lives in its own local set on desktop; include it in
+  // the row so a dismissal also survives a local-storage wipe and reaches the
+  // other device (mobile stores it in the same column).
+  const dismissedSet = await getDismissedHrefs();
   const { error } = await supabase.from("watch_history").upsert({
     user_id: user.id,
     episode_href: entry.episodeHref,
@@ -41,6 +45,7 @@ async function pushToCloud(entry: WatchEntry) {
     updated_at: new Date(entry.updatedAt).toISOString(),
     url4up: entry.url4up ?? null,
     completed: entry.completed ?? autoCompleted(entry),
+    dismissed: dismissedSet.has(entry.episodeHref),
   }, { onConflict: "user_id,episode_href" });
   if (error) console.warn("[history] cloud sync failed:", error.message);
 }
@@ -81,7 +86,25 @@ export async function pullHistoryFromCloud() {
     url4up: row.url4up || undefined,
     completed: !!row.completed,
   }));
+  // Dismissals live in their own set here (mobile keeps them on the row).
+  // Reconcile with the cloud: dismissed rows add to the set, and a NEWER
+  // un-dismissed row (re-watched on the other device) removes from it — so a
+  // dismissal survives reinstalls without sticking forever.
   const local = await getHistory();
+  const localByHref = new Map(local.map((e) => [e.episodeHref, e]));
+  const dismissed = await getDismissedHrefs();
+  let dismissedChanged = false;
+  for (const row of data as any[]) {
+    const href = row.episode_href as string;
+    if (row.dismissed) {
+      if (!dismissed.has(href)) { dismissed.add(href); dismissedChanged = true; }
+    } else {
+      const localEntry = localByHref.get(href);
+      const remoteAt = row.updated_at ? new Date(row.updated_at).getTime() : 0;
+      if (localEntry && remoteAt > localEntry.updatedAt && dismissed.delete(href)) dismissedChanged = true;
+    }
+  }
+  if (dismissedChanged) await setDismissedHrefs(dismissed);
   const byHref = new Map<string, WatchEntry>();
   for (const entry of local) byHref.set(entry.episodeHref, entry);
   for (const row of remote) {
