@@ -51,6 +51,18 @@ app.whenReady().then(async () => {
     return new Response('not found', { status: 404 });
   });
 
+  // Load the renderer's VTT parser so the sweep verifies the exact code the
+  // player uses to paint sidecar subtitles.
+  const subsModule = { exports: {} };
+  const subsCtx = vm.createContext({ module: subsModule, exports: subsModule.exports, console });
+  vm.runInContext(
+    ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src/lib/subtitles.ts'), 'utf8'), {
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+    }).outputText,
+    subsCtx,
+  );
+  const { parseVtt, cueAt } = subsModule.exports;
+
   // Real <video> playback of the MEGA custom-scheme stream — extraction alone
   // is not enough; the element must decode frames.
   async function playInWindow(url, timeoutMs = 25000) {
@@ -148,7 +160,11 @@ app.whenReady().then(async () => {
         if (!/^WEBVTT/.test(vttBody)) throw Error('subtitle is not a VTT file');
         const cues = (vttBody.match(/-->/g) || []).length;
         if (cues < 10) throw Error(`suspiciously few subtitle cues (${cues})`);
-        console.log(`  subtitle: ${result.subtitles[0].label || '?'} ${cues} cues`);
+        // The player's own parser must turn it into renderable cues.
+        const parsed = parseVtt(vttBody);
+        if (parsed.length < 10) throw Error(`parser produced ${parsed.length} cues`);
+        if (!cueAt(parsed, parsed[0].start + 0.01)) throw Error('cueAt missed the first cue');
+        console.log(`  subtitle: ${result.subtitles[0].label || '?'} ${parsed.length} cues (player parser OK)`);
       }
       console.log(`PASS ${server.provider} (${server.name || ''}): ${result.type || 'hls'} in ${Date.now() - started}ms`);
     } catch (error) {

@@ -17,6 +17,7 @@ import {
   videoContentType,
 } from "../lib/videoProviders";
 import { saveProgress, getProgress } from "../lib/history";
+import { cueAt, parseVtt, type SubtitleCue } from "../lib/subtitles";
 import { recordEpisodeWatched } from "../lib/completion";
 import { toAnimeUrl } from "../lib/favorites";
 import {
@@ -1113,38 +1114,37 @@ export function WatchPage() {
   useEffect(() => { resolvedRef.current = resolved; }, [resolved]);
 
   // Sidecar subtitles (Anime4up ships its Arabic track as a separate VTT).
-  // Fetch the text in the main process and hand the <video> a same-origin blob
-  // URL — a bare <track src> would need CORS the provider CDNs don't send.
-  const [subtitleBlobUrl, setSubtitleBlobUrl] = useState<string | null>(null);
+  // Fetched in the main process (no CDN CORS) and painted by our own overlay —
+  // a native <track> renders Chromium's black caption box and sits flush at the
+  // very bottom of the frame, neither of which we want.
+  const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[] | null>(null);
+  const [subtitleText, setSubtitleText] = useState<string | null>(null);
   useEffect(() => {
     const track = resolved?.subtitles?.[0];
     if (!track?.url || !window.pantoufa?.fetchText) {
-      setSubtitleBlobUrl(null);
+      setSubtitleCues(null);
+      setSubtitleText(null);
       return;
     }
     let cancelled = false;
-    let objectUrl: string | null = null;
     (async () => {
       const text = await window.pantoufa.fetchText(track.url).catch(() => null);
       if (cancelled || !text) return;
-      objectUrl = URL.createObjectURL(new Blob([text], { type: "text/vtt" }));
-      setSubtitleBlobUrl(objectUrl);
+      setSubtitleCues(parseVtt(text));
     })();
-    return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
+    return () => { cancelled = true; };
   }, [resolved?.subtitles]);
-  // A <track> added AFTER the media's metadata loaded doesn't inherit the
-  // "showing" mode from `default` in every Chromium build (and a server switch
-  // replaces the track element) — force it whenever the blob URL changes.
   useEffect(() => {
-    if (!subtitleBlobUrl) return;
-    const v = videoRef.current;
-    if (!v) return;
-    const tracks = v.textTracks;
-    for (let i = 0; i < tracks.length; i++) tracks[i].mode = "showing";
-  }, [subtitleBlobUrl, resolved?.url]);
+    if (!subtitleCues || subtitleCues.length === 0) { setSubtitleText(null); return; }
+    const tick = () => {
+      const v = videoRef.current;
+      const next = v ? cueAt(subtitleCues, v.currentTime) : null;
+      setSubtitleText((prev) => (prev === next ? prev : next));
+    };
+    tick();
+    const timer = window.setInterval(tick, 250);
+    return () => window.clearInterval(timer);
+  }, [subtitleCues, resolved?.url]);
 
   // Centralized re-extract trigger. Counts attempts so we don't loop
   // forever on a doomed server; once the budget is spent we fall back
@@ -2073,12 +2073,6 @@ export function WatchPage() {
               onClick={togglePlay}
               onDoubleClick={toggleFs}
               onCanPlay={() => setPartyReadyUrl(resolved.url)}
-              onLoadedMetadata={(e) => {
-                // A default <track> starts hidden in Chromium until a mode is
-                // set — force the sidecar subtitle visible.
-                const tracks = (e.target as HTMLVideoElement).textTracks;
-                for (let i = 0; i < tracks.length; i++) tracks[i].mode = "showing";
-              }}
               onError={(e) => {
                 const err = (e.target as HTMLVideoElement).error;
                 const code = err?.code;
@@ -2106,17 +2100,19 @@ export function WatchPage() {
                 }
                 if (code === 4) advanceToNext();
               }}
-            >
-              {subtitleBlobUrl && (
-                <track
-                  kind="subtitles"
-                  src={subtitleBlobUrl}
-                  srcLang={resolved.subtitles?.[0]?.lang || "ar"}
-                  label={resolved.subtitles?.[0]?.label || "العربية"}
-                  default
-                />
-              )}
-            </video>
+            />
+            {/* Sidecar subtitles — plain text, no caption box, sits just above
+                the control bar. */}
+            {subtitleText && (
+              <div className="pointer-events-none absolute inset-x-6 bottom-24 z-20 flex justify-center">
+                <p
+                  dir="auto"
+                  className="max-w-[85%] text-center text-base font-semibold leading-6 text-white whitespace-pre-line"
+                >
+                  {subtitleText}
+                </p>
+              </div>
+            )}
             {/* Top title bar — fades with the controls */}
             <div
               className={`pointer-events-none absolute inset-x-0 top-0 flex items-start gap-3 bg-gradient-to-b from-black/80 via-black/25 to-transparent px-5 pb-12 pt-4 transition-opacity duration-300 ${
