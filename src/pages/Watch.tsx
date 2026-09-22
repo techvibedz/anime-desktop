@@ -51,6 +51,33 @@ function resOf(name: string): number {
   return parseInt(name.match(/(\d{3,4})p/i)?.[1] || "0", 10);
 }
 
+// Sidecar subtitle overlay prefs: size in px, bottom offset in % of the player
+// box (anime4up servers are the only ones with sidecar tracks, and their text
+// size/placement vary per episode). Persisted so the user tunes them once.
+const SUBTITLE_PREFS_KEY = "pantoufa_subtitle_prefs";
+const SUBTITLE_SIZE_DEFAULT = 24;
+const SUBTITLE_BOTTOM_DEFAULT = 18;
+type SubtitlePrefs = { size: number; bottom: number };
+
+function clampSubtitle(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+function readSubtitlePrefs(): SubtitlePrefs {
+  try {
+    const raw = localStorage.getItem(SUBTITLE_PREFS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<SubtitlePrefs>;
+      return {
+        size: clampSubtitle(parsed.size, 12, 60, SUBTITLE_SIZE_DEFAULT),
+        bottom: clampSubtitle(parsed.bottom, 2, 60, SUBTITLE_BOTTOM_DEFAULT),
+      };
+    }
+  } catch {}
+  return { size: SUBTITLE_SIZE_DEFAULT, bottom: SUBTITLE_BOTTOM_DEFAULT };
+}
+
 // Providers we can re-extract cheaply. If extraction returns an iframe
 // fallback for one of these, it was almost certainly a transient miss, so we
 // re-extract once (the resolve cache no longer keeps the stale fallback) to
@@ -232,6 +259,18 @@ export function WatchPage() {
   const [muted, setMuted] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [showRateMenu, setShowRateMenu] = useState(false);
+  const [subtitlePrefs, setSubtitlePrefs] = useState<SubtitlePrefs>(readSubtitlePrefs);
+  const [showSubtitleMenu, setShowSubtitleMenu] = useState(false);
+  const updateSubtitlePrefs = useCallback((patch: Partial<SubtitlePrefs>) => {
+    setSubtitlePrefs((prev) => {
+      const next: SubtitlePrefs = {
+        size: clampSubtitle(patch.size ?? prev.size, 12, 60, SUBTITLE_SIZE_DEFAULT),
+        bottom: clampSubtitle(patch.bottom ?? prev.bottom, 2, 60, SUBTITLE_BOTTOM_DEFAULT),
+      };
+      try { localStorage.setItem(SUBTITLE_PREFS_KEY, JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }, []);
   const [showVolumeBar, setShowVolumeBar] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
@@ -2145,12 +2184,17 @@ export function WatchPage() {
               }}
             />
             {/* Sidecar subtitles — plain text, no caption box, sits just above
-                the control bar. */}
+                the control bar. Size + vertical position are user-adjustable
+                from the CC menu in the control bar. */}
             {subtitleText && (
-              <div className="pointer-events-none absolute inset-x-6 bottom-24 z-20 flex justify-center">
+              <div
+                className="pointer-events-none absolute inset-x-6 z-20 flex justify-center"
+                style={{ bottom: `${subtitlePrefs.bottom}%` }}
+              >
                 <p
                   dir="auto"
-                  className="max-w-[85%] text-center text-2xl font-semibold leading-8 text-white whitespace-pre-line"
+                  className="max-w-[85%] text-center font-semibold text-white whitespace-pre-line"
+                  style={{ fontSize: `${subtitlePrefs.size}px`, lineHeight: 1.35 }}
                 >
                   {subtitleText}
                 </p>
@@ -2251,8 +2295,10 @@ export function WatchPage() {
 
             {/* Skip intro — modern pill, sits just above the control bar.
                 Eligible across the opening window, but auto-fades after a few
-                seconds (re-shows on mouse move) so it isn't glued on screen. */}
-            {showSkipIntroEligible && (
+                seconds (re-shows on mouse move) so it isn't glued on screen.
+                Hidden while the subtitle menu is open — they occupy the same
+                corner and the pill otherwise sits on top of the panel. */}
+            {showSkipIntroEligible && !showSubtitleMenu && (
               <button
                 onClick={(e) => { e.stopPropagation(); skipIntro(); }}
                 className={`group/skip absolute bottom-20 right-5 z-30 flex items-center gap-2 rounded-lg border border-white/25 bg-black/65 px-4 py-2.5 text-sm font-bold text-white shadow-card backdrop-blur-md transition-all duration-300 hover:-translate-y-0.5 hover:border-accent hover:bg-accent hover:text-black ${
@@ -2350,6 +2396,75 @@ export function WatchPage() {
                 </span>
 
                 <span className="flex-1" />
+
+                {/* Subtitle settings — only when a sidecar track exists
+                    (anime4up servers). Size + vertical position, persisted. */}
+                {subtitleCues && subtitleCues.length > 0 && (
+                  <div className="relative">
+                    <button
+                      onClick={() => setShowSubtitleMenu((v) => !v)}
+                      title={t.subtitleSettings}
+                      className={`rounded-lg p-2 transition hover:bg-white/15 ${showSubtitleMenu ? "text-accent" : ""}`}
+                    >
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M20 4H4a2 2 0 00-2 2v12a2 2 0 002 2h16a2 2 0 002-2V6a2 2 0 00-2-2zM4 12h4v2H4v-2zm10 6H4v-2h10v2zm6 0h-4v-2h4v2zm0-4H10v-2h10v2z" /></svg>
+                    </button>
+                    {showSubtitleMenu && (
+                      /* right-0 (physical): the panel sets dir=rtl, and end-0
+                         resolves against the element's OWN direction — it
+                         anchored the panel to its left edge and pushed it past
+                         the player's right edge. */
+                      <div dir="rtl" className="absolute bottom-full right-0 z-40 mb-2 w-60 rounded-lg border border-white/10 bg-bg/95 p-3 text-xs shadow-card backdrop-blur-md">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-bold text-white">{t.subtitleSettings}</span>
+                          <button
+                            onClick={() => updateSubtitlePrefs({ size: SUBTITLE_SIZE_DEFAULT, bottom: SUBTITLE_BOTTOM_DEFAULT })}
+                            className="shrink-0 text-[10px] font-semibold text-accent hover:underline"
+                          >
+                            {t.subtitleReset}
+                          </button>
+                        </div>
+                        <div className="mt-3 flex items-center justify-between gap-2">
+                          <span className="shrink-0 text-white/75">{t.subtitleSize}</span>
+                          {/* dir=ltr: steppers read − value + in both locales */}
+                          <div dir="ltr" className="flex items-center gap-1">
+                            <button
+                              onClick={() => updateSubtitlePrefs({ size: subtitlePrefs.size - 2 })}
+                              className="h-6 w-6 rounded-md bg-white/10 font-bold text-white transition hover:bg-white/20"
+                            >
+                              −
+                            </button>
+                            <span className="w-8 text-center tabular-nums text-white/85">{subtitlePrefs.size}</span>
+                            <button
+                              onClick={() => updateSubtitlePrefs({ size: subtitlePrefs.size + 2 })}
+                              className="h-6 w-6 rounded-md bg-white/10 font-bold text-white transition hover:bg-white/20"
+                            >
+                              +
+                            </button>
+                          </div>
+                        </div>
+                        <div className="mt-2 flex items-center justify-between gap-2">
+                          <span className="shrink-0 text-white/75">{t.subtitlePosition}</span>
+                          <div dir="ltr" className="flex items-center gap-1">
+                            <button
+                              onClick={() => updateSubtitlePrefs({ bottom: subtitlePrefs.bottom + 2 })}
+                              title={t.subtitleUp}
+                              className="h-6 w-6 rounded-md bg-white/10 text-white transition hover:bg-white/20"
+                            >
+                              ▲
+                            </button>
+                            <button
+                              onClick={() => updateSubtitlePrefs({ bottom: subtitlePrefs.bottom - 2 })}
+                              title={t.subtitleDown}
+                              className="h-6 w-6 rounded-md bg-white/10 text-white transition hover:bg-white/20"
+                            >
+                              ▼
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {/* Playback rate */}
                 <div className="relative">

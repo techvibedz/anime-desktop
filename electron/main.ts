@@ -1365,6 +1365,34 @@ function pickHighestHlsVariant(playlist: string, masterUrl?: string): string | n
   return best?.url || null;
 }
 
+// Chromium (and session fetch) rides the forced DoH resolver below. On several
+// ISPs that resolver answers for Cloudflare-hosted source domains with the
+// carrier's PARKED anycast IPs (measured live: w1.anime4up.rest and the
+// rotating *.shop player hosts → 188.114.96/97.x, connection black-holes for
+// the full timeout; the OS resolver → 104.21.x / 172.67.x, 200 OK in <1s).
+// Node's fetch resolves through the OS resolver, so every privileged GET that
+// Chromium cannot reach is retried here — that is what keeps anime4up
+// discovery and its featured servers alive on those networks.
+async function fetchViaSystemDns(
+  target: string,
+  headers: Record<string, string>,
+  timeout: number,
+): Promise<string | null> {
+  try {
+    const resp = await fetch(target, {
+      method: "GET",
+      headers,
+      redirect: "follow",
+      signal: AbortSignal.timeout(timeout),
+    });
+    if (!resp.ok) return null;
+    return (await resp.text()).replace(/\\\//g, "/");
+  } catch (e) {
+    console.warn(`[fetchViaSystemDns] failed for ${target}:`, e);
+    return null;
+  }
+}
+
 async function extractAnime4upCdn(
   iframeUrl: string,
 ): Promise<{ url: string; type: "hls"; subtitles?: MediaSubtitle[]; denied?: boolean } | null> {
@@ -1382,25 +1410,24 @@ async function extractAnime4upCdn(
   } catch {}
   allowHost(iframeUrl);
   const fetchPlayerPage = async (url: string, timeout: number): Promise<string | null> => {
+    const headers = {
+      "User-Agent": PLAYBACK_UA,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "ar,en;q=0.9",
+    };
     try {
       const resp = await session.defaultSession.fetch(url, {
         method: "GET",
         signal: AbortSignal.timeout(timeout),
-        headers: {
-          "User-Agent": PLAYBACK_UA,
-          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language": "ar,en;q=0.9",
-          "X-Pantoufa-Proxy": "1",
-        },
+        headers: { ...headers, "X-Pantoufa-Proxy": "1" },
         redirect: "follow",
         cache: "no-store",
       });
-      if (!resp.ok) return null;
-      return (await resp.text()).replace(/\\\//g, "/");
+      if (resp.ok) return (await resp.text()).replace(/\\\//g, "/");
     } catch (e) {
-      console.warn(`[extractAnime4upCdn] page fetch failed (${timeout}ms):`, e);
-      return null;
+      console.warn(`[extractAnime4upCdn] chromium page fetch failed (${timeout}ms):`, e);
     }
+    return fetchViaSystemDns(url, headers, timeout);
   };
   // The SAME featured-server path with S1 ⇄ S2 swapped. VnxPlayer authorizes
   // per (server, episode): one sibling routinely has the episode while the
@@ -1456,6 +1483,7 @@ async function extractAnime4upCdn(
   allowHost(stream);
   for (const host of anime4upEdgeHosts(html)) allowHost(`https://${host}/`);
   if (subtitles.length) for (const track of subtitles) allowHost(track.url);
+  let playlist: string | null = null;
   try {
     const resp = await session.defaultSession.fetch(stream, {
       method: "GET",
@@ -1468,16 +1496,25 @@ async function extractAnime4upCdn(
       redirect: "follow",
       cache: "no-store",
     });
-    if (resp.ok) {
-      const best = pickHighestHlsVariant(await resp.text(), stream);
-      if (best) {
-        allowHost(best);
-        console.info(`[extractAnime4upCdn] highest variant → ${best}`);
-        return { url: best, type: "hls", subtitles };
-      }
-    }
+    if (resp.ok) playlist = await resp.text();
   } catch (e) {
     console.warn("[extractAnime4upCdn] playlist fetch failed:", e);
+  }
+  // Same DoH-vs-OS-resolver split as the player page above: the CDN host can
+  // be unreachable through Chromium while the system resolver reaches it.
+  if (!playlist) {
+    playlist = await fetchViaSystemDns(stream, {
+      "User-Agent": PLAYBACK_UA,
+      "Accept": "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+    }, 8000);
+  }
+  if (playlist) {
+    const best = pickHighestHlsVariant(playlist, stream);
+    if (best) {
+      allowHost(best);
+      console.info(`[extractAnime4upCdn] highest variant → ${best}`);
+      return { url: best, type: "hls", subtitles };
+    }
   }
   // Playlist unresolved — hand over the master and let hls.js adapt.
   return { url: stream, type: "hls", subtitles };
@@ -2883,10 +2920,12 @@ app.whenReady().then(() => {
         headers: { "User-Agent": PLAYBACK_UA, Accept: "text/vtt, text/plain, */*", "X-Pantoufa-Proxy": "1" },
         signal: AbortSignal.timeout(15000),
       });
-      if (!response.ok) return null;
-      return await response.text();
+      if (response.ok) return await response.text();
+      // Same DoH-vs-OS-resolver split as the scrapers: the VTT host can be
+      // unreachable through Chromium while the system resolver serves it.
+      return await fetchViaSystemDns(url.toString(), { "User-Agent": PLAYBACK_UA, Accept: "text/vtt, text/plain, */*" }, 15000);
     } catch {
-      return null;
+      return await fetchViaSystemDns(String(rawUrl || ""), { "User-Agent": PLAYBACK_UA, Accept: "text/vtt, text/plain, */*" }, 15000);
     }
   });
 
@@ -3064,6 +3103,13 @@ app.whenReady().then(() => {
     // attempts/timeoutMs overrides so a miss costs seconds, not half a minute.
     const ATTEMPTS = Math.max(1, Math.min(opts.attempts ?? 3, 5));
     const PER_ATTEMPT_TIMEOUT_MS = Math.max(1000, Math.min(opts.timeoutMs ?? 9000, 30000));
+    const sourceHeaders = {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "ar,en;q=0.9",
+      ...(opts.referer ? { Referer: opts.referer } : {}),
+    };
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), PER_ATTEMPT_TIMEOUT_MS);
@@ -3076,20 +3122,14 @@ app.whenReady().then(() => {
         // WiFi networks but show on mobile data.
         const res = await net.fetch(opts.url, {
           signal: controller.signal,
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ar,en;q=0.9",
-            ...(opts.referer ? { Referer: opts.referer } : {}),
-          },
+          headers: sourceHeaders,
         });
         clearTimeout(t);
         if (res.ok) return await res.text();
         // Retry the transient/edge statuses (rate-limit, Cloudflare, 5xx);
         // a hard 4xx (404/410) won't change on retry, so bail immediately.
         const retryable = res.status === 429 || res.status === 403 || res.status >= 500;
-        if (!retryable || attempt === ATTEMPTS) return null;
+        if (!retryable) return null;
         // 429/503 mean "too fast": honour the server's Retry-After and step back
         // harder than the generic 600ms, otherwise the retry lands inside the
         // same rate-limit window and every attempt is wasted.
@@ -3098,8 +3138,13 @@ app.whenReady().then(() => {
         }
       } catch {
         clearTimeout(t);
-        if (attempt === ATTEMPTS) return null;
       }
+      // The DoH resolver can hand back unreachable parked IPs for
+      // Cloudflare-hosted sources (see fetchViaSystemDns) — before burning a
+      // retry on Chromium, try the same GET through the OS resolver.
+      const viaNode = await fetchViaSystemDns(opts.url, sourceHeaders, PER_ATTEMPT_TIMEOUT_MS);
+      if (viaNode) return viaNode;
+      if (attempt === ATTEMPTS) return null;
       // Growing backoff between attempts (0.6s, 1.2s, or the server's own
       // Retry-After) — long enough to ride out a rate-limit burst, short enough
       // that recovery stays near-instant.

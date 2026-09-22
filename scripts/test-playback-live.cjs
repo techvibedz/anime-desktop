@@ -15,7 +15,7 @@ app.whenReady().then(async () => {
   const scripts = require('../dist-electron/shared/scrape-scripts.js');
   const source = fs.readFileSync(path.join(__dirname, '../electron/main.ts'), 'utf8');
   const ast = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, true);
-  const names = ['extractMp4upload', 'unpackPacked', 'extractAnime4upCdn', 'parseAnime4upStreamUrl', 'pickHighestHlsVariant'];
+  const names = ['extractMp4upload', 'unpackPacked', 'extractAnime4upCdn', 'fetchViaSystemDns', 'parseAnime4upStreamUrl', 'pickHighestHlsVariant'];
   const declarations = [];
   const visit = (node) => {
     if (ts.isFunctionDeclaration(node) && names.includes(node.name?.text)) declarations.push(node.getText(ast));
@@ -26,7 +26,7 @@ app.whenReady().then(async () => {
   const mega = source.slice(source.indexOf('type MegaStream ='), source.indexOf('function proxyUrlFor'));
   const ua = source.match(/const PLAYBACK_UA = "([^"]+)"/)[1];
   const ctx = vm.createContext({ session, net, enqueue, ...scripts, PLAYBACK_UA: ua, VIDEO_PROTOCOL: 'pantoufa-video',
-    Buffer, URL, Response, Request, AbortSignal, Uint8Array, console, setTimeout, clearTimeout,
+    Buffer, URL, Response, Request, AbortSignal, Uint8Array, console, setTimeout, clearTimeout, fetch,
     createDecipheriv: crypto.createDecipheriv, randomBytes: crypto.randomBytes });
   vm.runInContext(ts.transpileModule(mega + '\n' + functions, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, ctx);
   const servers = JSON.parse(fs.readFileSync(process.argv[2], 'utf8')).servers;

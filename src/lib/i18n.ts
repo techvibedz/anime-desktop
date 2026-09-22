@@ -109,6 +109,14 @@ export const ar = {
   loadingMoreServers: "جاري البحث عن مصادر إضافية…",
   skipIntro: "تخطّي المقدمة",
 
+  // Player — subtitle settings (sidecar tracks, e.g. anime4up servers)
+  subtitleSettings: "إعدادات الترجمة",
+  subtitleSize: "حجم الخط",
+  subtitlePosition: "الموضع",
+  subtitleUp: "تحريك لأعلى",
+  subtitleDown: "تحريك لأسفل",
+  subtitleReset: "إعادة الضبط",
+
   // Sign out
   signOut: "تسجيل الخروج",
   guest: "زائر",
