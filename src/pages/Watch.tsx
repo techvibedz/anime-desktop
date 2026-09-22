@@ -1749,6 +1749,34 @@ export function WatchPage() {
     return () => v.removeEventListener("timeupdate", onTime);
   }, [episodeUrl, meta, up4Param, resolved, animeParam, imgParam, posterFromDetail, animeTitleFromDetail, resolvedAnimeHref, currentEpNumber]);
 
+  // Iframe embeds never report a position, so the timeupdate saver above never
+  // fires for them and those servers never reached Continue Watching. Register
+  // the episode once the embed has had time to start playing — an existing
+  // saved position is never overwritten.
+  const iframeSavedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!episodeUrl) return;
+    if (resolved?.type !== "iframe" && resolved?.type !== "dailymotion") return;
+    if (iframeSavedRef.current === episodeUrl) return;
+    iframeSavedRef.current = episodeUrl;
+    const timer = window.setTimeout(async () => {
+      const existing = await getProgress(episodeUrl).catch(() => null);
+      if (existing && existing.positionMs > 0) return;
+      saveProgress({
+        episodeHref: episodeUrl,
+        episodeTitle: meta.episodeTitle || t.episode,
+        animeTitle: meta.animeTitle || animeTitleFromDetail,
+        animeHref: animeParam || "",
+        image: imgParam || posterFromDetail || "",
+        positionMs: 0,
+        durationMs: 0,
+        url4up: up4Param || undefined,
+        epNum: currentEpNumber ?? undefined,
+      }).catch(() => {});
+    }, 10000);
+    return () => window.clearTimeout(timer);
+  }, [episodeUrl, resolved?.type, meta, animeParam, imgParam, posterFromDetail, animeTitleFromDetail, up4Param, currentEpNumber]);
+
   // Auto-hide controls
   const scheduleHide = useCallback(() => {
     if (hideTimer.current) clearTimeout(hideTimer.current);

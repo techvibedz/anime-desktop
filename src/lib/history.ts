@@ -131,13 +131,16 @@ export async function saveProgress(entry: Omit<WatchEntry, "updatedAt">) {
 export async function getContinueWatching(): Promise<WatchEntry[]> {
   const list = await getHistory();
   const dismissed = await getDismissedHrefs();
-  // list is already sorted newest-first; keep the first seen per anime.
-  const seen = new Set<string>();
-  const out: WatchEntry[] = [];
+  // One card per anime (newest-first). A dismissed card must hide the WHOLE
+  // anime: the previous episode of the same series would otherwise immediately
+  // take its place and the X button would look broken.
+  const latestPerAnime = new Map<string, WatchEntry>();
   for (const e of list) {
     const key = e.animeHref || e.animeTitle;
-    if (seen.has(key)) continue;
-    seen.add(key);
+    if (!latestPerAnime.has(key)) latestPerAnime.set(key, e);
+  }
+  const out: WatchEntry[] = [];
+  for (const e of latestPerAnime.values()) {
     if (dismissed.has(e.episodeHref)) continue;
     out.push(e);
   }
@@ -157,7 +160,18 @@ export async function removeFromHistory(episodeHref: string) {
 
 export async function dismissFromContinue(episodeHref: string) {
   const dismissed = await getDismissedHrefs();
-  dismissed.add(episodeHref);
+  // The row groups by anime — dismissing a single episode would just reveal
+  // the previous one, so hide every entry of this series (progress is kept).
+  const list = await getHistory();
+  const target = list.find((e) => e.episodeHref === episodeHref);
+  if (target) {
+    const key = target.animeHref || target.animeTitle;
+    for (const entry of list) {
+      if ((entry.animeHref || entry.animeTitle) === key) dismissed.add(entry.episodeHref);
+    }
+  } else {
+    dismissed.add(episodeHref);
+  }
   await setDismissedHrefs(dismissed);
 }
 
