@@ -194,7 +194,21 @@ function handleAuthCallbackUrl(url: string) {
 // video CDNs but are heavily abused by popup ad networks. Match them only
 // when preceded by a dot (they're the top-level domain).
 const AD_HOST_RE = /doubleclick|googletagmanager|google-analytics|googleadservices|googlesyndication|adservice\.google|adnxs|facebook\.com\/tr|pixel\.facebook|popads|popcash|popmyads|popunder|propeller|propellerads|trafficjunky|adsterra|hilltopads|onclkds|onclickbid|onclickpredictiv|exoclick|magsrv|tsyndicate|clickadu|adcash|ad-maven|admaven|adsupply|servedbyadbutler|mgid|revcontent|adskeeper|trustedclicks|outbrain|taboola|etymonstheine|savorsaveragereaudit|offletsoroche|horizonungyve|visageagar|protrafficinspector|spendsdetachment|\.(?:cfd|cyou|life|shop|sbs|quest|buzz|top|ooo|live|today|icu|site|click|link|bid|trade|webcam|date|download|party|review|science|stream|racing|accountant|win|men|loan|faith|gdn)$/i;
+
+// Hosts discovered at runtime (provider embeds / extracted media) that must
+// bypass the TLD ad heuristic. The anime4up CDN rotates through cheap TLDs
+// (cdn1.k1c6x8p.shop, 4t.44y4h0r.shop, …) and its player page + HLS segments
+// were being cancelled as "ads" — the desktop "anime4up1/2 don't work" bug.
+// Any host we actually extract a stream from is legitimate by definition.
+const dynamicAllowedHosts = new Set<string>();
+function allowHost(raw: string | null | undefined): void {
+  try {
+    const host = new URL(String(raw || "")).hostname.toLowerCase();
+    if (host) dynamicAllowedHosts.add(host);
+  } catch {}
+}
 function isAdHost(host: string): boolean {
+  if (dynamicAllowedHosts.has(host)) return false;
   return !/(^|\.)witanime\.site$/i.test(host) && AD_HOST_RE.test(host);
 }
 
@@ -1259,6 +1273,73 @@ function parseAnime4upStreamUrl(html: string): string | null {
   return /^https?:\/\//i.test(raw) ? raw : null;
 }
 
+type MediaSubtitle = { url: string; label?: string; lang?: string };
+
+// Extract a top-level `key = [...]` JSON array with a string-aware bracket scan
+// (the tracks array nests a `fallbacks` array, so a non-greedy regex stops at
+// the inner closing bracket).
+function jsonArrayAfter(src: string, key: string): string | null {
+  const at = src.search(new RegExp(`(?:let|const|var)\\s+${key}\\s*=\\s*`, "i"));
+  if (at < 0) return null;
+  const start = src.indexOf("[", at);
+  if (start < 0) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let quote = "";
+  for (let i = start; i < src.length; i++) {
+    const ch = src[i];
+    if (inStr) {
+      if (esc) { esc = false; continue; }
+      if (ch === "\\") { esc = true; continue; }
+      if (ch === quote) inStr = false;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { inStr = true; quote = ch; continue; }
+    if (ch === "[") depth++;
+    else if (ch === "]") { depth--; if (depth === 0) return src.slice(start, i + 1); }
+  }
+  return null;
+}
+
+// The player page ships the Arabic subtitle as a sidecar VTT (its HLS master
+// has no subtitle rendition), so the custom player must load it explicitly.
+function parseAnime4upSubtitles(html: string): MediaSubtitle[] {
+  const raw = jsonArrayAfter(String(html || ""), "tracks");
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw.replace(/\\\//g, "/"));
+    const out: MediaSubtitle[] = [];
+    const seen = new Set<string>();
+    for (const track of Array.isArray(arr) ? arr : []) {
+      const url = String(track?.file || "").replace(/\\\//g, "/").trim();
+      if (!/^https?:\/\//i.test(url) || seen.has(url)) continue;
+      seen.add(url);
+      out.push({
+        url,
+        label: track?.label ? String(track.label) : undefined,
+        lang: track?.srclang ? String(track.srclang) : undefined,
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+// The page also lists its edge CDN hosts; allow them before the playlist fetch
+// so the ad heuristic can't cancel them.
+function anime4upEdgeHosts(html: string): string[] {
+  const raw = jsonArrayAfter(String(html || ""), "edgeHosts");
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw.replace(/\\\//g, "/"));
+    return (Array.isArray(arr) ? arr : []).map((h) => String(h || "")).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 function pickHighestHlsVariant(playlist: string, masterUrl?: string): string | null {
   const lines = String(playlist || "").split(/\r?\n/);
   let best: { bw: number; url: string } | null = null;
@@ -1283,7 +1364,8 @@ function pickHighestHlsVariant(playlist: string, masterUrl?: string): string | n
 
 async function extractAnime4upCdn(
   iframeUrl: string,
-): Promise<{ url: string; type: "hls" } | null> {
+): Promise<{ url: string; type: "hls"; subtitles?: MediaSubtitle[] } | null> {
+  allowHost(iframeUrl);
   let html = "";
   for (const timeout of [6000, 12000]) {
     try {
@@ -1307,6 +1389,12 @@ async function extractAnime4upCdn(
   }
   const stream = parseAnime4upStreamUrl(html);
   if (!stream) return null;
+  const subtitles = parseAnime4upSubtitles(html);
+  // Allow the CDN edge hosts BEFORE fetching the playlist/segments — the ad
+  // heuristic blocks the whole .shop TLD otherwise.
+  allowHost(stream);
+  for (const host of anime4upEdgeHosts(html)) allowHost(`https://${host}/`);
+  if (subtitles.length) for (const track of subtitles) allowHost(track.url);
   try {
     const resp = await session.defaultSession.fetch(stream, {
       method: "GET",
@@ -1322,15 +1410,16 @@ async function extractAnime4upCdn(
     if (resp.ok) {
       const best = pickHighestHlsVariant(await resp.text(), stream);
       if (best) {
+        allowHost(best);
         console.info(`[extractAnime4upCdn] highest variant → ${best}`);
-        return { url: best, type: "hls" };
+        return { url: best, type: "hls", subtitles };
       }
     }
   } catch (e) {
     console.warn("[extractAnime4upCdn] playlist fetch failed:", e);
   }
   // Playlist unresolved — hand over the master and let hls.js adapt.
-  return { url: stream, type: "hls" };
+  return { url: stream, type: "hls", subtitles };
 }
 
 // Pull the real .mp4 URL straight out of mp4upload's embed page from the
@@ -2376,8 +2465,17 @@ app.whenReady().then(() => {
       // renders black). Hostname-only avoids the false positives.
       const host = (() => { try { return new URL(u).hostname.toLowerCase(); } catch { return ""; } })();
       if (host && isAdHost(host)) {
-        console.info(`[ad-block] cancelled request to ${host}`);
-        return callback({ cancel: true });
+        // Media never needs blocking: an ad host serving the actual episode
+        // stream does not exist, while legit CDNs on cheap TLDs (anime4up's
+        // cdnN.<edge>.shop, streamwish mirrors on .top/.site/.icu) serve
+        // playlists, segments and subtitles through these paths. Cancelling
+        // them broke playback with a black player.
+        const mediaRequest = details.resourceType === "media" ||
+          /\.(?:m3u8|mp4|ts|m4s|vtt|key)(?:[?#]|$)/i.test(u);
+        if (!mediaRequest) {
+          console.info(`[ad-block] cancelled request to ${host}`);
+          return callback({ cancel: true });
+        }
       }
       // Block well-known ad script filenames / paths that escape the
       // hostname-based AD_HOST_RE (e.g. a CDN mirror hosting both the
@@ -2639,8 +2737,11 @@ app.whenReady().then(() => {
   ipcMain.handle("pantoufa:direct-extract", async (
     _evt,
     opts: { provider: string; iframeUrl: string },
-  ): Promise<{ url: string; type: "hls" | "mp4" } | null> => {
-    try {
+  ): Promise<{ url: string; type: "hls" | "mp4"; subtitles?: MediaSubtitle[] } | null> => {
+    // The embed page itself may sit on a cheap TLD the ad heuristic blocks
+    // (anime4up's *.shop player host) — allow it before any fetch.
+    allowHost(opts.iframeUrl);
+    const run = async (): Promise<{ url: string; type: "hls" | "mp4"; subtitles?: MediaSubtitle[] } | null> => {
       if (opts.provider === "dailymotion") {
         return await extractDailymotion(opts.iframeUrl);
       }
@@ -2687,10 +2788,38 @@ app.whenReady().then(() => {
         const timeout = opts.provider === "uqload" ? 25000 : 32000;
         return await extractViaCapture(opts.iframeUrl, `extract:${opts.provider}`, timeout);
       }
+      return null;
+    };
+    try {
+      const result = await run();
+      // Whatever host actually serves the media is legitimate — exempt it from
+      // the TLD ad heuristic so the renderer's player requests aren't cancelled.
+      if (result?.url) allowHost(result.url);
+      if (result?.subtitles) for (const track of result.subtitles) allowHost(track.url);
+      return result;
     } catch (e) {
       console.warn("[direct-extract] failed:", e);
     }
     return null;
+  });
+
+  // Sidecar subtitle text (VTT) for the custom player. Fetched here so the
+  // renderer gets a same-origin blob URL — a bare <track src> would need CORS
+  // the provider CDNs don't send.
+  ipcMain.handle("pantoufa:fetch-text", async (_evt, rawUrl: string): Promise<string | null> => {
+    try {
+      const url = new URL(String(rawUrl || ""));
+      if (!/^https?:$/.test(url.protocol)) return null;
+      allowHost(url.toString());
+      const response = await session.defaultSession.fetch(url.toString(), {
+        headers: { "User-Agent": PLAYBACK_UA, Accept: "text/vtt, text/plain, */*", "X-Pantoufa-Proxy": "1" },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok) return null;
+      return await response.text();
+    } catch {
+      return null;
+    }
   });
 
   ipcMain.handle("pantoufa:open-external", async (_evt, url: string) => {

@@ -63,8 +63,11 @@ contextBridge.exposeInMainWorld("pantoufa", {
     ipcRenderer.invoke("pantoufa:set-active-iframe", url),
   directExtract: (provider: string, iframeUrl: string) =>
     ipcRenderer.invoke("pantoufa:direct-extract", { provider, iframeUrl }) as Promise<
-      { url: string; type: "hls" | "mp4" } | null
+      { url: string; type: "hls" | "mp4"; subtitles?: { url: string; label?: string; lang?: string }[] } | null
     >,
+  // Sidecar subtitle text (VTT) fetched in the main process so the renderer can
+  // attach it as a same-origin blob <track> (no CDN CORS needed).
+  fetchText: (url: string) => ipcRenderer.invoke("pantoufa:fetch-text", url) as Promise<string | null>,
   // Privileged HTML GET from the main process (no CORS). Used to read
   // anime4up episode pages directly instead of rendering them headless.
   fetchHtml: (url: string, referer?: string, opts?: { attempts?: number; timeoutMs?: number }) =>

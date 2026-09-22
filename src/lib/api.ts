@@ -1515,7 +1515,7 @@ const CUSTOM_PLAYER_PROVIDERS = new Set([
 // direct stream or iframe).
 const EXPECT_DIRECT_PROVIDERS = new Set([...CUSTOM_PLAYER_PROVIDERS, "mp4upload", "videa", "anime4upcdn"]);
 
-type ResolvePayload = { success: true; data: { videoUrl: string; type: "hls" | "mp4" | "iframe" } } | { success: false; error: string };
+type ResolvePayload = { success: true; data: { videoUrl: string; type: "hls" | "mp4" | "iframe"; subtitles?: { url: string; label?: string; lang?: string }[] } } | { success: false; error: string };
 export type ResolveVideoOptions = { fresh?: boolean; priority?: boolean };
 const resolveCache = new Map<string, { ts: number; promise: Promise<ResolvePayload> }>();
 // 90s (was 15s): long enough that the prefetch fired when the server list
@@ -1582,7 +1582,12 @@ async function doResolveVideo(iframeUrl: string, provider: string) {
   if (provider === "anime4upcdn") {
     try {
       const direct = await window.pantoufa.directExtract?.(provider, iframeUrl);
-      if (direct?.url) return { success: true as const, data: { videoUrl: direct.url, type: direct.type } };
+      if (direct?.url) {
+        return {
+          success: true as const,
+          data: { videoUrl: direct.url, type: direct.type, subtitles: direct.subtitles },
+        };
+      }
     } catch {}
     return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
   }

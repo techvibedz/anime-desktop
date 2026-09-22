@@ -138,7 +138,7 @@ export function WatchPage() {
   const [directUp4, setDirectUp4] = useState<string | null>(null);
   const [meta, setMeta] = useState<{ episodeTitle: string; animeTitle: string }>({ episodeTitle: "", animeTitle: "" });
   const [activeIdx, setActiveIdx] = useState<number | null>(null);
-  const [resolved, setResolved] = useState<{ url: string; type: "hls" | "mp4" | "dailymotion" | "iframe"; embed: string } | null>(null);
+  const [resolved, setResolved] = useState<{ url: string; type: "hls" | "mp4" | "dailymotion" | "iframe"; embed: string; subtitles?: { url: string; label?: string; lang?: string }[] } | null>(null);
   const [status, setStatus] = useState<"idle" | "resolving" | "playing" | "failed">("idle");
   const [loadingServers, setLoadingServers] = useState(true);
   const [serverError, setServerError] = useState(false);
@@ -162,6 +162,11 @@ export function WatchPage() {
   // server before giving up and falling back to the iframe.
   const reextractCount = useRef(0);
   const MAX_REEXTRACTS_BEFORE_FALLBACK = 2;
+  // Mid-watch failures get a bigger budget: the player is already showing
+  // video, and a fresh signed token usually fixes an expired one — swapping to
+  // the embed (a full player reload) or stopping playback is far worse than a
+  // couple more re-extracts.
+  const MAX_REEXTRACTS_MIDWATCH = 3;
   const iframeFailedRef = useRef(false);
   // True once the active embed iframe has fired `onLoad`. After a successful
   // load, any `did-fail-load` reported by the main process is an internal
@@ -233,6 +238,10 @@ export function WatchPage() {
   const [skipIntroVisible, setSkipIntroVisible] = useState(false);
   const skipHideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reextractUsedRef = useRef(false);
+  // True once the CURRENT stream actually played a frame. Distinguishes a
+  // never-started server (iframe fallback is acceptable) from a mid-watch
+  // failure (keep the custom player and re-extract in place instead).
+  const hasPlayedRef = useRef(false);
   // True while the user has deliberately paused. The stall-recovery handler
   // uses it to avoid force-resuming a pause the user actually wanted (a pause
   // aborts the media fetch, which fires `stalled`).
@@ -830,11 +839,14 @@ export function WatchPage() {
   const prefetchedRef = useRef<Set<string>>(new Set());
   useEffect(() => { prefetchedRef.current = new Set(); }, [episodeUrl]);
   useEffect(() => {
-    if (USE_COMPLETE_SERVER_DISCOVERY) return;
     if (userActivated) return;            // real resolve flow has taken over
     if (activeIdx === null) return;
     const srv = sortedServers[activeIdx];
     if (!srv) return;
+    // The complete pipeline warms its direct candidates; skip those. Servers
+    // it could NOT pre-resolve (capture-based mirrors, later arrivals) are the
+    // ones that made the Play click wait 10-30s — resolve them ahead of time.
+    if (srv.videoUrl) return;
     if (prefetchedRef.current.has(srv.iframeUrl) || prefetchedRef.current.size >= 2) return;
     prefetchedRef.current.add(srv.iframeUrl);
     console.info(`[player] prefetching resolve for ${srv.provider}`);
@@ -892,6 +904,29 @@ export function WatchPage() {
     if (failedId) setBrokenIds((prev) => new Set(prev).add(failedId));
     setStatus("failed");
   }, [activeIdx, sortedServers]);
+
+  // A failed server used to leave the player stopped on a "failed" state until
+  // the user manually picked another one. Auto-switch to the next non-broken
+  // server (mobile parity) after a short beat so a failure reads as a switch,
+  // not a dead end.
+  const autoAdvanceTimer = useRef<number | null>(null);
+  useEffect(() => {
+    if (status !== "failed" || !userActivated) return;
+    const next = sortedServers.findIndex((s) => !brokenIds.has(s.id));
+    if (next < 0) return;
+    if (autoAdvanceTimer.current) clearTimeout(autoAdvanceTimer.current);
+    autoAdvanceTimer.current = window.setTimeout(() => {
+      autoAdvanceTimer.current = null;
+      console.info(`[player] server failed — auto-switching to ${sortedServers[next]?.name}`);
+      activateServer(next);
+    }, 1200);
+    return () => {
+      if (autoAdvanceTimer.current) {
+        clearTimeout(autoAdvanceTimer.current);
+        autoAdvanceTimer.current = null;
+      }
+    };
+  }, [status, userActivated, sortedServers, brokenIds, activateServer]);
 
   // Fast advance when iframe fails to load (did-fail-load in main process).
   // Fires within ~1s vs the iframe onError which takes ~5s on some platforms.
@@ -960,6 +995,18 @@ export function WatchPage() {
         embed: srv.iframeUrl,
       });
       setStatus("playing");
+      // The warm pipeline resolved this URL without sidecar metadata; a cached
+      // re-resolve (90s TTL) attaches the subtitle tracks instantly.
+      if (srv.provider === "anime4upcdn") {
+        resolveVideo(srv.iframeUrl, srv.provider)
+          .then((r) => {
+            if (cancelled || !r.success || !r.data?.subtitles) return;
+            setResolved((prev) => (prev && prev.url === srv.videoUrl
+              ? { ...prev, subtitles: r.data!.subtitles }
+              : prev));
+          })
+          .catch(() => {});
+      }
       return () => { cancelled = true; };
     }
 
@@ -992,6 +1039,7 @@ export function WatchPage() {
               url: r.data.videoUrl,
               type: r.data.type as "hls" | "mp4" | "dailymotion" | "iframe",
               embed: srv.iframeUrl,
+              subtitles: r.data.subtitles,
             });
             setStatus("playing");
             return;
@@ -1064,6 +1112,30 @@ export function WatchPage() {
   const resolvedRef = useRef(resolved);
   useEffect(() => { resolvedRef.current = resolved; }, [resolved]);
 
+  // Sidecar subtitles (Anime4up ships its Arabic track as a separate VTT).
+  // Fetch the text in the main process and hand the <video> a same-origin blob
+  // URL — a bare <track src> would need CORS the provider CDNs don't send.
+  const [subtitleBlobUrl, setSubtitleBlobUrl] = useState<string | null>(null);
+  useEffect(() => {
+    const track = resolved?.subtitles?.[0];
+    if (!track?.url || !window.pantoufa?.fetchText) {
+      setSubtitleBlobUrl(null);
+      return;
+    }
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    (async () => {
+      const text = await window.pantoufa.fetchText(track.url).catch(() => null);
+      if (cancelled || !text) return;
+      objectUrl = URL.createObjectURL(new Blob([text], { type: "text/vtt" }));
+      setSubtitleBlobUrl(objectUrl);
+    })();
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [resolved?.subtitles]);
+
   // Centralized re-extract trigger. Counts attempts so we don't loop
   // forever on a doomed server; once the budget is spent we fall back
   // to the iframe so the user keeps seeing video instead of a stuck
@@ -1077,16 +1149,26 @@ export function WatchPage() {
     reextractCount.current += 1;
 
     const embed = resolvedRef.current?.embed;
+    // Mid-watch: keep the exact position across the re-resolve instead of
+    // snapping back to the 10s-granularity saved progress.
+    const midWatch = hasPlayedRef.current;
+    if (midWatch && videoRef.current) {
+      stepDownSeekRef.current = videoRef.current.currentTime || 0;
+    }
+    const budget = midWatch ? MAX_REEXTRACTS_MIDWATCH : MAX_REEXTRACTS_BEFORE_FALLBACK;
 
-    if (reextractCount.current > MAX_REEXTRACTS_BEFORE_FALLBACK) {
+    if (reextractCount.current > budget) {
       console.warn(
-        `[player] ${reason}: re-extract budget exhausted (${reextractCount.current}), falling back to iframe`,
+        `[player] ${reason}: re-extract budget exhausted (${reextractCount.current})${midWatch ? " — switching server" : ", falling back to iframe"}`,
       );
-      if (embed) {
+      // Mid-watch, swapping the whole player for an embed (or leaving a dead
+      // frame) is worse than moving to the next server — advance instead. A
+      // player that never started still gets the embed so the user sees video.
+      if (midWatch || !embed) {
+        advanceToNext();
+      } else {
         setFallbackReload((n) => n + 1);
         setResolved({ url: embed, type: "iframe", embed });
-      } else {
-        advanceToNext();
       }
       return;
     }
@@ -1109,6 +1191,7 @@ export function WatchPage() {
     // Reset re-extract gate for the new stream — covers both HLS and
     // mp4 paths so the second error path also has a recovery shot.
     reextractUsedRef.current = false;
+    hasPlayedRef.current = false;
     // A fresh stream starts un-paused-by-user; clear any stale pause intent so
     // stall recovery works on the new source.
     userPausedRef.current = false;
@@ -1250,6 +1333,7 @@ export function WatchPage() {
     const onPlaying = () => {
       startupReleased = true;
       played = true;
+      hasPlayedRef.current = true;
       // Real playback resumed — refill the in-place budget so a long episode
       // on a flaky CDN survives more than 2 drops total. A dead stream never
       // fires `playing`, so it still advances after 2 failed recoveries.
@@ -1979,6 +2063,12 @@ export function WatchPage() {
               onClick={togglePlay}
               onDoubleClick={toggleFs}
               onCanPlay={() => setPartyReadyUrl(resolved.url)}
+              onLoadedMetadata={(e) => {
+                // A default <track> starts hidden in Chromium until a mode is
+                // set — force the sidecar subtitle visible.
+                const tracks = (e.target as HTMLVideoElement).textTracks;
+                for (let i = 0; i < tracks.length; i++) tracks[i].mode = "showing";
+              }}
               onError={(e) => {
                 const err = (e.target as HTMLVideoElement).error;
                 const code = err?.code;
@@ -2006,7 +2096,17 @@ export function WatchPage() {
                 }
                 if (code === 4) advanceToNext();
               }}
-            />
+            >
+              {subtitleBlobUrl && (
+                <track
+                  kind="subtitles"
+                  src={subtitleBlobUrl}
+                  srcLang={resolved.subtitles?.[0]?.lang || "ar"}
+                  label={resolved.subtitles?.[0]?.label || "العربية"}
+                  default
+                />
+              )}
+            </video>
             {/* Top title bar — fades with the controls */}
             <div
               className={`pointer-events-none absolute inset-x-0 top-0 flex items-start gap-3 bg-gradient-to-b from-black/80 via-black/25 to-transparent px-5 pb-12 pt-4 transition-opacity duration-300 ${
