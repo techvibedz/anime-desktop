@@ -666,8 +666,12 @@ return { url: best.score >= 34 ? best.url : null, score: best.score };
 /* ── VIDEO SERVERS (episode page) ─────────────── */
 
 export const EXTRACT_VIDEO_SERVERS = `(async function(){${HELPERS}
-function provider(url) {
+function provider(url, name) {
   url = (url || '').toLowerCase();
+  // anime4up's featured servers: labeled anime4up1/anime4up2, embedded on
+  // throwaway rotating *.shop hosts under a stable /Anime4up-S\d/ path.
+  if (/anime4up\\s*\\d/i.test(name || '')) return 'anime4upcdn';
+  if (/anime4up-s\\d|\\/mal\\/\\d+\\/\\d+\\/(?:sub|dub)/.test(url)) return 'anime4upcdn';
   if (/mp4upload/.test(url)) return 'mp4upload';
   if (/dailymotion|dai\\.ly/.test(url)) return 'dailymotion';
   if (/streamwish|hlswish|wishembed|wishfast|hgcloud|jwembed|vibuxer|audinifer|masukestin|hanerix|playerwish/.test(url)) return 'streamwish';
@@ -824,7 +828,7 @@ function collect() {
       name = (labelEl.textContent || '').replace(/\\s+/g, ' ').trim();
     }
     if (!name) name = 'Server ' + (out.length + 1);
-    out.push({ id: String(out.length), name: name, iframeUrl: src, provider: provider(src) });
+    out.push({ id: String(out.length), name: name, iframeUrl: src, provider: provider(src, name) });
   });
   document.querySelectorAll('iframe').forEach(function (f) {
     var src = normalizeEmbed((f.src || f.getAttribute('data-src') || '').trim());

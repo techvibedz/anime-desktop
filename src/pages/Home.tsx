@@ -6,6 +6,7 @@ import { EpisodeActionModal } from "../components/EpisodeActionModal";
 import { Shimmer } from "../components/Shimmer";
 import { SourceRail } from "../components/SourceRail";
 import { dismissFromContinue, getContinueWatching, pullHistoryFromCloud, type WatchEntry } from "../lib/history";
+import { usePosterImage } from "../lib/posters";
 import { reconcileCompletionFromEpisodes } from "../lib/completion";
 import { extractEpisodeNumber } from "../lib/episode-utils";
 import { t } from "../lib/i18n";
@@ -149,17 +150,7 @@ export function HomePage() {
                         <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
                       </svg>
                     </button>
-                    {w.image ? (
-                      <img
-                        src={w.image}
-                        alt={w.animeTitle || w.episodeTitle}
-                        className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.04]"
-                        loading="lazy"
-                        decoding="async"
-                      />
-                    ) : (
-                      <div className="h-full w-full shimmer" />
-                    )}
+                    <ContinueArtwork entry={w} />
                     {/* Progress bar pinned to the poster's bottom edge */}
                     {w.durationMs > 0 && (
                       <div className="absolute inset-x-0 bottom-0 h-1 bg-black/50">
@@ -189,6 +180,26 @@ export function HomePage() {
       <EpisodeActionModal episode={episodePopup} onClose={() => setEpisodePopup(null)} />
     </div>
   );
+}
+
+// Continue-watching artwork. History rows can carry artwork from a retired
+// source host (witanime rotates TLDs), which never loads — repair it from the
+// record's anime page instead of shimmering forever.
+function ContinueArtwork({ entry }: { entry: WatchEntry }) {
+  const poster = usePosterImage(entry.image, entry.animeHref || entry.episodeHref);
+  if (poster.src) {
+    return (
+      <img
+        src={poster.src}
+        alt={entry.animeTitle || entry.episodeTitle}
+        className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.04]"
+        loading="lazy"
+        decoding="async"
+        onError={poster.onError}
+      />
+    );
+  }
+  return <div className={`h-full w-full ${poster.repairing ? "shimmer" : "bg-raised"}`} />;
 }
 
 // Self-contained hero carousel. The rotation interval lives HERE so its tick

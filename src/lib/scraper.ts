@@ -161,8 +161,13 @@ export async function scrapeVideoServers(episodeUrl: string) {
 
 // Classify a server URL into the provider id the resolver special-cases.
 // Mirrors the provider() helper inside EXTRACT_VIDEO_SERVERS.
-function classifyProvider(url: string): string {
+function classifyProvider(url: string, name = ""): string {
   const u = (url || "").toLowerCase();
+  // anime4up's featured servers are labeled anime4up1/anime4up2 and rotate their
+  // throwaway embed host, so the label + the stable /Anime4up-S\d/ path beat any
+  // fixed host list.
+  if (/anime4up\s*\d/i.test(name)) return "anime4upcdn";
+  if (/anime4up-s\d|\/mal\/\d+\/\d+\/(?:sub|dub)/i.test(u)) return "anime4upcdn";
   if (/^https?:\/\/(?:[^/]+\.)?mega\.nz\//i.test(u)) return "mega";
   if (/mp4upload/.test(u)) return "mp4upload";
   if (/dailymotion|dai\.ly/.test(u)) return "dailymotion";
@@ -233,7 +238,7 @@ function parseUp4Servers(html: string): RawServer[] {
     } catch { continue; }
     seen.add(src);
     const name = (m[2] || "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim() || `Server ${out.length + 1}`;
-    out.push({ id: String(out.length), name, iframeUrl: src, provider: classifyProvider(src) });
+    out.push({ id: String(out.length), name, iframeUrl: src, provider: classifyProvider(src, name) });
   }
   return out;
 }
@@ -297,7 +302,7 @@ function parseWitServers(html: string): RawServer[] {
       if (!h || h === "undefined" || h === "null" || h.indexOf(".") < 0) continue;
     } catch { continue; }
     seen.add(url);
-    out.push({ id: String(out.length), name: names[i] || `Server ${out.length + 1}`, iframeUrl: normalizeEmbedUrl(url), provider: classifyProvider(url) });
+    out.push({ id: String(out.length), name: names[i] || `Server ${out.length + 1}`, iframeUrl: normalizeEmbedUrl(url), provider: classifyProvider(url, names[i]) });
   }
   return out;
 }
@@ -318,7 +323,7 @@ export async function scrapeWitanimeEpisodePageDirect(
       servers: current.servers.map((server) => ({
         ...server,
         iframeUrl: normalizeEmbedUrl(server.iframeUrl),
-        provider: classifyProvider(server.iframeUrl),
+        provider: classifyProvider(server.iframeUrl, server.name),
       })),
     };
   }

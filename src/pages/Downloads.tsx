@@ -9,7 +9,25 @@ import {
   getDownloads, subscribeDownloads, deleteDownload, retryDownload, downloadFileUrl,
   formatBytes, type DownloadItem,
 } from "../lib/downloads";
+import { usePosterImage } from "../lib/posters";
 import { t } from "../lib/i18n";
+
+// Saved artwork can point at a retired host (witanime rotates TLDs) — repair it
+// from the record's page instead of leaving a broken/empty tile.
+function DownloadArtwork({ item }: { item: DownloadItem }) {
+  const poster = usePosterImage(item.image, item.animeHref || item.episodeHref);
+  return (
+    <div className="h-16 w-12 shrink-0 overflow-hidden rounded-md bg-bg">
+      {poster.src ? (
+        <img src={poster.src} alt="" referrerPolicy="no-referrer" onError={poster.onError} className="h-full w-full object-cover" />
+      ) : poster.repairing ? (
+        <div className="h-full w-full shimmer" />
+      ) : (
+        <div className="h-full w-full bg-raised" />
+      )}
+    </div>
+  );
+}
 
 function statusLabel(it: DownloadItem): string {
   switch (it.status) {
@@ -64,9 +82,7 @@ export function DownloadsPage() {
         <div className="space-y-2">
           {items.map((it) => (
             <div key={it.id} className="flex items-center gap-3 rounded-xl border border-white/10 bg-surface p-2.5">
-              <div className="h-16 w-12 shrink-0 overflow-hidden rounded-md bg-bg">
-                {it.image ? <img src={it.image} alt="" referrerPolicy="no-referrer" onError={(event) => { event.currentTarget.style.display = "none"; }} className="h-full w-full object-cover" /> : <div className="h-full w-full shimmer" />}
-              </div>
+              <DownloadArtwork item={it} />
               <div className="min-w-0 flex-1">
                 <h3 className="line-clamp-1 font-semibold text-white">{it.animeTitle || it.episodeTitle}</h3>
                 <p className="line-clamp-1 text-xs text-text-secondary">{it.episodeTitle}</p>

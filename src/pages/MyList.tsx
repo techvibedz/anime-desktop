@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { getFavorites, removeFavorite, type FavoriteAnime, type FavoriteList } from "../lib/favorites";
 import { getHistory, type WatchEntry, isCompleted, progressPercent } from "../lib/history";
 import { extractEpisodeNumber } from "../lib/episode-utils";
+import { usePosterImage } from "../lib/posters";
 import { CompletionBadge } from "../components/CompletionBadge";
 import { t } from "../lib/i18n";
 
@@ -65,24 +66,27 @@ export function MyListPage() {
 }
 
 function FavRow({ fav, onRemove }: { fav: FavoriteAnime; onRemove: () => void }) {
-  // Cloud-synced records may hold posters from a retired source domain; on
-  // failure fall back to the shimmer instead of a broken-image glyph.
-  const [imgFailed, setImgFailed] = useState(false);
+  // Records synced from the cloud (or saved before witanime rotated TLDs) can
+  // hold artwork from a retired host — re-resolve it from the anime page, and
+  // show a static placeholder (not an endless shimmer) if that fails too.
+  const poster = usePosterImage(fav.image, fav.href);
   return (
     <div className="group relative">
       <Link to={`/anime/${encodeURIComponent(fav.href)}`} className="block">
         <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface ring-1 ring-transparent transition-shadow duration-200 group-hover:shadow-glow group-hover:ring-accent/50">
-          {fav.image && !imgFailed ? (
+          {poster.src ? (
             <img
-              src={fav.image}
+              src={poster.src}
               alt={fav.title}
               className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.04]"
               loading="lazy"
               decoding="async"
-              onError={() => setImgFailed(true)}
+              onError={poster.onError}
             />
-          ) : (
+          ) : poster.repairing ? (
             <div className="h-full w-full shimmer" />
+          ) : (
+            <div className="h-full w-full bg-raised" />
           )}
           <CompletionBadge hrefs={[fav.href]} titles={[fav.title]} className="absolute bottom-2 end-2" />
         </div>
@@ -102,12 +106,12 @@ function FavRow({ fav, onRemove }: { fav: FavoriteAnime; onRemove: () => void })
 }
 
 function HistoryRow({ entry }: { entry: WatchEntry }) {
-  const [imgFailed, setImgFailed] = useState(false);
+  const poster = usePosterImage(entry.image, entry.animeHref || entry.episodeHref);
   const pct = Math.round(progressPercent(entry) * 100);
   const done = isCompleted(entry);
   const num = extractEpisodeNumber(entry.episodeTitle, entry.episodeHref);
   const params = new URLSearchParams();
-  if (entry.image) params.set("img", entry.image);
+  if (poster.src) params.set("img", poster.src);
   if (entry.animeHref) params.set("anime", entry.animeHref);
   if (entry.url4up) params.set("up4", entry.url4up);
   const qs = params.toString();
@@ -117,8 +121,10 @@ function HistoryRow({ entry }: { entry: WatchEntry }) {
       className="group flex items-center gap-3 rounded-xl bg-surface p-2 ring-1 ring-white/5 transition hover:ring-accent/50"
     >
       <div className="relative h-16 w-28 flex-shrink-0 overflow-hidden rounded-lg bg-bg">
-        {entry.image && !imgFailed ? (
-          <img src={entry.image} alt="" className="h-full w-full object-cover" loading="lazy" decoding="async" onError={() => setImgFailed(true)} />
+        {poster.src ? (
+          <img src={poster.src} alt="" className="h-full w-full object-cover" loading="lazy" decoding="async" onError={poster.onError} />
+        ) : poster.repairing ? (
+          <div className="h-full w-full shimmer" />
         ) : (
           <div className="flex h-full w-full items-center justify-center bg-raised">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-text-muted">

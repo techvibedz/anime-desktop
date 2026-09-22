@@ -47,7 +47,11 @@ export function anime4upEpisodeUrl(title: string, episodeNumber: number): string
 }
 
 export const PROVIDER_POLICIES: Record<string, ProviderPolicy> = {
-  anime4upcdn: { patterns: ["anime4up-s\\d", "44y4h0r\\.shop", "z4m2r9t\\.shop", "k1c6x8p\\.shop"], rank: 0, resolution: "directThenIframe", failureMode: "failed", supported: true, adaptive: true },
+  // Featured anime4up servers (Anime4up-S1/S2). The embed host rotates through
+  // throwaway *.shop domains, so classify on the STABLE parts of the URL (the
+  // /Anime4up-S\d/ path segment and the /mal/<id>/<ep>/sub/ tail), plus the
+  // historical hosts. The server NAME ("anime4up1") is the last-resort signal.
+  anime4upcdn: { patterns: ["anime4up-s\\d", "\\/mal\\/\\d+\\/\\d+\\/(?:sub|dub)", "44y4h0r\\.shop", "z4m2r9t\\.shop", "k1c6x8p\\.shop"], rank: 0, resolution: "directThenIframe", failureMode: "failed", supported: true, adaptive: true },
   mp4upload: { patterns: ["mp4upload"], rank: 1, resolution: "directThenIframe", failureMode: "failed", supported: true, downloadable: true },
   dailymotion: { patterns: ["dailymotion", "dai\\.ly"], rank: 0, resolution: "directThenIframe", failureMode: "failed", supported: true, adaptive: true },
   streamwish: { patterns: ["streamwish", "hlswish", "wishembed", "wishfast", "hgcloud", "jwembed", "vibuxer", "audinifer", "masukestin", "hanerix", "playerwish"], rank: 2, resolution: "directThenIframe", failureMode: "failed", supported: true, adaptive: true },
@@ -69,8 +73,11 @@ export const PROVIDER_POLICIES: Record<string, ProviderPolicy> = {
 
 const PROVIDER_ENTRIES = Object.entries(PROVIDER_POLICIES).filter(([id]) => id !== "generic");
 
-export function classifyProvider(url: string): string {
+export function classifyProvider(url: string, name = ""): string {
   const value = String(url || "").toLowerCase();
+  // anime4up labels the featured VnxPlayer servers "anime4up1"/"anime4up2" —
+  // the label survives a host rotation the URL patterns can't follow.
+  if (/anime4up\s*\d/i.test(name)) return "anime4upcdn";
   for (const [id, policy] of PROVIDER_ENTRIES) {
     if (policy.patterns.some((pattern) => new RegExp(pattern, "i").test(value))) return id;
   }
@@ -195,7 +202,7 @@ export function mergeVideoServers<T extends { id?: string; name: string; provide
       const iframeUrl = normalizeServerUrl(server.iframeUrl);
       const dedupeKey = serverDedupeKey(iframeUrl);
       const provider = !server.provider || server.provider === "generic"
-        ? classifyProvider(iframeUrl)
+        ? classifyProvider(iframeUrl, server.name)
         : server.provider;
       if (!iframeUrl || !isProviderSupported(provider) || seen.has(dedupeKey)) continue;
       seen.add(dedupeKey);

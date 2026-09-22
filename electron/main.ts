@@ -1370,7 +1370,13 @@ async function extractAnime4upCdn(
 ): Promise<{ url: string; type: "hls"; subtitles?: MediaSubtitle[]; denied?: boolean } | null> {
   allowHost(iframeUrl);
   let html = "";
-  for (const timeout of [6000, 12000]) {
+  let refused = false;
+  // VnxPlayer's refusal is served INTERMITTENTLY by its edge — the same URL
+  // flips between the player and the refusal page within minutes (measured:
+  // refused at 16:20, playing at 16:35). So a refusal gets retried before it is
+  // reported; only a refusal on every attempt is treated as denied.
+  for (const timeout of [6000, 12000, 12000]) {
+    let page = "";
     try {
       const resp = await session.defaultSession.fetch(iframeUrl, {
         method: "GET",
@@ -1384,20 +1390,24 @@ async function extractAnime4upCdn(
         redirect: "follow",
         cache: "no-store",
       });
-      if (resp.ok) html = (await resp.text()).replace(/\\\//g, "/");
+      if (resp.ok) page = (await resp.text()).replace(/\\\//g, "/");
     } catch (e) {
       console.warn(`[extractAnime4upCdn] page fetch failed (${timeout}ms):`, e);
     }
-    if (html) break;
+    if (!page) continue;
+    html = page;
+    refused = /mp-denied/i.test(page) && !parseAnime4upStreamUrl(page);
+    if (!refused) break;
+    await new Promise((resolve) => setTimeout(resolve, 600));
   }
   const stream = parseAnime4upStreamUrl(html);
   if (!stream) {
-    // VnxPlayer's "this domain is not authorized" page. It is a definitive
-    // refusal for THIS episode's featured server (anime4up's own page gets the
-    // same page for the same URL), so the caller must NOT fall back to the
-    // iframe — that would render the refusal page inside the player. Report it
-    // as denied and let the player mark the server broken and switch.
-    if (/mp-denied/i.test(html)) {
+    // VnxPlayer's "this domain is not authorized" page. It means THIS episode's
+    // featured server cannot play right now (anime4up's own page gets the same
+    // page for the same URL), so the caller must NOT fall back to the iframe —
+    // that would render the refusal inside the player. Report it as denied and
+    // let the player mark the server broken and switch.
+    if (refused) {
       console.info(`[extractAnime4upCdn] VnxPlayer refused this server: ${iframeUrl}`);
       return { url: "", type: "hls", denied: true };
     }
