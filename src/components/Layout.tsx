@@ -62,7 +62,7 @@ export function Layout() {
     <div className="min-h-screen bg-bg text-text">
       <aside className="fixed inset-y-0 start-0 z-sticky flex w-60 flex-col border-e border-white/5 bg-bg">
         <Link to="/" className="flex items-center gap-3 px-5 pb-6 pt-6">
-          <img src="/logo.png" alt="" className="h-9 w-9 rounded-xl" />
+          <img src="./logo.png" alt="" className="h-9 w-9 rounded-xl" />
           <span className="text-lg font-bold tracking-tight text-white">{t.appName}</span>
         </Link>
 

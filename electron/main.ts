@@ -209,7 +209,10 @@ function allowHost(raw: string | null | undefined): void {
 }
 function isAdHost(host: string): boolean {
   if (dynamicAllowedHosts.has(host)) return false;
-  return !/(^|\.)witanime\.site$/i.test(host) && AD_HOST_RE.test(host);
+  // witanime rotates through free TLDs that AD_HOST_RE blocks wholesale
+  // (.life is in that list, and .site/.net are one rotation away from it).
+  // Its own domains and its image CDN (images.witanime.*) are never ads.
+  return !/(^|\.)witanime\.[a-z]{2,}$/i.test(host) && AD_HOST_RE.test(host);
 }
 
 // Canonical Referer/Origin a provider's embed expects, keyed by hostname.
@@ -1364,7 +1367,7 @@ function pickHighestHlsVariant(playlist: string, masterUrl?: string): string | n
 
 async function extractAnime4upCdn(
   iframeUrl: string,
-): Promise<{ url: string; type: "hls"; subtitles?: MediaSubtitle[] } | null> {
+): Promise<{ url: string; type: "hls"; subtitles?: MediaSubtitle[]; denied?: boolean } | null> {
   allowHost(iframeUrl);
   let html = "";
   for (const timeout of [6000, 12000]) {
@@ -1388,7 +1391,18 @@ async function extractAnime4upCdn(
     if (html) break;
   }
   const stream = parseAnime4upStreamUrl(html);
-  if (!stream) return null;
+  if (!stream) {
+    // VnxPlayer's "this domain is not authorized" page. It is a definitive
+    // refusal for THIS episode's featured server (anime4up's own page gets the
+    // same page for the same URL), so the caller must NOT fall back to the
+    // iframe — that would render the refusal page inside the player. Report it
+    // as denied and let the player mark the server broken and switch.
+    if (/mp-denied/i.test(html)) {
+      console.info(`[extractAnime4upCdn] VnxPlayer refused this server: ${iframeUrl}`);
+      return { url: "", type: "hls", denied: true };
+    }
+    return null;
+  }
   const subtitles = parseAnime4upSubtitles(html);
   // Allow the CDN edge hosts BEFORE fetching the playlist/segments — the ad
   // heuristic blocks the whole .shop TLD otherwise.
@@ -2737,11 +2751,11 @@ app.whenReady().then(() => {
   ipcMain.handle("pantoufa:direct-extract", async (
     _evt,
     opts: { provider: string; iframeUrl: string },
-  ): Promise<{ url: string; type: "hls" | "mp4"; subtitles?: MediaSubtitle[] } | null> => {
+  ): Promise<{ url: string; type: "hls" | "mp4"; subtitles?: MediaSubtitle[]; denied?: boolean } | null> => {
     // The embed page itself may sit on a cheap TLD the ad heuristic blocks
     // (anime4up's *.shop player host) — allow it before any fetch.
     allowHost(opts.iframeUrl);
-    const run = async (): Promise<{ url: string; type: "hls" | "mp4"; subtitles?: MediaSubtitle[] } | null> => {
+    const run = async (): Promise<{ url: string; type: "hls" | "mp4"; subtitles?: MediaSubtitle[]; denied?: boolean } | null> => {
       if (opts.provider === "dailymotion") {
         return await extractDailymotion(opts.iframeUrl);
       }

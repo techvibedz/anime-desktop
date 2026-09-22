@@ -43,7 +43,7 @@ export function RegisterPage() {
     <div className="flex min-h-screen items-center justify-center bg-bg p-6">
       <form onSubmit={submit} className="w-full max-w-sm space-y-5 rounded-2xl border border-white/10 bg-surface p-8 shadow-card">
         <div className="text-center">
-          <img src="/logo.png" alt="" className="mx-auto h-14 w-14 rounded-2xl" />
+          <img src="./logo.png" alt="" className="mx-auto h-14 w-14 rounded-2xl" />
           <h1 className="mt-3 text-2xl font-bold text-white">{t.createAccount}</h1>
         </div>
         <div className="space-y-3">

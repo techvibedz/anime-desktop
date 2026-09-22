@@ -33,7 +33,7 @@ declare global {
       directExtract: (
         provider: string,
         iframeUrl: string,
-      ) => Promise<{ url: string; type: "hls" | "mp4"; subtitles?: { url: string; label?: string; lang?: string }[] } | null>;
+      ) => Promise<{ url: string; type: "hls" | "mp4"; subtitles?: { url: string; label?: string; lang?: string }[]; denied?: boolean } | null>;
       fetchText: (url: string) => Promise<string | null>;
       fetchHtml: (
         url: string,

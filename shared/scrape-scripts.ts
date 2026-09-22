@@ -15,13 +15,21 @@ const HELPERS = `
     if (!u) return null;
     return String(u).replace(/-\\d+x\\d+(\\.\\w+)$/, '$1').replace(/\\?resize=\\d+,\\d+/, '').replace(/\\?w=\\d+/, '');
   };
+  window.__pAbsImg = function (src, base) {
+    if (!src) return null;
+    // Relative / protocol-relative srcs must be resolved HERE, in the page that
+    // knows its own origin. Left raw they reach the renderer's <img> and resolve
+    // against the app's file:/// document → ERR_FILE_NOT_FOUND (blank poster).
+    // data:/blob: placeholders are already resolvable — leave them untouched.
+    return /^(?:data|blob|https?):/i.test(src) ? src : window.__pAbsUrl(src, base || location.origin);
+  };
   window.__pBestImg = function (el) {
     var img = el.querySelector('img');
     if (!img) return null;
     var src = img.getAttribute('data-image') || img.getAttribute('data-src')
            || (img.getAttribute('srcset') || '').split(' ')[0]
            || img.getAttribute('src') || '';
-    return window.__pUpgrade(src);
+    return window.__pUpgrade(window.__pAbsImg(src));
   };
   window.__pAbsUrl = function (href, base) {
     if (!href) return '';
@@ -280,7 +288,7 @@ var episodes = decoded.map(function (ep) {
     title: ((ep.type || '') + ' ' + (ep.number != null ? ep.number : '')).trim() || ('Episode ' + num),
     number: num,
     type: ep.type || '',
-    screenshot: ep.screenshot || '',
+    screenshot: window.__pAbsImg(ep.screenshot || '') || '',
     href: url || null,
   };
 }).filter(function (e) { return e.href; });
@@ -302,7 +310,7 @@ if (episodes.length === 0) {
 
 return {
   title: (titleEl && titleEl.textContent.trim()) || '',
-  poster: (posterImg && (posterImg.getAttribute('data-image') || posterImg.getAttribute('src'))) || '',
+  poster: (posterImg && window.__pUpgrade(window.__pAbsImg(posterImg.getAttribute('data-image') || posterImg.getAttribute('src')))) || '',
   synopsis: (synopsisEl && synopsisEl.textContent.trim()) || '',
   genres: genres,
   episodes: episodes,
@@ -356,7 +364,7 @@ episodes.sort(function (a, b) { return a.number - b.number; });
 
 return {
   title: (titleEl && titleEl.textContent.trim()) || '',
-  poster: (posterImg && (posterImg.getAttribute('data-image') || posterImg.getAttribute('src'))) || '',
+  poster: (posterImg && window.__pUpgrade(window.__pAbsImg(posterImg.getAttribute('data-image') || posterImg.getAttribute('src')))) || '',
   synopsis: (synopsisEl && synopsisEl.textContent.trim()) || '',
   genres: genres,
   episodes: episodes,

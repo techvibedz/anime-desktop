@@ -1588,6 +1588,14 @@ async function doResolveVideo(iframeUrl: string, provider: string) {
           data: { videoUrl: direct.url, type: direct.type, subtitles: direct.subtitles },
         };
       }
+      // VnxPlayer refused this episode's featured server. The refusal is
+      // permanent for this URL and anime4up's own page shows the same thing,
+      // so the iframe fallback below would only paint that refusal text inside
+      // the player. Fail hard instead: the player marks the server broken and
+      // auto-switches to the next one.
+      if (direct?.denied) {
+        return { success: false as const, error: "anime4up featured server refused this episode" };
+      }
     } catch {}
     return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
   }

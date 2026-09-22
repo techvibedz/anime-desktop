@@ -65,17 +65,21 @@ export function MyListPage() {
 }
 
 function FavRow({ fav, onRemove }: { fav: FavoriteAnime; onRemove: () => void }) {
+  // Cloud-synced records may hold posters from a retired source domain; on
+  // failure fall back to the shimmer instead of a broken-image glyph.
+  const [imgFailed, setImgFailed] = useState(false);
   return (
     <div className="group relative">
       <Link to={`/anime/${encodeURIComponent(fav.href)}`} className="block">
         <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface ring-1 ring-transparent transition-shadow duration-200 group-hover:shadow-glow group-hover:ring-accent/50">
-          {fav.image ? (
+          {fav.image && !imgFailed ? (
             <img
               src={fav.image}
               alt={fav.title}
               className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.04]"
               loading="lazy"
               decoding="async"
+              onError={() => setImgFailed(true)}
             />
           ) : (
             <div className="h-full w-full shimmer" />
@@ -98,6 +102,7 @@ function FavRow({ fav, onRemove }: { fav: FavoriteAnime; onRemove: () => void })
 }
 
 function HistoryRow({ entry }: { entry: WatchEntry }) {
+  const [imgFailed, setImgFailed] = useState(false);
   const pct = Math.round(progressPercent(entry) * 100);
   const done = isCompleted(entry);
   const num = extractEpisodeNumber(entry.episodeTitle, entry.episodeHref);
@@ -112,8 +117,8 @@ function HistoryRow({ entry }: { entry: WatchEntry }) {
       className="group flex items-center gap-3 rounded-xl bg-surface p-2 ring-1 ring-white/5 transition hover:ring-accent/50"
     >
       <div className="relative h-16 w-28 flex-shrink-0 overflow-hidden rounded-lg bg-bg">
-        {entry.image ? (
-          <img src={entry.image} alt="" className="h-full w-full object-cover" loading="lazy" decoding="async" />
+        {entry.image && !imgFailed ? (
+          <img src={entry.image} alt="" className="h-full w-full object-cover" loading="lazy" decoding="async" onError={() => setImgFailed(true)} />
         ) : (
           <div className="flex h-full w-full items-center justify-center bg-raised">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-text-muted">

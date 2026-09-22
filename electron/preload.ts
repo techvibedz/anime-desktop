@@ -63,7 +63,7 @@ contextBridge.exposeInMainWorld("pantoufa", {
     ipcRenderer.invoke("pantoufa:set-active-iframe", url),
   directExtract: (provider: string, iframeUrl: string) =>
     ipcRenderer.invoke("pantoufa:direct-extract", { provider, iframeUrl }) as Promise<
-      { url: string; type: "hls" | "mp4"; subtitles?: { url: string; label?: string; lang?: string }[] } | null
+      { url: string; type: "hls" | "mp4"; subtitles?: { url: string; label?: string; lang?: string }[]; denied?: boolean } | null
     >,
   // Sidecar subtitle text (VTT) fetched in the main process so the renderer can
   // attach it as a same-origin blob <track> (no CDN CORS needed).
