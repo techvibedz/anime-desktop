@@ -53,6 +53,13 @@ async function deleteFromCloud(episodeHref: string) {
     .eq("user_id", user.id).eq("episode_href", episodeHref);
 }
 
+/**
+ * Hydrate local cache from Supabase. MERGE, never replace: overwriting local
+ * storage with the cloud copy meant one failed push (offline save, expired
+ * session) wiped the user's progress and Continue Watching row on the next
+ * Home mount. Local entries the cloud doesn't know about are kept; for shared
+ * hrefs the newer updatedAt wins.
+ */
 export async function pullHistoryFromCloud() {
   if (!isSupabaseConfigured) return;
   const { data: { user } } = await supabase.auth.getUser();
@@ -62,7 +69,7 @@ export async function pullHistoryFromCloud() {
     .order("updated_at", { ascending: false }).limit(MAX_ITEMS);
   if (error) { console.warn("[history] pull failed:", error.message); return; }
   if (!data) return;
-  const local: WatchEntry[] = data.map((row: any) => ({
+  const remote: WatchEntry[] = data.map((row: any) => ({
     episodeHref: row.episode_href,
     episodeTitle: row.episode_title,
     animeTitle: row.anime_title,
@@ -74,7 +81,21 @@ export async function pullHistoryFromCloud() {
     url4up: row.url4up || undefined,
     completed: !!row.completed,
   }));
-  await storage.setItem(KEY, JSON.stringify(local));
+  const local = await getHistory();
+  const byHref = new Map<string, WatchEntry>();
+  for (const entry of local) byHref.set(entry.episodeHref, entry);
+  for (const row of remote) {
+    const existing = byHref.get(row.episodeHref);
+    if (!existing) {
+      byHref.set(row.episodeHref, row);
+    } else if (row.updatedAt > existing.updatedAt) {
+      byHref.set(row.episodeHref, { ...existing, ...row, epNum: row.epNum ?? existing.epNum });
+    }
+  }
+  const merged = [...byHref.values()]
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, MAX_ITEMS);
+  await storage.setItem(KEY, JSON.stringify(merged));
 }
 
 async function getDismissedHrefs(): Promise<Set<string>> {
@@ -133,14 +154,22 @@ export async function getContinueWatching(): Promise<WatchEntry[]> {
   const dismissed = await getDismissedHrefs();
   // One card per anime (newest-first). A dismissed card must hide the WHOLE
   // anime: the previous episode of the same series would otherwise immediately
-  // take its place and the X button would look broken.
-  const latestPerAnime = new Map<string, WatchEntry>();
+  // take its place and the X button would look broken. A VISIBLE entry always
+  // beats a dismissed one, so re-watching brings the card straight back.
+  const bestPerAnime = new Map<string, WatchEntry>();
   for (const e of list) {
     const key = e.animeHref || e.animeTitle;
-    if (!latestPerAnime.has(key)) latestPerAnime.set(key, e);
+    if (dismissed.has(e.episodeHref)) {
+      if (!bestPerAnime.has(key)) bestPerAnime.set(key, e);
+      continue;
+    }
+    const current = bestPerAnime.get(key);
+    if (!current || dismissed.has(current.episodeHref) || e.updatedAt > current.updatedAt) {
+      bestPerAnime.set(key, e);
+    }
   }
   const out: WatchEntry[] = [];
-  for (const e of latestPerAnime.values()) {
+  for (const e of bestPerAnime.values()) {
     if (dismissed.has(e.episodeHref)) continue;
     out.push(e);
   }
