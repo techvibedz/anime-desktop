@@ -2107,7 +2107,7 @@ export function WatchPage() {
               <div className="pointer-events-none absolute inset-x-6 bottom-24 z-20 flex justify-center">
                 <p
                   dir="auto"
-                  className="max-w-[85%] text-center text-base font-semibold leading-6 text-white whitespace-pre-line"
+                  className="max-w-[85%] text-center text-2xl font-semibold leading-8 text-white whitespace-pre-line"
                 >
                   {subtitleText}
                 </p>
