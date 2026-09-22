@@ -1240,6 +1240,13 @@ export function WatchPage() {
     // could buffer forever on a half-working stream.
     let loadStartedAt = Date.now();
     const INITIAL_LOAD_DEADLINE_MS = 22000;
+    // vid3rb's per-quality progressive files are the one provider with a real
+    // step-down target, and its dead qualities fail FAST (zero bytes, no
+    // metadata) rather than dripping — so give them a shorter no-data window
+    // before stepping down instead of waiting out the 22s deadline.
+    const isVid3rbStream = /vid3rb\.com/i.test(resolved.url);
+    const startDeadlineMs = isVid3rbStream ? 10000 : INITIAL_LOAD_DEADLINE_MS;
+    const noDataLimitMs = isVid3rbStream ? 10000 : STALL_THRESHOLD_MS;
     // Track buffered-end growth so a slow-but-alive link isn't yanked to
     // another (equally slow) server mid-download. On bad internet the 22s
     // hard-deadline used to fire while bytes were still flowing → endless
@@ -1269,9 +1276,17 @@ export function WatchPage() {
         if (be > lastBufferedEnd + 0.01) { lastBufferedEnd = be; lastBufferGrowthAt = now; }
       } catch {}
 
-      if (neverStarted && now - loadStartedAt > INITIAL_LOAD_DEADLINE_MS
-          && now - lastBufferGrowthAt > STALL_THRESHOLD_MS) {
+      if (neverStarted && !userPausedRef.current && now - loadStartedAt > startDeadlineMs
+          && now - lastBufferGrowthAt > noDataLimitMs) {
         advanced = true;
+        // A vid3rb quality that produced ZERO bytes is the CDN throttling THAT
+        // file — measured on Re:Zero S2 ep11: the 1080p source never answered
+        // while 720p streamed in 0.6s. Re-extracting or reloading the same dead
+        // file just burns another ~20s, so step down to the next quality now.
+        if (stepDownQuality()) {
+          console.warn(`[player] no data after ${noDataLimitMs}ms — stepped down quality`);
+          return;
+        }
         console.warn(`[player] Initial load exceeded ${INITIAL_LOAD_DEADLINE_MS}ms with no buffer growth — advancing`);
         triggerReextract(`${resolved.type.toUpperCase()} initial load timed out`);
         return;

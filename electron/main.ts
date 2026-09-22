@@ -1381,16 +1381,9 @@ async function extractAnime4upCdn(
     }
   } catch {}
   allowHost(iframeUrl);
-  let html = "";
-  let refused = false;
-  // VnxPlayer's refusal is served INTERMITTENTLY by its edge — the same URL
-  // flips between the player and the refusal page within minutes (measured:
-  // refused at 16:20, playing at 16:35). So a refusal gets retried before it is
-  // reported; only a refusal on every attempt is treated as denied.
-  for (const timeout of [6000, 12000, 12000]) {
-    let page = "";
+  const fetchPlayerPage = async (url: string, timeout: number): Promise<string | null> => {
     try {
-      const resp = await session.defaultSession.fetch(iframeUrl, {
+      const resp = await session.defaultSession.fetch(url, {
         method: "GET",
         signal: AbortSignal.timeout(timeout),
         headers: {
@@ -1402,17 +1395,49 @@ async function extractAnime4upCdn(
         redirect: "follow",
         cache: "no-store",
       });
-      if (resp.ok) page = (await resp.text()).replace(/\\\//g, "/");
+      if (!resp.ok) return null;
+      return (await resp.text()).replace(/\\\//g, "/");
     } catch (e) {
       console.warn(`[extractAnime4upCdn] page fetch failed (${timeout}ms):`, e);
+      return null;
     }
+  };
+  // The SAME featured-server path with S1 ⇄ S2 swapped. VnxPlayer authorizes
+  // per (server, episode): one sibling routinely has the episode while the
+  // other refuses (measured live: Mirai Nikki ep1/2 only S2, ep3 only S1;
+  // Re:Zero S2 ep9/10/12/13 both, ep11 neither). A refusal is deterministic
+  // for the URL and flips over MINUTES, not milliseconds, so retrying it 600ms
+  // later only delayed the player's switch — retry once only when the fetch
+  // itself failed, and fall back to the sibling before reporting a dead server.
+  const siblingUrl = (() => {
+    try {
+      const u = new URL(iframeUrl);
+      const m = u.pathname.match(/^(.*\/Anime4up-S)(\d)(\/.*)$/i);
+      if (!m) return null;
+      u.pathname = `${m[1]}${m[2] === "1" ? "2" : "1"}${m[3]}`;
+      return u.toString();
+    } catch { return null; }
+  })();
+  let html = "";
+  let refused = false;
+  for (const timeout of [6000, 12000]) {
+    const page = await fetchPlayerPage(iframeUrl, timeout);
     if (!page) continue;
     html = page;
     refused = /mp-denied/i.test(page) && !parseAnime4upStreamUrl(page);
-    if (!refused) break;
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    break;
   }
-  const stream = parseAnime4upStreamUrl(html);
+  let stream = parseAnime4upStreamUrl(html);
+  if (!stream && refused && siblingUrl && siblingUrl !== iframeUrl) {
+    allowHost(siblingUrl);
+    const page = await fetchPlayerPage(siblingUrl, 8000);
+    const siblingStream = page ? parseAnime4upStreamUrl(page) : null;
+    if (siblingStream) {
+      console.info(`[extractAnime4upCdn] featured server refused, sibling has it: ${siblingUrl}`);
+      html = page as string;
+      stream = siblingStream;
+    }
+  }
   if (!stream) {
     // VnxPlayer's "this domain is not authorized" page. It means THIS episode's
     // featured server cannot play right now (anime4up's own page gets the same
