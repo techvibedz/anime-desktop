@@ -1135,6 +1135,16 @@ export function WatchPage() {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [resolved?.subtitles]);
+  // A <track> added AFTER the media's metadata loaded doesn't inherit the
+  // "showing" mode from `default` in every Chromium build (and a server switch
+  // replaces the track element) — force it whenever the blob URL changes.
+  useEffect(() => {
+    if (!subtitleBlobUrl) return;
+    const v = videoRef.current;
+    if (!v) return;
+    const tracks = v.textTracks;
+    for (let i = 0; i < tracks.length; i++) tracks[i].mode = "showing";
+  }, [subtitleBlobUrl, resolved?.url]);
 
   // Centralized re-extract trigger. Counts attempts so we don't loop
   // forever on a doomed server; once the budget is spent we fall back
