@@ -159,8 +159,12 @@ export function qualityScore(name: string): number {
 }
 
 export function sortVideoServers<T extends { name: string; provider: string }>(servers: T[]): T[] {
+  // vid3rb serves fixed-bitrate MP4s: 1080p regularly outruns the connection.
+  // Start at 720p; viewers can still select 1080p explicitly.
+  const startupQuality = (s: T) => s.provider === "vid3rb" && qualityScore(s.name) === 3
+    ? -1 : qualityScore(s.name);
   return [...servers].sort((a, b) =>
-    providerRank(a.provider) - providerRank(b.provider) || qualityScore(b.name) - qualityScore(a.name));
+    providerRank(a.provider) - providerRank(b.provider) || startupQuality(b) - startupQuality(a));
 }
 
 export function selectWarmupServers<T extends { name: string; provider: string }>(servers: T[], limit = 3): T[] {

@@ -8,6 +8,8 @@ import path from "node:path";
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 import { createDecipheriv, randomBytes } from "node:crypto";
+import https from "node:https";
+import { isIP } from "node:net";
 
 // Disable QUIC so Chromium falls back to TCP/HTTP2. Restrictive ISPs
 // often block or mangle QUIC (UDP/443), causing ERR_QUIC_PROTOCOL_ERROR
@@ -1264,10 +1266,9 @@ async function extractVk(
  * The featured servers (Anime4up-S1/S2) embed a VnxPlayer page on a rotating
  * *.shop host whose STATIC HTML carries the HLS master URL:
  *     let streamUrl = "https://cdnN.….shop/?token=…"
- * The master lists 360p/720p/1080p variants, each with its own signed token —
- * we return the HIGHEST-bandwidth variant so the custom hls.js player runs at
- * max quality. The generic headless capture never recognised this private
- * host/URL shape, which is why anime4up1/2 "didn't work"; one plain GET each
+ * The master lists 360p/720p/1080p variants, each with its own signed token.
+ * Pass the master to hls.js so playback adapts to the connection. The generic
+ * headless capture never recognised this private host/URL shape, which is why anime4up1/2 "didn't work"; one plain GET each
  * resolves them. */
 function parseAnime4upStreamUrl(html: string): string | null {
   const m = String(html || "").match(/(?:let|const|var)\s+streamUrl\s*=\s*["']([^"']+)["']/i);
@@ -1343,28 +1344,6 @@ function anime4upEdgeHosts(html: string): string[] {
   }
 }
 
-function pickHighestHlsVariant(playlist: string, masterUrl?: string): string | null {
-  const lines = String(playlist || "").split(/\r?\n/);
-  let best: { bw: number; url: string } | null = null;
-  for (let i = 0; i < lines.length; i++) {
-    const info = lines[i].match(/^#EXT-X-STREAM-INF:.*\bBANDWIDTH=(\d+)/i);
-    if (!info) continue;
-    let j = i + 1;
-    while (j < lines.length && (!lines[j].trim() || lines[j].trim().startsWith("#"))) j++;
-    const uri = (lines[j] || "").trim();
-    if (!uri) continue;
-    let resolved: string;
-    try {
-      resolved = /^https?:\/\//i.test(uri) ? uri : new URL(uri, masterUrl).toString();
-    } catch {
-      continue;
-    }
-    const bw = parseInt(info[1], 10);
-    if (!best || bw > best.bw) best = { bw, url: resolved };
-  }
-  return best?.url || null;
-}
-
 // Chromium (and session fetch) rides the forced DoH resolver below. On several
 // ISPs that resolver answers for Cloudflare-hosted source domains with the
 // carrier's PARKED anycast IPs (measured live: w1.anime4up.rest and the
@@ -1405,8 +1384,13 @@ async function extractAnime4upCdn(
     const u = new URL(iframeUrl);
     if (/\/Anime4up-S\d\/mal\/\d+\/\d+\/(?:sub|dub)$/i.test(u.pathname)) {
       u.pathname += "/";
-      iframeUrl = u.toString();
     }
+    // The rotating embed host now redirects to this exact first-party path.
+    // Go there directly: its DNS can differ from the throwaway host's, and a
+    // failed redirect otherwise makes both featured servers look dead.
+    if (/\/Anime4up-S[12]\/mal\/\d+\/\d+\/(?:sub|dub)\/$/i.test(u.pathname))
+      u.host = "w1.anime4up.rest";
+    iframeUrl = u.toString();
   } catch {}
   allowHost(iframeUrl);
   const fetchPlayerPage = async (url: string, timeout: number): Promise<string | null> => {
@@ -1415,6 +1399,8 @@ async function extractAnime4upCdn(
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "ar,en;q=0.9",
     };
+    const viaEdge = await fetchSourceViaWorkingEdge(url, headers, timeout);
+    if (viaEdge) return viaEdge;
     try {
       const resp = await session.defaultSession.fetch(url, {
         method: "GET",
@@ -1478,46 +1464,54 @@ async function extractAnime4upCdn(
     return null;
   }
   const subtitles = parseAnime4upSubtitles(html);
-  // Allow the CDN edge hosts BEFORE fetching the playlist/segments — the ad
-  // heuristic blocks the whole .shop TLD otherwise.
+  // Keep the master playlist so hls.js can switch quality when bandwidth drops.
+  // Pinning the highest variant made these servers stall on slower connections.
   allowHost(stream);
   for (const host of anime4upEdgeHosts(html)) allowHost(`https://${host}/`);
   if (subtitles.length) for (const track of subtitles) allowHost(track.url);
-  let playlist: string | null = null;
-  try {
-    const resp = await session.defaultSession.fetch(stream, {
-      method: "GET",
-      signal: AbortSignal.timeout(8000),
-      headers: {
-        "User-Agent": PLAYBACK_UA,
-        "Accept": "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-        "X-Pantoufa-Proxy": "1",
-      },
-      redirect: "follow",
-      cache: "no-store",
-    });
-    if (resp.ok) playlist = await resp.text();
-  } catch (e) {
-    console.warn("[extractAnime4upCdn] playlist fetch failed:", e);
-  }
-  // Same DoH-vs-OS-resolver split as the player page above: the CDN host can
-  // be unreachable through Chromium while the system resolver reaches it.
-  if (!playlist) {
-    playlist = await fetchViaSystemDns(stream, {
-      "User-Agent": PLAYBACK_UA,
-      "Accept": "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-    }, 8000);
-  }
-  if (playlist) {
-    const best = pickHighestHlsVariant(playlist, stream);
-    if (best) {
-      allowHost(best);
-      console.info(`[extractAnime4upCdn] highest variant → ${best}`);
-      return { url: best, type: "hls", subtitles };
-    }
-  }
-  // Playlist unresolved — hand over the master and let hls.js adapt.
   return { url: stream, type: "hls", subtitles };
+}
+
+// Some ISPs return a Cloudflare anycast address that never answers for either
+// source. A reachable edge still serves both TLS hostnames; use it for their
+// HTML requests. TLS verification remains against the requested hostname.
+let sourceEdgeIpPromise: Promise<string | null> | null = null;
+async function fetchSourceViaWorkingEdge(url: string, headers: Record<string, string>, timeout: number): Promise<string | null> {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname !== "anime3rb.com" && parsed.hostname !== "w1.anime4up.rest") return null;
+    sourceEdgeIpPromise ||= fetch("https://dns.google/resolve?name=w1.anime4up.rest&type=A", {
+      signal: AbortSignal.timeout(3000),
+    }).then((r) => r.json()).then((dns: { Answer?: { data?: string }[] }) =>
+      dns.Answer?.map((a) => a.data || "").find((ip) => isIP(ip) === 4) || null,
+    ).catch(() => null);
+    const ip = await sourceEdgeIpPromise;
+    if (!ip) { sourceEdgeIpPromise = null; return null; }
+    return await new Promise<string | null>((resolve) => {
+      const req = https.get(url, {
+        headers,
+        timeout,
+        lookup: (_host, options, callback) => {
+          if (options.all) callback(null, [{ address: ip, family: 4 }]);
+          else callback(null, ip, 4);
+        },
+      }, (res) => {
+        const playerDenial = parsed.hostname === "w1.anime4up.rest" && /^\/Anime4up-S[12]\//i.test(parsed.pathname) && res.statusCode === 403;
+        if (res.statusCode !== 200 && !playerDenial) { res.resume(); resolve(null); return; }
+        const chunks: Buffer[] = [];
+        let size = 0;
+        res.on("data", (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > 4 * 1024 * 1024) { req.destroy(); return; }
+          chunks.push(chunk);
+        });
+        res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+        res.on("error", () => resolve(null));
+      });
+      req.on("error", () => resolve(null));
+      req.on("timeout", () => req.destroy());
+    });
+  } catch { return null; }
 }
 
 // Pull the real .mp4 URL straight out of mp4upload's embed page from the
@@ -2370,8 +2364,8 @@ app.whenReady().then(() => {
     app.configureHostResolver({
       secureDnsMode: "secure",
       secureDnsServers: [
-        "https://cloudflare-dns.com/dns-query",
         "https://dns.google/dns-query",
+        "https://cloudflare-dns.com/dns-query",
         "https://dns.quad9.net/dns-query",
       ],
     });
@@ -3110,6 +3104,10 @@ app.whenReady().then(() => {
       "Accept-Language": "ar,en;q=0.9",
       ...(opts.referer ? { Referer: opts.referer } : {}),
     };
+    // The normal resolver can blackhole both source sites. Use the reachable
+    // edge first so title/episode lookups avoid the 8–12 second timeout.
+    const viaEdge = await fetchSourceViaWorkingEdge(opts.url, sourceHeaders, PER_ATTEMPT_TIMEOUT_MS);
+    if (viaEdge) return viaEdge;
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), PER_ATTEMPT_TIMEOUT_MS);

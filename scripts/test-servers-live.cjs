@@ -17,7 +17,7 @@ protocol.registerSchemesAsPrivileged([{
   privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, bypassCSP: true },
 }]);
 app.whenReady().then(async () => {
-  app.configureHostResolver({ secureDnsMode: 'secure', secureDnsServers: ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'] });
+  app.configureHostResolver({ secureDnsMode: 'secure', secureDnsServers: ['https://dns.google/dns-query', 'https://cloudflare-dns.com/dns-query'] });
   const { enqueue } = require('../dist-electron/electron/scraper/host.js');
   const scripts = require('../dist-electron/shared/scrape-scripts.js');
   const source = fs.readFileSync(path.join(__dirname, '../electron/main.ts'), 'utf8');
