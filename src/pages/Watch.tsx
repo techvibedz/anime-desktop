@@ -2194,7 +2194,7 @@ export function WatchPage() {
                 <p
                   dir="auto"
                   className="max-w-[85%] text-center font-semibold text-white whitespace-pre-line"
-                  style={{ fontSize: `${subtitlePrefs.size}px`, lineHeight: 1.35 }}
+                  style={{ fontSize: `${subtitlePrefs.size}px`, lineHeight: 1.35, WebkitTextStroke: "1px #000" }}
                 >
                   {subtitleText}
                 </p>
