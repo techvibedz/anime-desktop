@@ -22,7 +22,7 @@ const cipher = crypto.createCipheriv('aes-128-ctr', key, nonce);
 const encrypted = Buffer.concat([cipher.update(plain), cipher.final()]);
 let failUpstream = false;
 const context = vm.createContext({
-  Buffer, URL, Response, Request, Uint8Array, AbortSignal, console,
+  Buffer, URL, Response, Request, Uint8Array, AbortSignal, AbortController, ReadableStream, console, setTimeout, clearTimeout,
   randomBytes: crypto.randomBytes, createDecipheriv: crypto.createDecipheriv,
   VIDEO_PROTOCOL: 'pantoufa-video',
   net: { fetch: async (_, init) => {
@@ -71,6 +71,18 @@ async function main() {
   }
   const bad = await context.serveMegaStream(new Request(stream.url, { headers: { Range: 'bytes=8000-' } }), new URL(stream.url));
   assert.equal(bad.status, 416);
+  // Open-ended `bytes=0-` is what <video> sends on every load and seek. It must
+  // answer with the FULL remainder: the old 1MB-capped body made Chromium treat
+  // the ended response as the whole resource and "end" playback at 0:00.
+  const openEnded = await context.serveMegaStream(new Request(stream.url, { headers: { Range: 'bytes=0-' } }), new URL(stream.url));
+  assert.equal(openEnded.status, 206);
+  assert.equal(openEnded.headers.get('Content-Range'), `bytes 0-${plain.length - 1}/${plain.length}`);
+  assert.equal(openEnded.headers.get('Content-Length'), String(plain.length));
+  assert.deepEqual(Buffer.from(await openEnded.arrayBuffer()), plain);
+  const seek = await context.serveMegaStream(new Request(stream.url, { headers: { Range: 'bytes=1000-' } }), new URL(stream.url));
+  assert.equal(seek.status, 206);
+  assert.equal(seek.headers.get('Content-Range'), `bytes 1000-${plain.length - 1}/${plain.length}`);
+  assert.deepEqual(Buffer.from(await seek.arrayBuffer()), plain.subarray(1000));
   // An evicted/unknown token must signal re-extract, not a dead 404.
   const gone = await context.serveMegaStream(new Request('pantoufa-video://mega/missingtoken12345678.mp4'), new URL('pantoufa-video://mega/missingtoken12345678.mp4'));
   assert.equal(gone.status, 410);
@@ -78,6 +90,6 @@ async function main() {
   failUpstream = true;
   const failed = await context.serveMegaStream(new Request(stream.url), new URL(stream.url));
   assert.equal(failed.status, 502);
-  console.log('MEGA production handler: legacy+modern links, decrypt, unaligned seek, invalid range, expired token, upstream failure passed');
+  console.log('MEGA production handler: legacy+modern links, decrypt, open-ended stream + seek, unaligned seek, invalid range, expired token, upstream failure passed');
 }
 main().catch((error) => { console.error(error); process.exitCode = 1; });

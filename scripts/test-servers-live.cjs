@@ -41,7 +41,7 @@ app.whenReady().then(async () => {
   const adHost = source.match(/const AD_HOST_RE = (\/.+\/i);/)[1];
   const ctx = vm.createContext({ session, net, enqueue, ...scripts, PLAYBACK_UA: ua, DECOY_RE: eval(decoy),
     AD_HOST_RE: eval(adHost), dynamicAllowedHosts: new Set(), VIDEO_PROTOCOL: 'pantoufa-video',
-    Buffer, URL, Response, Request, AbortSignal, Uint8Array, console, setTimeout, clearTimeout, fetch,
+    Buffer, URL, Response, Request, AbortSignal, AbortController, ReadableStream, Uint8Array, console, setTimeout, clearTimeout, fetch,
     createDecipheriv: crypto.createDecipheriv, randomBytes: crypto.randomBytes });
   vm.runInContext(ts.transpileModule(mega + '\n' + declarations.join('\n'), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, ctx);
 

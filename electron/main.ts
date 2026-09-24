@@ -563,6 +563,35 @@ function advanceCtr(iv: Buffer, blocks: number): Buffer {
   return out;
 }
 
+async function fetchMegaRange(stream: MegaStream, start: number, end: number, outer?: AbortSignal): Promise<Buffer> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  const onOuterAbort = () => controller.abort();
+  outer?.addEventListener("abort", onOuterAbort, { once: true });
+  try {
+    // MEGA's file servers take the byte window as a PATH suffix, not a Range
+    // header, and require it 16-byte aligned (AES-CTR is a block cipher).
+    const alignedStart = start - (start % 16);
+    const upstream = await session.defaultSession.fetch(`${stream.downloadUrl.replace(/\/$/, "")}/${alignedStart}-${end}`, {
+      headers: { "Accept-Encoding": "identity" },
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!(upstream.status === 200 || upstream.status === 206)) throw new Error(`MEGA fetch ${upstream.status}`);
+    const encrypted = Buffer.from(await upstream.arrayBuffer());
+    if (encrypted.length !== end - alignedStart + 1) throw new Error("incomplete MEGA range");
+    const decipher = createDecipheriv("aes-128-ctr", stream.key, advanceCtr(stream.nonce, alignedStart / 16));
+    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    return decrypted.subarray(start - alignedStart, start - alignedStart + (end - start + 1));
+  } finally {
+    clearTimeout(timer);
+    outer?.removeEventListener("abort", onOuterAbort);
+  }
+}
+
+const MEGA_FIRST_WINDOW = 1024 * 1024;
+const MEGA_STEADY_WINDOW = 4 * 1024 * 1024;
+
 async function serveMegaStream(request: Request, reqUrl: URL): Promise<Response> {
   const cors = {
     "Access-Control-Allow-Origin": "*",
@@ -586,33 +615,72 @@ async function serveMegaStream(request: Request, reqUrl: URL): Promise<Response>
   if (!Number.isSafeInteger(start) || start < 0 || start >= stream.size) {
     return new Response("invalid range", { status: 416, headers: { ...cors, "Content-Range": `bytes */${stream.size}` } });
   }
-  const chunkSize = start === 0 ? 1024 * 1024 : 4 * 1024 * 1024;
   const requestedEnd = match?.[2] ? Number(match[2]) : stream.size - 1;
   if ((request.headers.has("range") && !match) || !Number.isSafeInteger(requestedEnd) || requestedEnd < start) {
     return new Response("invalid range", { status: 416, headers: { ...cors, "Content-Range": `bytes */${stream.size}` } });
   }
-  const end = Math.min(stream.size - 1, requestedEnd, start + chunkSize - 1);
-  const alignedStart = start - (start % 16);
-  const upstream = await session.defaultSession.fetch(`${stream.downloadUrl.replace(/\/$/, "")}/${alignedStart}-${end}`, {
-    headers: { "Accept-Encoding": "identity" },
-    cache: "no-store",
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!(upstream.status === 200 || upstream.status === 206)) {
+  const end = Math.min(stream.size - 1, requestedEnd);
+  // The media element opens every playback (and every seek) with an OPEN-ENDED
+  // `bytes=start-` range. A 206 that stops early — the old 1MB/4MB chunk cap —
+  // makes Chromium treat the ended body as the WHOLE resource: the response
+  // covers [0,1MB] of a 150MB file, the moov parses, and the element jumps
+  // straight to "ended" at 0:00. The picture therefore never ran — the exact
+  // "MEGA resolves but plays nothing" bug. The response must instead run to the
+  // end of the REQUESTED range; windows keep memory flat and let a seek cancel
+  // the in-flight body (its AbortSignal stops the next upstream fetch).
+  const firstEnd = Math.min(end, start + MEGA_FIRST_WINDOW - 1);
+  let firstChunk: Buffer;
+  try {
+    firstChunk = await fetchMegaRange(stream, start, firstEnd, request.signal ?? undefined);
+  } catch (e) {
+    // First window failed (dead link / quota / expired download URL) — safe to
+    // fail the whole response; the renderer re-extracts on 502.
+    console.warn(`[mega] first window fetch failed for ${token}:`, e);
     return new Response("MEGA fetch failed", { status: 502, headers: cors });
   }
-  const encrypted = Buffer.from(await upstream.arrayBuffer());
-  if (encrypted.length !== end - alignedStart + 1) return new Response("incomplete MEGA range", { status: 502, headers: cors });
-  const decipher = createDecipheriv("aes-128-ctr", stream.key, advanceCtr(stream.nonce, alignedStart / 16));
-  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-  const body = decrypted.subarray(start - alignedStart, start - alignedStart + end - start + 1);
-  const actualEnd = start + body.length - 1;
-  return new Response(new Uint8Array(body), { status: 206, headers: {
+  const abort = new AbortController();
+  const onAbort = () => abort.abort();
+  request.signal?.addEventListener("abort", onAbort, { once: true });
+  let pos = firstEnd + 1;
+  let cancelled = false;
+  let pending: Buffer | null = firstChunk;
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (cancelled) return;
+      if (pending) {
+        const chunk = pending;
+        pending = null;
+        controller.enqueue(new Uint8Array(chunk));
+        return;
+      }
+      if (pos > end) {
+        controller.close();
+        return;
+      }
+      const windowEnd = Math.min(end, pos + MEGA_STEADY_WINDOW - 1);
+      try {
+        const chunk = await fetchMegaRange(stream, pos, windowEnd, abort.signal);
+        if (cancelled) return;
+        pos = windowEnd + 1;
+        controller.enqueue(new Uint8Array(chunk));
+      } catch (e) {
+        // Mid-stream upstream failure: error the body so the element surfaces a
+        // network error and the player re-extracts a fresh URL/token.
+        if (!cancelled) controller.error(e);
+      }
+    },
+    cancel() {
+      cancelled = true;
+      abort.abort();
+      request.signal?.removeEventListener("abort", onAbort);
+    },
+  });
+  return new Response(body, { status: 206, headers: {
     ...cors,
     "Content-Type": "video/mp4",
     "Accept-Ranges": "bytes",
-    "Content-Length": String(body.length),
-    "Content-Range": `bytes ${start}-${actualEnd}/${stream.size}`,
+    "Content-Length": String(end - start + 1),
+    "Content-Range": `bytes ${start}-${end}/${stream.size}`,
     "Cache-Control": "no-store",
   } });
 }

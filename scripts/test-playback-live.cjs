@@ -28,7 +28,7 @@ app.whenReady().then(async () => {
   const mega = source.slice(source.indexOf('type MegaStream ='), source.indexOf('function proxyUrlFor'));
   const ua = source.match(/const PLAYBACK_UA = "([^"]+)"/)[1];
   const ctx = vm.createContext({ session, net, enqueue, ...scripts, PLAYBACK_UA: ua, VIDEO_PROTOCOL: 'pantoufa-video', dynamicAllowedHosts: new Set(), sourceEdgeIpPromise: null, https, isIP,
-    Buffer, URL, Response, Request, AbortSignal, Uint8Array, console, setTimeout, clearTimeout, fetch,
+    Buffer, URL, Response, Request, AbortSignal, AbortController, ReadableStream, Uint8Array, console, setTimeout, clearTimeout, fetch,
     createDecipheriv: crypto.createDecipheriv, randomBytes: crypto.randomBytes });
   vm.runInContext(ts.transpileModule(mega + '\n' + functions, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, ctx);
   const policy = { exports: {} };
