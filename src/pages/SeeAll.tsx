@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from "react";
-import { useParams, Link } from "react-router-dom";
+import { useParams, useLocation, Link } from "react-router-dom";
 import {
   fetchHome, fetchRecent, fetchAllAnime,
   type AnimeItem, type EpisodeItem, type SearchResult,
@@ -13,6 +13,7 @@ type ItemKind = "anime" | "episode";
 
 export function SeeAllPage() {
   const { section } = useParams<{ section: string }>();
+  const location = useLocation();
   const [items, setItems] = useState<(AnimeItem | EpisodeItem | SearchResult)[]>([]);
   const [kind, setKind] = useState<ItemKind>("anime");
   const [title, setTitle] = useState("");
@@ -29,6 +30,7 @@ export function SeeAllPage() {
   // Initial load — figure out which kind of section this is.
   useEffect(() => {
     if (!section) return;
+    let cancelled = false;
     setLoading(true);
     setError(null);
     setItems([]);
@@ -38,8 +40,17 @@ export function SeeAllPage() {
       try {
         if (section === "recently_updated") {
           setTitle(t.recentlyUpdated); setKind("episode");
+          const seeded = (location.state as { episodes?: EpisodeItem[] } | null)?.episodes;
+          if (Array.isArray(seeded) && seeded.length > 0) {
+            const seen = new Set<string>();
+            seenAnimeRef.current = seen;
+            setItems(dedupeEpisodes(seeded, seen));
+            setHasMore(false);
+            setLoading(false);
+          }
           const seen = new Set<string>();
           const { collected, nextPage, more } = await fillRecent(1, seen);
+          if (cancelled) return;
           seenAnimeRef.current = seen;
           setItems(collected);
           setPage(nextPage - 1); // last page actually fetched
@@ -47,11 +58,13 @@ export function SeeAllPage() {
         } else if (section === "all_anime") {
           setTitle("جميع الأنميات"); setKind("anime");
           const r = await fetchAllAnime(1);
+          if (cancelled) return;
           setItems(r.data.items);
           setHasMore(r.data.hasNext && r.data.items.length > 0);
         } else {
           // Sections derived from the cached home payload — no pagination.
           const home = await fetchHome();
+          if (cancelled) return;
           const found = home.data.sections.find((s) => s.id === section);
           if (found) {
             setTitle(localizedTitle(section, found.title));
@@ -61,13 +74,15 @@ export function SeeAllPage() {
           setHasMore(false);
         }
       } catch (e) {
+        if (cancelled) return;
         setError(e instanceof Error ? e.message : t.failedToLoad);
         setHasMore(false);
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     })();
-  }, [section, retryNonce]);
+    return () => { cancelled = true; };
+  }, [section, retryNonce, location.key]);
 
   const loadMore = useCallback(async () => {
     if (loadingMore || !hasMore) return;

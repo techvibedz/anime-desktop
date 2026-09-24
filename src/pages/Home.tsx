@@ -307,6 +307,7 @@ const Section = memo(function Section({
         </h2>
         <Link
           to={`/see-all/${section.id}`}
+          state={section.id === "recently_updated" ? { episodes: section.items } : undefined}
           className="text-xs font-semibold text-accent transition-colors hover:text-accent-bright"
         >
           {t.seeAllShort} ←

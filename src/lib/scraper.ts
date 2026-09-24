@@ -1381,7 +1381,7 @@ export async function fetchAnime4upRecentPageDirect(
 ): Promise<{ episodes: RawEpisodeCard[]; hasNext: boolean } | null> {
   const safePage = Math.max(1, Math.floor(page));
   const url = safePage === 1 ? `${UP4_BASE}/episode/` : `${UP4_BASE}/episode/page/${safePage}/`;
-  const html = await window.pantoufa.fetchHtml?.(url, UP4_BASE + "/");
+  const html = await window.pantoufa.fetchHtml?.(url, UP4_BASE + "/", { attempts: 1, timeoutMs: 5000 });
   if (!html) return null;
   const result = parseAnime4upRecentHtml(html, safePage);
   return result.episodes.length ? result : null;

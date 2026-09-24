@@ -28,21 +28,28 @@ app.whenReady().then(async () => {
     await win.loadURL('about:blank');
     const result = await win.webContents.executeJavaScript(`(async () => {
       const module = { exports: {} }, exports = module.exports, require = () => ({});
-      window.pantoufa = { fetchHtml: async (url) => url.includes('search_param') ? ${JSON.stringify(searchHtml)} : ${JSON.stringify(detailHtml)}, scrape: async () => null };
+      const requests = [];
+      window.pantoufa = { fetchHtml: async (url, referer, opts) => {
+        requests.push({ url, opts });
+        return url.includes('search_param') ? ${JSON.stringify(searchHtml)} : url.endsWith('/episode/') ? ${JSON.stringify(recentHtml)} : ${JSON.stringify(detailHtml)};
+      }, scrape: async () => null };
       ${js}
       const detail = await module.exports.scrapeAnime4upDetailDirect(${JSON.stringify(detailUrl)});
       const match = await module.exports.searchAnime4upDirect('Mirai Nikki');
+      const firstPage = await module.exports.fetchAnime4upRecentPageDirect(1);
       const page1 = module.exports.parseAnime4upRecentHtml(${JSON.stringify(recentHtml)}, 1);
       const page2 = module.exports.parseAnime4upRecentHtml(${JSON.stringify(nextHtml)}, 2);
       let failure = '';
       try { await module.exports.scrapeEpisodesPage(${JSON.stringify(detailUrl)}); }
       catch (error) { failure = error.message; }
-      return { detail, match, page1, page2, failure };
+      return { detail, match, firstPage, page1, page2, failure, requests };
     })()`);
     assert.match(result.detail.title, /Mirai Nikki/i);
     assert.equal(result.detail.episodes.length, 2, 'detail episodes');
     assert.ok(result.detail.poster.startsWith('https://'), 'detail poster');
     assert.equal(result.match, detailUrl, 'fallback title search');
+    assert.equal(result.firstPage.episodes.length, 2, 'fast recent fetch');
+    assert.deepEqual(result.requests.find((request) => request.url.endsWith('/episode/')).opts, { attempts: 1, timeoutMs: 5000 });
     assert.equal(result.page1.episodes.length, 2, 'recent anime dedup');
     assert.equal(result.page2.episodes.length, 1, 'recent page 2');
     assert.ok(result.page1.hasNext && !result.page2.hasNext, 'recent pagination');
