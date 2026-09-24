@@ -1477,45 +1477,80 @@ async function extractAnime4upCdn(
   return { url: stream, type: "hls", subtitles };
 }
 
-// Some ISPs return a Cloudflare anycast address that never answers for either
-// source. A reachable edge still serves both TLS hostnames; use it for their
-// HTML requests. TLS verification remains against the requested hostname.
-let sourceEdgeIpPromise: Promise<string | null> | null = null;
+// Some ISPs and poisoned resolvers answer for the Cloudflare-hosted source
+// domains with anycast addresses that never serve the site (measured live: BOTH
+// dns.google AND the OS resolver return 188.114.96/97.x for w1.anime4up.rest
+// and anime3rb.com — the TCP connection black-holes for the full timeout, while
+// Cloudflare's own DoH resolves the same names to a reachable edge: 200 OK in
+// <1s). A reachable edge still serves both TLS hostnames; collect candidates
+// from BOTH resolvers with Cloudflare's answers first, probe them in order, and
+// let the first one that actually answers serve the request. TLS verification
+// remains against the requested hostname.
+let sourceEdgeIpsPromise: Promise<string[]> | null = null;
+
+async function resolveSourceEdgeIps(): Promise<string[]> {
+  const ask = async (base: string): Promise<string[]> => {
+    try {
+      const res = await fetch(`${base}?name=w1.anime4up.rest&type=A`, {
+        headers: { accept: "application/dns-json" },
+        signal: AbortSignal.timeout(3000),
+      });
+      const dns = (await res.json()) as { Answer?: { data?: string }[] };
+      return (dns.Answer || []).map((a) => a.data || "").filter((ip) => isIP(ip) === 4);
+    } catch {
+      return [];
+    }
+  };
+  const [cf, google] = await Promise.all([
+    ask("https://cloudflare-dns.com/dns-query"),
+    ask("https://dns.google/resolve"),
+  ]);
+  return [...new Set([...cf, ...google])];
+}
+
 async function fetchSourceViaWorkingEdge(url: string, headers: Record<string, string>, timeout: number): Promise<string | null> {
   try {
     const parsed = new URL(url);
     if (parsed.hostname !== "anime3rb.com" && parsed.hostname !== "w1.anime4up.rest") return null;
-    sourceEdgeIpPromise ||= fetch("https://dns.google/resolve?name=w1.anime4up.rest&type=A", {
-      signal: AbortSignal.timeout(3000),
-    }).then((r) => r.json()).then((dns: { Answer?: { data?: string }[] }) =>
-      dns.Answer?.map((a) => a.data || "").find((ip) => isIP(ip) === 4) || null,
-    ).catch(() => null);
-    const ip = await sourceEdgeIpPromise;
-    if (!ip) { sourceEdgeIpPromise = null; return null; }
-    return await new Promise<string | null>((resolve) => {
-      const req = https.get(url, {
-        headers,
-        timeout,
-        lookup: (_host, options, callback) => {
-          if (options.all) callback(null, [{ address: ip, family: 4 }]);
-          else callback(null, ip, 4);
-        },
-      }, (res) => {
-        const playerDenial = parsed.hostname === "w1.anime4up.rest" && /^\/Anime4up-S[12]\//i.test(parsed.pathname) && res.statusCode === 403;
-        if (res.statusCode !== 200 && !playerDenial) { res.resume(); resolve(null); return; }
-        const chunks: Buffer[] = [];
-        let size = 0;
-        res.on("data", (chunk: Buffer) => {
-          size += chunk.length;
-          if (size > 4 * 1024 * 1024) { req.destroy(); return; }
-          chunks.push(chunk);
+    sourceEdgeIpsPromise ||= resolveSourceEdgeIps().catch(() => [] as string[]);
+    const ips = await sourceEdgeIpsPromise;
+    if (ips.length === 0) { sourceEdgeIpsPromise = null; return null; }
+    // A black-holed candidate must not eat the caller's whole budget probing it.
+    const perIpTimeout = Math.min(timeout, 2500);
+    for (const ip of ips.slice(0, 3)) {
+      const body = await new Promise<string | null>((resolve) => {
+        const req = https.get(url, {
+          headers,
+          timeout: perIpTimeout,
+          lookup: (_host, options, callback) => {
+            if (options.all) callback(null, [{ address: ip, family: 4 }]);
+            else callback(null, ip, 4);
+          },
+        }, (res) => {
+          const playerDenial = parsed.hostname === "w1.anime4up.rest" && /^\/Anime4up-S[12]\//i.test(parsed.pathname) && res.statusCode === 403;
+          if (res.statusCode !== 200 && !playerDenial) { res.resume(); resolve(null); return; }
+          const chunks: Buffer[] = [];
+          let size = 0;
+          res.on("data", (chunk: Buffer) => {
+            size += chunk.length;
+            if (size > 4 * 1024 * 1024) { req.destroy(); return; }
+            chunks.push(chunk);
+          });
+          res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+          res.on("error", () => resolve(null));
         });
-        res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-        res.on("error", () => resolve(null));
+        req.on("error", () => resolve(null));
+        req.on("timeout", () => req.destroy());
       });
-      req.on("error", () => resolve(null));
-      req.on("timeout", () => req.destroy());
-    });
+      if (body !== null) {
+        // Self-calibrating: keep the edge that answered at the front of the list.
+        sourceEdgeIpsPromise = Promise.resolve([ip, ...ips.filter((x) => x !== ip)]);
+        return body;
+      }
+    }
+    // Every candidate black-holed — drop the memo so the next call re-resolves.
+    sourceEdgeIpsPromise = null;
+    return null;
   } catch { return null; }
 }
 
@@ -2356,6 +2391,13 @@ app.whenReady().then(() => {
   // iframes. The cross-source anime4up/anime3rb fetches go through net.fetch
   // (see pantoufa:fetch-html), which rides this same resolver.
   //
+  // Cloudflare must stay FIRST: its answers for anime4up/anime3rb are the
+  // reachable zone edge, while Google's can be the carrier's parked anycast
+  // IPs (188.114.96/97.x) whose connections black-hole — see
+  // fetchSourceViaWorkingEdge. Chromium uses the first server that answers,
+  // and the parked answer looks like a success, so Google-first silently
+  // poisons every anime4up/anime3rb lookup.
+  //
   // 'secure' (not 'automatic'): use ONLY the DoH servers, never the system
   // resolver. 'automatic' keeps the ISP resolver as a fallback, and that
   // fallback is the bug — on a DNS-blocking ISP the blocked hostnames don't
@@ -2373,8 +2415,8 @@ app.whenReady().then(() => {
     app.configureHostResolver({
       secureDnsMode: "secure",
       secureDnsServers: [
-        "https://dns.google/dns-query",
         "https://cloudflare-dns.com/dns-query",
+        "https://dns.google/dns-query",
         "https://dns.quad9.net/dns-query",
       ],
     });
