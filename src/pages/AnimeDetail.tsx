@@ -30,6 +30,7 @@ export function AnimeDetailPage() {
   const [merged, setMerged] = useState<{ anime4up: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [retryNonce, setRetryNonce] = useState(0);
   const [bookmarkList, setBookmarkList] = useState<FavoriteList | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [downloadMeta, setDownloadMeta] = useState<DownloadMeta | null>(null);
@@ -76,7 +77,7 @@ export function AnimeDetailPage() {
       });
 
     return () => { cancelled = true; };
-  }, [id, animeHref]);
+  }, [id, animeHref, retryNonce]);
 
   // Mobile parity: Anime3rb contributes a third, independent episode list.
   // Resolve it after the primary detail has painted so it never delays opening
@@ -277,7 +278,10 @@ export function AnimeDetailPage() {
     );
   }
   if (error || !data) {
-    return <p className="py-20 text-center text-text-secondary">{error ?? t.notFound}</p>;
+    return <div className="flex flex-col items-center gap-4 py-20 text-center text-text-secondary">
+      <p>{error ?? t.notFound}</p>
+      {error && <button type="button" onClick={() => setRetryNonce((n) => n + 1)} className="rounded-full bg-accent px-4 py-2 font-semibold text-black">{t.retry}</button>}
+    </div>;
   }
 
   return (

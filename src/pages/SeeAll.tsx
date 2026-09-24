@@ -20,6 +20,8 @@ export function SeeAllPage() {
   const [hasMore, setHasMore] = useState(true);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [retryNonce, setRetryNonce] = useState(0);
   const [episodePopup, setEpisodePopup] = useState<EpisodeItem | null>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const seenAnimeRef = useRef<Set<string>>(new Set()); // per-anime dedup for recently_updated
@@ -28,6 +30,7 @@ export function SeeAllPage() {
   useEffect(() => {
     if (!section) return;
     setLoading(true);
+    setError(null);
     setItems([]);
     setPage(1);
     setHasMore(true);
@@ -57,11 +60,14 @@ export function SeeAllPage() {
           }
           setHasMore(false);
         }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : t.failedToLoad);
+        setHasMore(false);
       } finally {
         setLoading(false);
       }
     })();
-  }, [section]);
+  }, [section, retryNonce]);
 
   const loadMore = useCallback(async () => {
     if (loadingMore || !hasMore) return;
@@ -70,16 +76,10 @@ export function SeeAllPage() {
     console.info(`[see-all] loading page ${next} of "${section}"`);
     try {
       if (section === "recently_updated") {
-        // Over-fetch pages until ~a screenful of fresh anime is gathered, so one
-        // trigger fills the grid (and a fully-deduped page is absorbed silently).
+        // Fetch one page so each set of fresh anime can paint immediately.
         const { collected, nextPage, more } = await fillRecent(next, seenAnimeRef.current);
-        if (collected.length === 0) {
-          console.info(`[see-all] no new anime past page ${page} — end of list`);
-          setHasMore(false);
-        } else {
-          setItems((prev) => prev.concat(collected));
-          setHasMore(more);
-        }
+        if (collected.length > 0) setItems((prev) => prev.concat(collected));
+        setHasMore(more);
         setPage(nextPage - 1);
         return;
       } else if (section === "all_anime") {
@@ -103,6 +103,8 @@ export function SeeAllPage() {
       setPage(next);
     } catch (e) {
       console.warn(`[see-all] load page ${next} failed:`, e);
+      setError(e instanceof Error ? e.message : t.failedToLoad);
+      setHasMore(false);
     } finally {
       setLoadingMore(false);
     }
@@ -130,6 +132,12 @@ export function SeeAllPage() {
         <Link to="/" className="text-text-muted hover:text-white">→ {t.back}</Link>
         <h1 className="text-3xl font-bold">{title || t.loading}</h1>
       </div>
+      {error && (
+        <div className="flex items-center gap-3 text-sm text-text-secondary">
+          <span>{error}</span>
+          <button type="button" onClick={() => setRetryNonce((n) => n + 1)} className="rounded-full bg-accent px-4 py-2 font-semibold text-black">{t.retry}</button>
+        </div>
+      )}
       {loading ? (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-6">
           {Array.from({ length: 18 }).map((_, i) => <Shimmer key={i} className="aspect-[2/3]" />)}
@@ -179,10 +187,6 @@ function dedupe<T extends { href: string }>(arr: T[]): T[] {
 // The recently-updated feed lists raw episodes newest-first; we want each anime
 // to appear exactly once (its latest episode). Because the feed is newest-first,
 // the first episode seen for an anime is its newest one.
-const FILL_TARGET = 24;
-const MAX_PAGES_PER_FILL = 8;
-const PAGES_PER_BATCH = 4;
-
 function episodeAnimeKey(ep: EpisodeItem): string {
   const href = String(ep.animeHref || "").trim();
   if (href) return "h:" + href.toLowerCase().replace(/\/+$/, "");
@@ -202,28 +206,15 @@ function dedupeEpisodes(eps: EpisodeItem[], seen: Set<string>): EpisodeItem[] {
   return out;
 }
 
-// Walk recent pages (deduping against `seen`) until ~a screenful of fresh anime
-// is gathered, so a single trigger fills the grid instead of trickling rows.
+// Load one page at a time so the first anime cards paint without waiting for
+// later pages, and avoid a burst of requests to Anime4up's rate-limited edge.
 async function fillRecent(fromPage: number, seen: Set<string>) {
-  let page = fromPage;
-  let more = true;
-  const collected: EpisodeItem[] = [];
-  let fetched = 0;
-  while (fetched < MAX_PAGES_PER_FILL && more && collected.length < FILL_TARGET) {
-    const count = Math.min(PAGES_PER_BATCH, MAX_PAGES_PER_FILL - fetched);
-    const batch = await Promise.all(
-      Array.from({ length: count }, (_, offset) => fetchRecent(page + offset).catch(() => null)),
-    );
-    for (const r of batch) {
-      if (!r?.success) { more = false; break; }
-      page += 1;
-      fetched += 1;
-      more = r.data.hasNext && r.data.episodes.length > 0;
-      for (const e of dedupeEpisodes(r.data.episodes, seen)) collected.push(e);
-      if (!more) break;
-    }
-  }
-  return { collected, nextPage: page, more };
+  const r = await fetchRecent(fromPage);
+  return {
+    collected: dedupeEpisodes(r.data.episodes, seen),
+    nextPage: fromPage + 1,
+    more: r.data.hasNext && r.data.episodes.length > 0,
+  };
 }
 
 function localizedTitle(id: string, fallback: string): string {

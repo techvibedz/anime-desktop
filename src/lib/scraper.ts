@@ -80,11 +80,13 @@ export type RawDetail = {
 
 export async function scrapeEpisodesPage(animeUrl: string) {
   const is4up = /anime4up/i.test(animeUrl);
-  return enqueue<RawDetail>({
+  const detail = await enqueue<RawDetail | null>({
     url: is4up ? animeUrl : rewriteWitUrl(animeUrl),
     injectAfter: is4up ? EXTRACT_EPISODES_4UP : EXTRACT_EPISODES_WIT,
     timeoutMs: 35000,
   });
+  if (!detail || !Array.isArray(detail.episodes)) throw new Error("Anime details unavailable. Please retry.");
+  return detail;
 }
 
 export async function scrapeSearch(query: string) {
@@ -617,6 +619,23 @@ export async function scrapeAnime4upEpisodesDirect(
   const html = await window.pantoufa.fetchHtml?.(animeUrl, UP4_BASE + "/");
   if (!html) return [];
   return parseUp4Episodes(html);
+}
+
+export async function scrapeAnime4upDetailDirect(animeUrl: string): Promise<RawDetail | null> {
+  const html = await window.pantoufa.fetchHtml?.(animeUrl, UP4_BASE + "/", { attempts: 1, timeoutMs: 8000 });
+  if (!html) return null;
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const title = doc.querySelector(".anime-details-title")?.textContent?.trim() || "";
+  if (!title) return null;
+  const poster = doc.querySelector(".anime-thumbnail img")?.getAttribute("data-image")
+    || doc.querySelector(".anime-thumbnail img")?.getAttribute("src") || "";
+  return {
+    title,
+    poster: poster ? up4AbsoluteUrl(poster) : "",
+    synopsis: doc.querySelector(".anime-story")?.textContent?.trim() || "",
+    genres: [...doc.querySelectorAll(".anime-genres a")].map((a) => a.textContent?.trim() || "").filter(Boolean),
+    episodes: parseUp4Episodes(html),
+  };
 }
 
 function up4PageUrl(animeUrl: string, page: number): string {

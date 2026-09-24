@@ -6,8 +6,8 @@ import {
   fetchWitHomeDirect,
   scrapeEpisodesPage,
   scrapeSearch,
-  scrapeRecent,
   fetchAnime4upRecentPageDirect,
+  scrapeAnime4upDetailDirect,
   scrapeGenre,
   scrapeAllAnime,
   scrapeVideoServers,
@@ -356,10 +356,24 @@ async function fetchEpisodesFresh(animeUrl: string): Promise<EpisodesPayload> {
     if (a) void writeCache(DETAIL_CACHE_PREFIX + animeUrl, payload);
     return payload;
   }
-  const d = await scrapeEpisodesPage(animeUrl);
+  const d = /anime4up/i.test(animeUrl)
+    ? (await scrapeAnime4upDetailDirect(animeUrl).catch(() => null)) || await scrapeEpisodesPage(animeUrl)
+    : /witanime/i.test(animeUrl)
+      ? await Promise.any([
+          scrapeEpisodesPage(animeUrl),
+          (async () => {
+            const title = titleFromSlug(animeUrl);
+            const url = await searchAnime4upDirect(title);
+            const alternate = url ? await scrapeAnime4upDetailDirect(url) : null;
+            if (!alternate || fuzzyScore(title, alternate.title) < 0.75 || tm_seasonNum(title) !== tm_seasonNum(alternate.title))
+              throw new Error("Matching anime details unavailable");
+            return { ...alternate, up4Url: url };
+          })(),
+        ]).catch(() => { throw new Error("Anime details unavailable. Please retry."); })
+      : await scrapeEpisodesPage(animeUrl);
   const payload: EpisodesPayload = {
     success: true,
-    data: { title: cleanAnimeTitle(d.title), poster: d.poster, banner: d.poster, synopsis: cleanSynopsis(d.synopsis), genres: d.genres, rating: null, metadata: {}, externalLinks: [], totalEpisodes: d.episodes.length, episodes: d.episodes, episodes4up: [], merged: null, up4Hint: d.up4Url ?? null },
+    data: { title: cleanAnimeTitle(d.title) || titleFromSlug(animeUrl), poster: d.poster, banner: d.poster, synopsis: cleanSynopsis(d.synopsis), genres: d.genres, rating: null, metadata: {}, externalLinks: [], totalEpisodes: d.episodes.length, episodes: d.episodes, episodes4up: [], merged: null, up4Hint: d.up4Url ?? null },
   };
   void writeCache(DETAIL_CACHE_PREFIX + animeUrl, payload);
   return payload;
@@ -460,13 +474,14 @@ export function findAnime4upAnimeUrl(title: string): Promise<string | null> {
 }
 
 export async function fetchRecent(page = 1) {
+  const r = await fetchAnime4upRecentPageDirect(page).catch(() => null);
+  if (r) return { success: true, data: { page, episodes: r.episodes.map((e) => ({ title: e.title, href: e.href, image: imgOrEmpty(e.image), animeTitle: e.animeTitle, animeHref: e.animeHref, isNew: e.isNew })), hasNext: r.hasNext } };
   if (page === 1) {
     const home = await fetchHome();
     const recent = home.data.sections.find((section) => section.id === "recently_updated");
-    if (recent?.items.length) return { success: true, data: { page, episodes: recent.items as EpisodeItem[], hasNext: true } };
+    if (recent?.items.length) return { success: true, data: { page, episodes: recent.items as EpisodeItem[], hasNext: false } };
   }
-  const r = await scrapeRecent(page);
-  return { success: true, data: { page, episodes: r.episodes.map((e) => ({ title: e.title, href: e.href, image: imgOrEmpty(e.image), animeTitle: e.animeTitle, animeHref: e.animeHref, isNew: e.isNew })), hasNext: r.hasNext ?? r.episodes.length > 0 } };
+  throw new Error("Recent episodes unavailable. Please retry.");
 }
 
 // Dedup-by-title-key + stable fuzzy rerank for the multi-source search union.
