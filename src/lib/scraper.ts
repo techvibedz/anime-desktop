@@ -170,7 +170,7 @@ function classifyProvider(url: string, name = ""): string {
   // fixed host list.
   if (/anime4up\s*\d/i.test(name)) return "anime4upcdn";
   if (/anime4up-s\d|\/mal\/\d+\/\d+\/(?:sub|dub)/i.test(u)) return "anime4upcdn";
-  if (/^https?:\/\/(?:[^/]+\.)?mega\.nz\//i.test(u)) return "mega";
+  if (/^https?:\/\/(?:[^/]+\.)?mega\.(?:nz|co\.nz)\//i.test(u)) return "mega";
   if (/mp4upload/.test(u)) return "mp4upload";
   if (/dailymotion|dai\.ly/.test(u)) return "dailymotion";
   if (/streamwish|hlswish|wishembed|wishfast|hgcloud|jwembed|vibuxer|audinifer|masukestin|hanerix|playerwish/.test(u)) return "streamwish";

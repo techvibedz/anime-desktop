@@ -491,13 +491,48 @@ const megaStreams = new Map<string, MegaStream>();
 
 async function resolveMegaStream(embedUrl: string): Promise<{ url: string; type: "mp4" } | null> {
   const url = new URL(embedUrl);
-  if (url.protocol !== "https:" || !(url.hostname === "mega.nz" || url.hostname.endsWith(".mega.nz"))) return null;
+  const host = url.hostname.toLowerCase();
+  const isMegaHost =
+    host === "mega.nz" || host.endsWith(".mega.nz") ||
+    host === "mega.co.nz" || host.endsWith(".mega.co.nz");
+  if (url.protocol !== "https:" || !isMegaHost) return null;
+  // Anime sites circulate every link shape MEGA has ever shipped:
+  //   /file/<handle>#<key>            /embed/<handle>#<key>   (modern)
+  //   /#!/<handle>!<key>   /embed#!/<handle>!<key>            (legacy — both in the fragment)
+  //   /file/!<handle>!<key>   /file/<handle>!<key>             (hybrid — key after `!` in the path)
+  // The old parser only understood the modern shape, so every legacy embed
+  // resolved to null and the server "never ran in the player".
+  const fragment = decodeURIComponent(url.hash.replace(/^#/, ""));
   const parts = url.pathname.split("/").filter(Boolean);
-  const marker = parts.findIndex((part) => part === "embed" || part === "file");
-  const handle = marker >= 0 ? parts[marker + 1] : "";
-  if (!handle || !url.hash) return null;
-  const rawKey = Buffer.from(url.hash.slice(1), "base64url");
-  if (rawKey.length !== 32 || !/^[A-Za-z0-9_-]{8}$/.test(handle)) return null;
+  let handle = "";
+  let keyText = fragment;
+  const marker = parts.findIndex((part) => part === "embed" || part === "file" || part === "folder");
+  if (marker >= 0 && parts[marker + 1]) {
+    // Sites prepend `!` and sometimes `/` before the handle — strip both.
+    const seg = parts[marker + 1].replace(/^[!/]+/, "");
+    const bang = seg.indexOf("!");
+    if (bang >= 0) {
+      handle = seg.slice(0, bang);
+      if (seg.slice(bang + 1)) keyText = seg.slice(bang + 1);
+    } else {
+      handle = seg;
+    }
+  }
+  if (!handle && fragment) {
+    const frag = fragment.replace(/^[!/]+/, "");
+    const bang = frag.indexOf("!");
+    if (bang >= 0 && /^[A-Za-z0-9_-]{8}$/.test(frag.slice(0, bang))) {
+      handle = frag.slice(0, bang);
+      keyText = frag.slice(bang + 1);
+    }
+  }
+  if (!handle || !/^[A-Za-z0-9_-]{8}$/.test(handle)) return null;
+  // Accept both standard and URL-safe base64 keys — sites copy either form.
+  const rawKey = Buffer.from(
+    keyText.replace(/[^A-Za-z0-9+/=_-]/g, "").replace(/-/g, "+").replace(/_/g, "/"),
+    "base64",
+  );
+  if (rawKey.length !== 32) return null;
   const key = Buffer.alloc(16);
   for (let i = 0; i < 16; i++) key[i] = rawKey[i] ^ rawKey[i + 16];
   const nonce = Buffer.alloc(16);
@@ -512,7 +547,7 @@ async function resolveMegaStream(embedUrl: string): Promise<{ url: string; type:
   const result = (await response.json() as any[])?.[0];
   if (typeof result?.g !== "string" || !result.g.startsWith("https://") || !Number.isSafeInteger(result.s) || result.s <= 0) return null;
   const token = randomBytes(18).toString("base64url");
-  if (megaStreams.size >= 32) megaStreams.delete(megaStreams.keys().next().value!);
+  if (megaStreams.size >= 64) megaStreams.delete(megaStreams.keys().next().value!);
   megaStreams.set(token, { downloadUrl: result.g, size: result.s, key, nonce });
   return { url: `${VIDEO_PROTOCOL}://mega/${token}.mp4`, type: "mp4" };
 }
@@ -529,14 +564,19 @@ function advanceCtr(iv: Buffer, blocks: number): Buffer {
 }
 
 async function serveMegaStream(request: Request, reqUrl: URL): Promise<Response> {
-  const token = reqUrl.pathname.replace(/^\//, "").replace(/\.mp4$/, "");
-  const stream = megaStreams.get(token);
-  if (!stream) return new Response("expired stream", { status: 404 });
   const cors = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
     "Access-Control-Allow-Headers": "*",
   };
+  const token = reqUrl.pathname.replace(/^\//, "").replace(/\.mp4$/, "");
+  const stream = megaStreams.get(token);
+  // 410 + Reextract (not a bare 404): a token missing from the map is
+  // recoverable — the renderer mints a fresh one instead of abandoning the
+  // server. The LRU touch keeps an in-use token from aging out mid-playback.
+  if (!stream) return new Response("expired stream", { status: 410, headers: { ...cors, "X-Pantoufa-Reextract": "1" } });
+  megaStreams.delete(token);
+  megaStreams.set(token, stream);
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
   if (request.method === "HEAD") return new Response(null, { status: 200, headers: {
     ...cors, "Content-Type": "video/mp4", "Accept-Ranges": "bytes", "Content-Length": String(stream.size),
@@ -1708,7 +1748,10 @@ async function extractVid3rb(
       });
       console.info(`[extractVid3rb] GET ${playerUrl} (try ${attempt + 1}) → ${resp.status}`);
       if (resp.ok) { html = await resp.text(); break; }
-      if (resp.status === 404 || resp.status === 410) return null;
+      // A dead player-page token answers 401/403 — retrying the same URL can
+      // never help and used to burn 8s×2 plus a system-DNS attempt on every
+      // "anime3rb never runs" click before failing over.
+      if (resp.status === 401 || resp.status === 403 || resp.status === 404 || resp.status === 410) return null;
     } catch (e) {
       console.warn(`[extractVid3rb] fetch failed (try ${attempt + 1}):`, e);
     }

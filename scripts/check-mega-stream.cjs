@@ -42,6 +42,27 @@ async function main() {
   assert.equal(await context.resolveMegaStream('https://notmega.nz/file/abcdefgh#' + rawKey.toString('base64url')), null);
   const stream = await context.resolveMegaStream('https://mega.nz/embed/abcdefgh#' + rawKey.toString('base64url'));
   assert.ok(stream?.url.startsWith('pantoufa-video://mega/'));
+  // Every link shape anime sites circulate must resolve to the same bytes.
+  const keyB64url = rawKey.toString('base64url');
+  const keyB64 = rawKey.toString('base64');
+  const shapes = [
+    `https://mega.nz/file/abcdefgh#${keyB64url}`,
+    `https://mega.nz/#!/abcdefgh!${keyB64url}`,
+    `https://mega.nz/embed#!/abcdefgh!${keyB64url}`,
+    `https://mega.nz/embed#abcdefgh!${keyB64url}`,
+    `https://mega.nz/file/!abcdefgh!${keyB64url}`,
+    `https://mega.nz/file/abcdefgh!${keyB64url}`,
+    `https://mega.co.nz/file/abcdefgh#${keyB64url}`,
+    `https://mega.nz/file/abcdefgh#${keyB64}`,
+    `https://mega.nz/folder/xyz12345/file/abcdefgh#${keyB64url}`,
+  ];
+  for (const shape of shapes) {
+    const s = await context.resolveMegaStream(shape);
+    assert.ok(s?.url.startsWith('pantoufa-video://mega/'), `shape must resolve: ${shape}`);
+    const r = await context.serveMegaStream(new Request(s.url, { headers: { Range: 'bytes=0-31' } }), new URL(s.url));
+    assert.equal(r.status, 206, `shape must decrypt: ${shape}`);
+    assert.deepEqual(Buffer.from(await r.arrayBuffer()), plain.subarray(0, 32), `shape bytes: ${shape}`);
+  }
   for (const [start, end] of [[0, 63], [17, 111], [2049, 4095]]) {
     const response = await context.serveMegaStream(new Request(stream.url, { headers: { Range: `bytes=${start}-${end}` } }), new URL(stream.url));
     assert.equal(response.status, 206);
@@ -50,9 +71,13 @@ async function main() {
   }
   const bad = await context.serveMegaStream(new Request(stream.url, { headers: { Range: 'bytes=8000-' } }), new URL(stream.url));
   assert.equal(bad.status, 416);
+  // An evicted/unknown token must signal re-extract, not a dead 404.
+  const gone = await context.serveMegaStream(new Request('pantoufa-video://mega/missingtoken12345678.mp4'), new URL('pantoufa-video://mega/missingtoken12345678.mp4'));
+  assert.equal(gone.status, 410);
+  assert.equal(gone.headers.get('X-Pantoufa-Reextract'), '1');
   failUpstream = true;
   const failed = await context.serveMegaStream(new Request(stream.url), new URL(stream.url));
   assert.equal(failed.status, 502);
-  console.log('MEGA production handler: HTTPS, decrypt, unaligned seek, invalid range, upstream failure passed');
+  console.log('MEGA production handler: legacy+modern links, decrypt, unaligned seek, invalid range, expired token, upstream failure passed');
 }
 main().catch((error) => { console.error(error); process.exitCode = 1; });

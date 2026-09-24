@@ -1013,6 +1013,19 @@ export function WatchPage() {
     window.pantoufa.setActiveIframe(url);
   }, [resolved?.url, resolved?.type]);
 
+  // anime3rb's player URL is tokenized (?token=…&expires=…). When the token
+  // dies, re-extracting the SAME URL 403s forever — re-scrape the episode page
+  // for a fresh one at the same quality before the retry.
+  const refreshA3rbPlayerUrl = useCallback(async (name: string): Promise<string | null> => {
+    const ep = a3rbParam || (/anime3rb\.com\/episode\//i.test(episodeUrl) ? episodeUrl : "");
+    if (!ep) return null;
+    const fresh = await fetchAnime3rbServersByUrl(ep).catch(() => [] as { name: string; iframeUrl: string }[]);
+    if (!fresh.length) return null;
+    const want = resOf(name);
+    const match = (want > 0 ? fresh.find((s) => resOf(s.name) === want) : null) || fresh[0];
+    return match?.iframeUrl || null;
+  }, [a3rbParam, episodeUrl]);
+
   // Resolve the active server only after user clicks (lazy-load to prevent
   // tokenized stream URLs from expiring while the user is reading the page).
   useEffect(() => {
@@ -1027,7 +1040,11 @@ export function WatchPage() {
     // The complete mobile pipeline pre-resolves its best direct candidates.
     // Reuse that URL immediately; the normal resolver remains the fallback for
     // a candidate that arrived before its warm-up completed.
-    if (srv.videoUrl) {
+    // vid3rb is excluded: its signed CDN URLs expire in ~40 min and the
+    // warm-up used to pin one at discovery time, so a later Play click (or a
+    // mid-watch re-extract) replayed a dead URL and "never ran". It extracts
+    // at play time by design (one cheap player-page GET, cached 90s).
+    if (srv.videoUrl && srv.provider !== "vid3rb") {
       const contentType = videoContentType(srv.videoUrl, srv.provider);
       setResolved({
         url: srv.videoUrl,
@@ -1060,9 +1077,28 @@ export function WatchPage() {
     (async () => {
       const fastRetry = FAST_REEXTRACT_PROVIDERS.has(srv.provider);
       const MAX_ATTEMPTS = fastRetry ? 2 : 1;
+      let resolveUrl = srv.iframeUrl;
+      let refreshedA3rb = false;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        // Before a vid3rb retry, swap in a freshly-scraped player URL — the
+        // stored one's token may be what's dead, and retrying it 403s forever.
+        if (attempt > 1 && srv.provider === "vid3rb" && !refreshedA3rb) {
+          refreshedA3rb = true;
+          const fresh = await refreshA3rbPlayerUrl(srv.name).catch(() => null);
+          if (cancelled) return;
+          if (fresh && fresh !== resolveUrl) {
+            console.info(`[player] vid3rb player URL stale — refreshed from episode page`);
+            invalidateResolveCache(fresh);
+            resolveUrl = fresh;
+            // Keep the row's identity (broken/selected state) while pointing
+            // future re-extracts at the live player URL.
+            const prevUrl = srv.iframeUrl;
+            setServers((prev) => prev.map((s) => (s.iframeUrl === prevUrl ? { ...s, iframeUrl: fresh } : s)));
+            activeServerUrlRef.current = fresh;
+          }
+        }
         try {
-          const r = await resolveVideo(srv.iframeUrl, srv.provider, { fresh: attempt > 1 });
+          const r = await resolveVideo(resolveUrl, srv.provider, { fresh: attempt > 1 });
           if (cancelled) return;
           if (r.success && r.data?.videoUrl) {
             const gotDirect = r.data.type === "hls" || r.data.type === "mp4";
@@ -1070,7 +1106,7 @@ export function WatchPage() {
             // missed this round. Re-extract once before accepting the embed.
             if (!gotDirect && fastRetry && attempt < MAX_ATTEMPTS) {
               console.warn(`[player] ${srv.provider}: iframe fallback, re-extracting (attempt ${attempt}/${MAX_ATTEMPTS})`);
-              invalidateResolveCache(srv.iframeUrl);
+              invalidateResolveCache(resolveUrl);
               await new Promise((res) => setTimeout(res, 800));
               continue;
             }
@@ -1078,7 +1114,7 @@ export function WatchPage() {
             setResolved({
               url: r.data.videoUrl,
               type: r.data.type as "hls" | "mp4" | "dailymotion" | "iframe",
-              embed: srv.iframeUrl,
+              embed: resolveUrl,
               subtitles: r.data.subtitles,
             });
             setStatus("playing");
@@ -1087,7 +1123,7 @@ export function WatchPage() {
           // Extraction came up totally empty — retry once if cheap, else advance.
           if (attempt < MAX_ATTEMPTS) {
             console.warn(`[player] ${srv.provider}: extraction empty, retrying (attempt ${attempt}/${MAX_ATTEMPTS})`);
-            invalidateResolveCache(srv.iframeUrl);
+            invalidateResolveCache(resolveUrl);
             await new Promise((res) => setTimeout(res, 800));
             continue;
           }
@@ -1098,7 +1134,7 @@ export function WatchPage() {
           if (cancelled) return;
           if (attempt < MAX_ATTEMPTS) {
             console.warn(`[player] ${srv.provider}: resolve threw, retrying (attempt ${attempt}/${MAX_ATTEMPTS})`, e);
-            invalidateResolveCache(srv.iframeUrl);
+            invalidateResolveCache(resolveUrl);
             await new Promise((res) => setTimeout(res, 800));
             continue;
           }
@@ -1110,7 +1146,7 @@ export function WatchPage() {
     })();
 
     return () => { cancelled = true; };
-  }, [activeIdx, sortedServers, advanceToNext, retryNonce]);
+  }, [activeIdx, sortedServers, advanceToNext, retryNonce, refreshA3rbPlayerUrl]);
 
   // Mark the embed we're capturing for once the iframe is rendering.
   // The captured-URL listener uses this to ignore stale captures from
@@ -1223,6 +1259,11 @@ export function WatchPage() {
     }
 
     console.warn(`[player] ${reason}: re-extracting (attempt ${reextractCount.current})`);
+    // Drop warm-resolved stream URLs so the resolve effect re-extracts instead
+    // of replaying the same dead tokenized URL (vid3rb's CDN tokens live ~40
+    // min — the discovery warm-up used to pin that dead URL for the whole
+    // session and every "never runs" click replayed it).
+    setServers((prev) => prev.map((s) => (s.videoUrl ? { ...s, videoUrl: undefined } : s)));
     import("../lib/api").then(({ invalidateResolveCache }) => {
       if (embed) invalidateResolveCache?.(embed);
       setRetryNonce((n) => n + 1);
@@ -1273,6 +1314,11 @@ export function WatchPage() {
     // (play 5s → stall 15s → recover → …) can't grind forever: on the 3rd
     // stall we step down to the lower anime3rb quality instead.
     let totalMidStreamStalls = 0;
+    // Consecutive healthy 1s ticks. 30s of real progress refills the recovery
+    // budget — resetting it on every `playing` blip instead made a
+    // "play 1s → stall → v.load() → play 1s" cycle reset the bound forever
+    // (the player "keeps refreshing completely" and never advances).
+    let healthyTicks = 0;
     // Absolute wall clock for initial load. Even if `progress` events
     // keep firing (slow CDN dripping bytes), we still hard-advance once
     // this elapses without `playing` firing. Without this the player
@@ -1332,6 +1378,7 @@ export function WatchPage() {
       }
 
       if (isInitialLoading || isBufferingMidStream) {
+        healthyTicks = 0;
         const elapsed = now - lastTimeUpdate;
         if (elapsed > STALL_THRESHOLD_MS) {
           // Mid-stream stall on a progressive direct stream (vid3rb /
@@ -1373,12 +1420,21 @@ export function WatchPage() {
               console.warn(`[player] mid-stream stall ${elapsed}ms — in-place reload #${inPlaceRecoveries} @ ${pos.toFixed(1)}s`);
               try {
                 v.load();
-                v.addEventListener("loadedmetadata", () => {
+                let resumed = false;
+                const resume = () => {
+                  if (resumed) return;
+                  resumed = true;
                   try {
-                    if (pos > 0 && v.duration > 0 && pos < v.duration) v.currentTime = pos;
+                    // Always restore the position. The old guard skipped the
+                    // seek when duration was still unknown at loadedmetadata,
+                    // so the reload restarted the episode from 0 — literally
+                    // "refreshing completely". The browser clamps if needed.
+                    if (pos > 0) v.currentTime = pos;
                     v.play().catch(() => {});
                   } catch {}
-                }, { once: true });
+                };
+                v.addEventListener("loadedmetadata", resume, { once: true });
+                v.addEventListener("loadeddata", resume, { once: true });
               } catch {}
             }
             lastTimeUpdate = Date.now();
@@ -1391,6 +1447,11 @@ export function WatchPage() {
       } else {
         lastTime = v.currentTime;
         lastTimeUpdate = now;
+        if (++healthyTicks >= 30) {
+          healthyTicks = 0;
+          inPlaceRecoveries = 0;
+          totalMidStreamStalls = 0;
+        }
       }
     };
 
@@ -1398,10 +1459,6 @@ export function WatchPage() {
       startupReleased = true;
       played = true;
       hasPlayedRef.current = true;
-      // Real playback resumed — refill the in-place budget so a long episode
-      // on a flaky CDN survives more than 2 drops total. A dead stream never
-      // fires `playing`, so it still advances after 2 failed recoveries.
-      inPlaceRecoveries = 0;
       lastTime = v.currentTime;
       lastTimeUpdate = Date.now();
     };
@@ -2176,8 +2233,11 @@ export function WatchPage() {
                 // often surfaces here, NOT as a true decode failure — so try one re-extract
                 // before abandoning the server (triggerReextract is budgeted and falls back
                 // to the iframe / advances once its retry budget is spent, so this can't loop).
-                if ((code === 2 || code === 3) && resolved.url) {
-                  triggerReextract(`mp4 ${code === 2 ? "network" : "decode"} error code=${code}`);
+                // Code 4 on a MEGA stream = the in-memory token was evicted (410
+                // X-Pantoufa-Reextract) — mint a fresh one instead of abandoning.
+                const megaStream = resolved.url.startsWith("pantoufa-video://mega/");
+                if ((code === 2 || code === 3 || (megaStream && code === 4)) && resolved.url) {
+                  triggerReextract(`mp4 ${code === 2 ? "network" : code === 3 ? "decode" : "src"} error code=${code}`);
                   return;
                 }
                 if (code === 4) advanceToNext();
