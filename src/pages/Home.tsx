@@ -23,7 +23,6 @@ export function HomePage() {
   useEffect(() => {
     let cancelled = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    let reloadTimer: ReturnType<typeof setTimeout> | null = null;
 
     setLoading(true);
     setError(null);
@@ -60,7 +59,6 @@ export function HomePage() {
           return;
         }
         setError(e?.message ?? t.failedToLoad);
-        reloadTimer = setTimeout(() => window.location.reload(), 1200);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -77,7 +75,6 @@ export function HomePage() {
     return () => {
       cancelled = true;
       if (retryTimer) clearTimeout(retryTimer);
-      if (reloadTimer) clearTimeout(reloadTimer);
     };
   }, [retryAttempt]);
 
@@ -89,7 +86,7 @@ export function HomePage() {
     return () => window.removeEventListener("focus", refresh);
   }, []);
 
-  if ((loading || retryAttempt > 0) && sections.length === 0) {
+  if ((loading || (retryAttempt > 0 && !error)) && sections.length === 0) {
     return (
       <div className="space-y-10">
         <Shimmer className="h-[440px] w-full rounded-2xl" />
@@ -106,9 +103,10 @@ export function HomePage() {
   if (error) {
     return (
       <div className="flex min-h-[50vh] flex-col items-center justify-center gap-3 text-center text-text-secondary">
-        <div className="h-10 w-10 animate-spin rounded-full border-2 border-accent border-t-transparent" />
         <p>{error}</p>
-        <p className="text-sm text-text-muted">Reloading automatically...</p>
+        <button type="button" onClick={() => setRetryAttempt(0)} className="rounded-full bg-accent px-5 py-2 font-semibold text-white">
+          {t.retry}
+        </button>
       </div>
     );
   }

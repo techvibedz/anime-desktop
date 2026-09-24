@@ -50,7 +50,7 @@ import {
 } from "./videoProviders";
 
 const HOME_CACHE_KEY = "@home_cache_v2";
-const HOME_CACHE_TTL = 30 * 60 * 1000;
+const HOME_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
 const DETAIL_CACHE_PREFIX = "@detail_v4:";
 const DETAIL_CACHE_TTL = 30 * 60 * 1000;
 const UP4_CACHE_PREFIX = "@up4_eps_v2:";
@@ -158,7 +158,10 @@ async function fetchHomeFresh(): Promise<HomePayload> {
   ]);
   let wit = normalizeHomeSource(witDirect);
   if (!wit || (wit.animes.length === 0 && wit.episodes.length === 0)) {
-    wit = normalizeHomeSource(await scrapeWitanimeHome().catch(() => null));
+    wit = normalizeHomeSource(await withTimeout(scrapeWitanimeHome().catch(() => null), 10_000, null));
+  }
+  if (wit.animes.length === 0 && wit.episodes.length === 0 && anime4upRecent?.episodes.length) {
+    wit = { ...wit, episodes: anime4upRecent.episodes };
   }
   if (wit.animes.length === 0 && wit.episodes.length === 0) {
     throw new Error("Home content unavailable");

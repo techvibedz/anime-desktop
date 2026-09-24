@@ -1648,49 +1648,53 @@ async function extractVid3rb(
   // third 8s timeout just stalls the click. The AbortSignal bounds every
   // attempt; without it a tarpitted fetch sat for Chromium's multi-minute
   // default and the server looked "stuck loading" instead of failing over.
+  const headers = {
+    "User-Agent": PLAYBACK_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ar,en;q=0.9",
+    "Referer": "https://anime3rb.com/",
+    "X-Pantoufa-Proxy": "1",
+  };
+  let html: string | null = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
     try {
       const resp = await session.defaultSession.fetch(playerUrl, {
         method: "GET",
         signal: AbortSignal.timeout(8000),
-        headers: {
-          "User-Agent": PLAYBACK_UA,
-          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language": "ar,en;q=0.9",
-          "Referer": "https://anime3rb.com/",
-          "X-Pantoufa-Proxy": "1",
-        },
+        headers,
         redirect: "follow",
         cache: "no-store",
       });
       console.info(`[extractVid3rb] GET ${playerUrl} (try ${attempt + 1}) → ${resp.status}`);
-      if (!resp.ok) continue;
-      const html = await resp.text();
-      // The page declares `video_sources` twice — an empty [] then the real
-      // array — so match the non-empty form. The match is valid JSON as-is
-      // (URLs use JSON's escaped https:\/\/… slashes).
-      const m = html.match(/video_sources\s*=\s*(\[\{[\s\S]*?\}\])\s*;/);
-      if (!m) { console.warn("[extractVid3rb] no video_sources in player HTML"); continue; }
-      let sources: { src?: string; res?: string; label?: string; premium?: boolean }[] = [];
-      try { sources = JSON.parse(m[1]); } catch { continue; }
-      const free = sources
-        .filter((s) => s.src && /^https?:\/\//.test(s.src) && !s.premium)
-        .map((s) => ({ src: s.src as string, res: parseInt(s.res || "0", 10) || 0, label: s.label }))
-        .sort((a, b) => b.res - a.res); // highest first
-      if (free.length === 0) { console.warn("[extractVid3rb] no playable (non-premium) source"); return null; }
-      // Pick the requested quality (exact → closest at-or-below → highest).
-      const best =
-        (desiredRes > 0 &&
-          (free.find((s) => s.res === desiredRes) || free.find((s) => s.res > 0 && s.res <= desiredRes))) ||
-        free[0];
-      console.info(`[extractVid3rb] ${best.label || best.res || "?"}p → ${best.src}`);
-      return { url: best.src, type: /\.m3u8(\?|$)/i.test(best.src) ? "hls" : "mp4" };
+      if (resp.ok) { html = await resp.text(); break; }
+      if (resp.status === 404 || resp.status === 410) return null;
     } catch (e) {
       console.warn(`[extractVid3rb] fetch failed (try ${attempt + 1}):`, e);
     }
+    // Chromium's forced DoH can fail where the OS resolver still works.
+    if (attempt === 0) {
+      html = await fetchViaSystemDns(playerUrl, headers, 8000);
+      if (html) break;
+    }
   }
-  return null;
+  if (!html) return null;
+  // The page declares `video_sources` twice — an empty [] then the real array.
+  const m = html.match(/video_sources\s*=\s*(\[\{[\s\S]*?\}\])\s*;/);
+  if (!m) { console.warn("[extractVid3rb] no video_sources in player HTML"); return null; }
+  let sources: { src?: string; res?: string; label?: string; premium?: boolean }[] = [];
+  try { sources = JSON.parse(m[1]); } catch { return null; }
+  const free = sources
+    .filter((s) => s.src && /^https?:\/\//.test(s.src) && !s.premium)
+    .map((s) => ({ src: s.src as string, res: parseInt(s.res || "0", 10) || 0, label: s.label }))
+    .sort((a, b) => b.res - a.res);
+  if (free.length === 0) { console.warn("[extractVid3rb] no playable (non-premium) source"); return null; }
+  const best =
+    (desiredRes > 0 &&
+      (free.find((s) => s.res === desiredRes) || free.find((s) => s.res > 0 && s.res <= desiredRes))) ||
+    free[0];
+  console.info(`[extractVid3rb] ${best.label || best.res || "?"}p → ${best.src}`);
+  return { url: best.src, type: /\.m3u8(\?|$)/i.test(best.src) ? "hls" : "mp4" };
 }
 
 function registerVideoProxy() {

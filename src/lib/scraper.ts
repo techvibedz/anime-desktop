@@ -723,14 +723,19 @@ export async function findUp4EpisodeAcrossPages(
 // So each request fails fast (single attempt, short timeout — a retry would
 // just re-enter the tarpit) and successive requests stay spaced out.
 let a3rbLastFetchAt = 0;
+let a3rbFetchQueue: Promise<void> = Promise.resolve();
 const A3RB_FETCH_SPACING_MS = 700;
 async function a3rbFetch(
   url: string,
   opts?: { attempts?: number; timeoutMs?: number },
 ): Promise<string | null> {
-  const wait = a3rbLastFetchAt + A3RB_FETCH_SPACING_MS - Date.now();
-  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-  a3rbLastFetchAt = Date.now();
+  const turn = a3rbFetchQueue.then(async () => {
+    const wait = a3rbLastFetchAt + A3RB_FETCH_SPACING_MS - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    a3rbLastFetchAt = Date.now();
+  });
+  a3rbFetchQueue = turn.catch(() => {});
+  await turn;
   const html = await window.pantoufa.fetchHtml?.(url, A3RB_BASE + "/", {
     attempts: 1,
     timeoutMs: 8000,
