@@ -47,6 +47,7 @@ const DEV_URL = "http://localhost:5173";
 let activeIframeUrl: string | null = null;
 const PROTOCOL = "pantoufa";
 const VIDEO_PROTOCOL = "pantoufa-video";
+const POSTER_PROTOCOL = "pantoufa-poster";
 // Offline-downloads scheme + on-disk directory (resolved lazily — app.getPath
 // is unavailable before ready).
 const FILE_PROTOCOL = "pantoufa-file";
@@ -175,6 +176,10 @@ protocol.registerSchemesAsPrivileged([
     // in both dev (http://localhost) and packaged (file://) builds.
     scheme: FILE_PROTOCOL,
     privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, bypassCSP: true },
+  },
+  {
+    scheme: POSTER_PROTOCOL,
+    privileges: { standard: true, secure: true },
   },
 ]);
 
@@ -2463,6 +2468,33 @@ app.whenReady().then(() => {
   const coldStartUrl = process.argv.find((a) => a.startsWith(`${PROTOCOL}://`));
   if (coldStartUrl) handleAuthCallbackUrl(coldStartUrl);
 
+  // Anime4up posters time out through Chromium's forced DoH on some networks,
+  // even when the same host is reachable through the OS resolver. Keep image
+  // URLs in the renderer unchanged; only its image requests use this route.
+  protocol.handle(POSTER_PROTOCOL, async (request) => {
+    const url = new URL(request.url);
+    if (url.hostname !== "anime4up" || !url.pathname.startsWith("/wp-content/uploads/")) {
+      return new Response("invalid poster", { status: 400 });
+    }
+    const target = `https://w1.anime4up.rest${url.pathname}${url.search}`;
+    const headers = { Referer: "https://w1.anime4up.rest/" };
+    try {
+      let response: Response;
+      try {
+        response = await fetch(target, { headers, redirect: "error", signal: AbortSignal.timeout(8000) });
+      } catch {
+        response = await net.fetch(target, { headers, signal: AbortSignal.timeout(8000) });
+      }
+      const contentType = response.headers.get("content-type") || "";
+      if (!response.ok || !contentType.startsWith("image/")) return new Response("poster unavailable", { status: 502 });
+      return new Response(response.body, {
+        headers: { "Content-Type": contentType, "Cache-Control": "public, max-age=86400" },
+      });
+    } catch {
+      return new Response("poster unavailable", { status: 502 });
+    }
+  });
+
   // Relax response headers on the renderer for images / iframes.
   // Also fix Supabase auth CORS — in dev mode (localhost:5173) the
   // origin doesn't match the Supabase dashboard's allowed list.
@@ -2559,6 +2591,12 @@ app.whenReady().then(() => {
       // proxy operates on defaultSession too, and without this check
       // its own outbound fetches would loop back as new captures.
       if (inFlightProxyTargets.has(u)) return callback({});
+      if (details.resourceType === "image") {
+        const imageUrl = new URL(u);
+        if (imageUrl.hostname === "w1.anime4up.rest" && imageUrl.pathname.startsWith("/wp-content/uploads/")) {
+          return callback({ redirectURL: `${POSTER_PROTOCOL}://anime4up${imageUrl.pathname}${imageUrl.search}` });
+        }
+      }
       // CRITICAL: match AD_HOST_RE against the HOSTNAME only, not the
       // full URL. The regex contains substrings like "mgid", "popunder",
       // "adcash", "tsyndicate" — testing against a full URL means any
