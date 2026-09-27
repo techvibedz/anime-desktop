@@ -327,7 +327,11 @@ export async function scrapeWitanimeEpisodePageDirect(
       servers: current.servers.map((server) => ({
         ...server,
         iframeUrl: normalizeEmbedUrl(server.iframeUrl),
-        provider: classifyProvider(server.iframeUrl, server.name),
+        // The main-process handshake classifies by the manifest LABEL
+        // (hgcloud→streamwish, videa→videa, mega→mega, …) because the gate URL
+        // itself carries no provider pattern. Fall back to host classification
+        // for older preloads that don't send it.
+        provider: server.provider || classifyProvider(server.iframeUrl, server.name),
       })),
     };
   }

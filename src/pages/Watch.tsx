@@ -99,7 +99,7 @@ const FAST_REEXTRACT_PROVIDERS = new Set([
 // For these (all cheap to re-extract) a click-path Range probe turns that
 // stall into an immediate re-extract — the mobile pipeline probes warmed URLs
 // before play; this is the click-path equivalent.
-const PROBE_BEFORE_PLAY = new Set(["streamwish", "streamruby", "doodstream"]);
+const PROBE_BEFORE_PLAY = new Set(["streamwish", "streamruby", "doodstream", "vid3rb"]);
 
 function displayName(s: VideoServer): string {
   const n = (s.name || "").trim();
@@ -1344,19 +1344,25 @@ export function WatchPage() {
     // "play 1s → stall → v.load() → play 1s" cycle reset the bound forever
     // (the player "keeps refreshing completely" and never advances).
     let healthyTicks = 0;
-    // Absolute wall clock for initial load. Even if `progress` events
-    // keep firing (slow CDN dripping bytes), we still hard-advance once
-    // this elapses without `playing` firing. Without this the player
-    // could buffer forever on a half-working stream.
+    // Absolute wall clock for initial load. A stream that keeps RECEIVING
+    // bytes (progress events) but has no metadata yet is not dead — it must
+    // be allowed to reach its moov atom. vid3rb's progressive files carry the
+    // moov ~1.8MB in, and the CDN throttles to ~80KB/s, so ~22s of loading
+    // can pass before ANY metadata; the old hard deadline (10s for vid3rb,
+    // 22s otherwise) bailed out seconds before playback could start, stepped
+    // down, and finally dropped the user into the iframe. The no-data guard
+    // still fails a truly dead stream quickly; the hard deadline below now
+    // only bounds a stream that drips forever without becoming playable.
     let loadStartedAt = Date.now();
     const INITIAL_LOAD_DEADLINE_MS = 22000;
     // vid3rb's per-quality progressive files are the one provider with a real
     // step-down target, and its dead qualities fail FAST (zero bytes, no
     // metadata) rather than dripping — so give them a shorter no-data window
-    // before stepping down instead of waiting out the 22s deadline.
+    // before stepping down instead of waiting out the deadline.
     const isVid3rbStream = /vid3rb\.com/i.test(resolved.url);
     const startDeadlineMs = isVid3rbStream ? 10000 : INITIAL_LOAD_DEADLINE_MS;
     const noDataLimitMs = isVid3rbStream ? 10000 : STALL_THRESHOLD_MS;
+    const metadataDeadlineMs = isVid3rbStream ? 60000 : 45000;
     // Track buffered-end growth so a slow-but-alive link isn't yanked to
     // another (equally slow) server mid-download. On bad internet the 22s
     // hard-deadline used to fire while bytes were still flowing → endless
@@ -1386,8 +1392,16 @@ export function WatchPage() {
         if (be > lastBufferedEnd + 0.01) { lastBufferedEnd = be; lastBufferGrowthAt = now; }
       } catch {}
 
+      // `lastTimeUpdate` is refreshed by progress events while never-started
+      // (onProgress), so it doubles as "last bytes received". A stream dies
+      // only when BOTH buffer growth and incoming bytes stop. The hard
+      // metadata deadline still fires for a stream that drips but never
+      // becomes playable (corrupt/truncated file, bitrate far above link).
+      const dataIdleMs = now - lastTimeUpdate;
+      const streamDead = dataIdleMs > noDataLimitMs && now - lastBufferGrowthAt > noDataLimitMs;
+      const metadataHardOut = now - loadStartedAt > metadataDeadlineMs;
       if (neverStarted && !userPausedRef.current && now - loadStartedAt > startDeadlineMs
-          && now - lastBufferGrowthAt > noDataLimitMs) {
+          && (streamDead || metadataHardOut)) {
         advanced = true;
         // A vid3rb quality that produced ZERO bytes is the CDN throttling THAT
         // file — measured on Re:Zero S2 ep11: the 1080p source never answered

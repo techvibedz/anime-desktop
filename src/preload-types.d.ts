@@ -46,7 +46,7 @@ declare global {
       ) => Promise<string | null>;
       fetchJson: (opts: { url: string; method?: string; body?: string; headers?: Record<string, string> }) => Promise<string | null>;
       resolveWitServers: (url: string) => Promise<{
-        servers: { id: string; name: string; iframeUrl: string }[];
+        servers: { id: string; name: string; iframeUrl: string; provider?: string }[];
         episodeTitle: string;
         animeTitle: string;
       } | null>;

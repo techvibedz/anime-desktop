@@ -1788,6 +1788,40 @@ async function extractMp4upload(
 // need no Referer, and aren't IP-locked (their signed redirect carries
 // noip=yes). Premium-gated qualities ship with an empty src and are skipped.
 // Tokens expire in ~40 minutes, which is why extraction happens at play time
+// The vid3rb CDN resolves /video/<id> with a 302 to a files-N edge; roughly
+// one edge in six hangs the connection forever (measured: readyState 0 for
+// 22s until the stall watchdog stepped a quality down — the "anime3rb loads
+// forever, then drops to the embed" report). Mobile validates the edge with a
+// 2-byte Range request before handing it to the player and moves to the next
+// candidate when it hangs; same here.
+async function probeVid3rbEdge(src: string, headers: Record<string, string>): Promise<string | null> {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await session.defaultSession.fetch(src, {
+        method: "GET",
+        headers: { ...headers, Range: "bytes=0-1" },
+        signal: AbortSignal.timeout(5000),
+        redirect: "follow",
+        cache: "no-store",
+      });
+      if (res.ok || res.status === 206) {
+        const body = await res.arrayBuffer().catch(() => null);
+        if (body && body.byteLength > 0) {
+          // Prefer the final redirect target (files-N edge) so playback skips
+          // the 302 round-trip; fall back to the original URL.
+          try {
+            const finalHost = new URL(res.url).hostname.toLowerCase();
+            if (/(^|\.)vid3rb\.com$/.test(finalHost)) return res.url;
+          } catch {}
+          return src;
+        }
+      }
+    } catch {}
+    if (attempt < 2) await new Promise((r) => setTimeout(r, 400));
+  }
+  return null;
+}
+
 // (the resolve cache is 90s) rather than when the server list is built.
 async function extractVid3rb(
   playerUrlWithHint: string,
@@ -1852,12 +1886,30 @@ async function extractVid3rb(
     .map((s) => ({ src: s.src as string, res: parseInt(s.res || "0", 10) || 0, label: s.label }))
     .sort((a, b) => b.res - a.res);
   if (free.length === 0) { console.warn("[extractVid3rb] no playable (non-premium) source"); return null; }
-  const best =
-    (desiredRes > 0 &&
-      (free.find((s) => s.res === desiredRes) || free.find((s) => s.res > 0 && s.res <= desiredRes))) ||
-    free[0];
-  console.info(`[extractVid3rb] ${best.label || best.res || "?"}p → ${best.src}`);
-  return { url: best.src, type: /\.m3u8(\?|$)/i.test(best.src) ? "hls" : "mp4" };
+  // Candidate order (mobile parity): exact requested quality, then the nearest
+  // lower quality, then the remaining sources highest-first.
+  const ordered: typeof free = [];
+  const exact = desiredRes > 0 ? free.find((s) => s.res === desiredRes) : undefined;
+  if (exact) ordered.push(exact);
+  if (desiredRes > 0) {
+    for (const s of free) if (s !== exact && s.res > 0 && s.res <= desiredRes) ordered.push(s);
+  }
+  for (const s of free) if (!ordered.includes(s)) ordered.push(s);
+  const candidates = ordered.slice(0, 4);
+
+  for (const candidate of candidates) {
+    const validated = await probeVid3rbEdge(candidate.src, headers);
+    if (validated) {
+      console.info(`[extractVid3rb] ${candidate.label || candidate.res || "?"}p edge ok → ${validated}`);
+      return { url: validated, type: /\.m3u8(\?|$)/i.test(validated) ? "hls" : "mp4" };
+    }
+    console.warn(`[extractVid3rb] ${candidate.label || candidate.res || "?"}p edge not answering, trying next`);
+  }
+  // No edge validated: hand over the best raw URL anyway so the player (and
+  // its own re-extract/step-down path) can still try instead of failing hard.
+  const fallback = (exact || free[0]).src;
+  console.warn(`[extractVid3rb] no edge validated; returning raw ${fallback}`);
+  return { url: fallback, type: /\.m3u8(\?|$)/i.test(fallback) ? "hls" : "mp4" };
 }
 
 function registerVideoProxy() {
@@ -3147,7 +3199,7 @@ app.whenReady().then(() => {
       };
       const manifestResponse = await request(new URL(source, episode).toString(), { method: "POST", headers });
       if (!manifestResponse.ok) return null;
-      const manifest = await manifestResponse.json() as any;
+      const manifest = await manifestResponse.json().catch(() => null) as any;
       const seenLabels = new Set<string>();
       const entries: { quality: string; label: string; token: string }[] = [];
       for (const [quality, group] of Object.entries(manifest?.players || {})) {
@@ -3162,7 +3214,18 @@ app.whenReady().then(() => {
       }
       const rank = (label: string) => label.includes("hgcloud") ? 0 : label.includes("videa") ? 1 : label.includes("mp4upload") ? 2 : 3;
       entries.sort((a, b) => rank(a.label) - rank(b.label));
-      const servers: { id: string; name: string; iframeUrl: string }[] = [];
+      // Provider from the manifest LABEL — the same mapping the in-page
+      // extractor uses. The gate URL carries no provider pattern, so host
+      // classification would call every entry generic and the watch screen
+      // would drop them (or only iframe-play them).
+      const providerForLabel = (label: string) => {
+        if (label.includes("mp4upload")) return "mp4upload";
+        if (label.includes("hgcloud")) return "streamwish";
+        if (label.includes("videa")) return "videa";
+        if (label.includes("mega")) return "mega";
+        return "generic";
+      };
+      const servers: { id: string; name: string; iframeUrl: string; provider: string }[] = [];
       for (const entry of entries) {
         const sourceUrl = `${episode.origin}/watch/stream-source/${entry.token}`;
         let ready = await request(sourceUrl, { method: "POST", headers }).catch(() => null);
@@ -3186,9 +3249,22 @@ app.whenReady().then(() => {
           if (followed?.url && followed.url !== gateUrl) target = followed.url;
         }
         try { target = new URL(target, gateUrl).toString(); } catch { target = ""; }
-        if (!target || target === gateUrl || servers.some((server) => server.iframeUrl === target)) continue;
-        servers.push({ id: entry.token, name: `${entry.label} ${entry.quality}`.trim(), iframeUrl: target });
+        // The gate used to 302 to the provider's embed; it now often serves the
+        // player itself (200, no redirect). In that case the GATE URL is the
+        // playable server — exactly what the in-page extractor returns — so keep
+        // it instead of dropping the entry (this was why every witanime server
+        // from the main-process handshake disappeared while the headless
+        // fallback still showed them).
+        if (!target || target === gateUrl) target = gateUrl;
+        if (servers.some((server) => server.iframeUrl === target)) continue;
+        servers.push({
+          id: entry.token,
+          name: `${entry.label} ${entry.quality}`.trim(),
+          iframeUrl: target,
+          provider: providerForLabel(entry.label),
+        });
       }
+      if (servers.length) console.info(`[wit-servers] ${servers.length}/${entries.length} ready (${servers.map((s) => s.name).join(", ")})`);
       const deent = (value: string) => value.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
       // The new witanime watch page has no dedicated episode heading: its only
       // <h1> is the anime title and its <h3>s belong to the "related" rails, so

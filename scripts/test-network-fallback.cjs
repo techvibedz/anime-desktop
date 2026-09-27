@@ -22,13 +22,19 @@ function run(source, context) {
   assert.ok(starts[1] - starts[0] >= 650 && starts[2] - starts[1] >= 650, 'Anime3rb requests stay spaced');
 
   const main = fs.readFileSync('electron/main.ts', 'utf8');
-  const fn = main.match(/async function extractVid3rb\([\s\S]*?(?=function registerVideoProxy)/)?.[0];
+  const fn = main.match(/async function probeVid3rbEdge[\s\S]*?(?=function registerVideoProxy)/)?.[0];
   const { isIP } = require('node:net');
   assert.ok(fn, 'Anime3rb player extractor found');
   const playerHtml = 'video_sources = [{"src":"https://video.vid3rb.com/1080.mp4","res":"1080"},{"src":"https://video.vid3rb.com/720.mp4","res":"720"}];';
   let fallbackCalls = 0;
+  const okProbe = (url) => ({ ok: true, status: 206, url, arrayBuffer: async () => new ArrayBuffer(2) });
   const playerContext = {
-    session: { defaultSession: { fetch: async () => { throw new Error('Chromium DNS unavailable'); } } },
+    session: { defaultSession: { fetch: async (url) => {
+      // The player PAGE fetch fails (forces the system-DNS fallback); the edge
+      // probes succeed so the validated candidate is returned.
+      if (/\.mp4/.test(url)) return okProbe(url);
+      throw new Error('Chromium DNS unavailable');
+    } } },
     fetchViaSystemDns: async () => { fallbackCalls++; return playerHtml; },
     PLAYBACK_UA: 'test', AbortSignal, setTimeout, console, URL,
   };
@@ -36,6 +42,23 @@ function run(source, context) {
   const result = await playerContext.extractVid3rb('https://video.vid3rb.com/player/test#vid3rb=720');
   assert.equal(result.url, 'https://video.vid3rb.com/720.mp4');
   assert.equal(fallbackCalls, 1);
+
+  // A dead requested quality must fall through to the next candidate instead
+  // of being handed to the player (mobile parity edge validation).
+  let fallbackCalls2 = 0;
+  const dead720Context = {
+    session: { defaultSession: { fetch: async (url) => {
+      if (/720\.mp4/.test(url)) throw new Error('edge tarpit');
+      if (/\.mp4/.test(url)) return okProbe(url);
+      throw new Error('Chromium DNS unavailable');
+    } } },
+    fetchViaSystemDns: async () => { fallbackCalls2++; return playerHtml; },
+    PLAYBACK_UA: 'test', AbortSignal, setTimeout, console, URL,
+  };
+  run(`${fn}\nglobalThis.extractVid3rb = extractVid3rb;`, dead720Context);
+  const fallbackResult = await dead720Context.extractVid3rb('https://video.vid3rb.com/player/test#vid3rb=720');
+  assert.equal(fallbackResult.url, 'https://video.vid3rb.com/1080.mp4', 'dead quality falls to the next validated edge');
+  assert.equal(fallbackCalls2, 1);
 
   // Source-edge resolution: Google's answer for anime4up/anime3rb is the parked
   // black-hole anycast (188.114.96/97.x); Cloudflare's is the reachable edge.
