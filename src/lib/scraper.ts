@@ -162,26 +162,28 @@ export async function scrapeVideoServers(episodeUrl: string) {
 }
 
 // Classify a server URL into the provider id the resolver special-cases.
-// Mirrors the provider() helper inside EXTRACT_VIDEO_SERVERS.
+// Mirrors the provider() helper inside EXTRACT_VIDEO_SERVERS and the
+// PROVIDER_POLICIES table in videoProviders.ts (same patterns, same order).
 function classifyProvider(url: string, name = ""): string {
   const u = (url || "").toLowerCase();
   // anime4up's featured servers are labeled anime4up1/anime4up2 and rotate their
   // throwaway embed host, so the label + the stable /Anime4up-S\d/ path beat any
   // fixed host list.
   if (/anime4up\s*\d/i.test(name)) return "anime4upcdn";
-  if (/anime4up-s\d|\/mal\/\d+\/\d+\/(?:sub|dub)/i.test(u)) return "anime4upcdn";
-  if (/^https?:\/\/(?:[^/]+\.)?mega\.(?:nz|co\.nz)\//i.test(u)) return "mega";
+  if (/anime4up-s\d|\/mal\/\d+\/\d+\/(?:sub|dub)|44y4h0r\.shop|z4m2r9t\.shop|k1c6x8p\.shop/i.test(u)) return "anime4upcdn";
   if (/mp4upload/.test(u)) return "mp4upload";
   if (/dailymotion|dai\.ly/.test(u)) return "dailymotion";
   if (/streamwish|hlswish|wishembed|wishfast|hgcloud|jwembed|vibuxer|audinifer|masukestin|hanerix|playerwish/.test(u)) return "streamwish";
   if (/voe\./.test(u)) return "voe";
   if (/share4max|megamax/.test(u)) return "share4max";
   if (/rubyvidhub|streamruby|rubystm|ruby/.test(u)) return "streamruby";
-  if (/doodstream|dood\.|dsvplay|d-s\.io|vidply/.test(u)) return "doodstream";
+  if (/doodstream|dood\.|dsvplay|d-s\.io|vidply|ds2play|ds2video|d0o0d|do0od|all3do|doply|playmogo/.test(u)) return "doodstream";
   if (/uqload/.test(u)) return "uqload";
-  if (/ok\.ru/.test(u)) return "okru";
-  if (/videa\.|vidvaita|vidit/.test(u)) return "videa";
+  if (/ok\.ru|odnoklassniki/.test(u)) return "okru";
+  if (/app\.videas\.fr/.test(u)) return "videas";
+  if (/videa\.|vidvaita|vidit|videakid/.test(u)) return "videa";
   if (/vk\.com/.test(u)) return "vk";
+  if (/mega\.(?:nz|co\.nz)/.test(u)) return "mega";
   if (/vid3rb|anime3rb/.test(u)) return "vid3rb";
   // witanime's current default hosts. Give them their own ids so they aren't
   // classified "generic" and dropped by the witanime-generic filter in

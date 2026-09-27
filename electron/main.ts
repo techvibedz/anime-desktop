@@ -39,7 +39,7 @@ process.on("warning", (warning: { name?: string; message?: string }) => {
 });
 
 import { autoUpdater } from "electron-updater";
-import { enqueue, type ScrapeJob } from "./scraper/host";
+import { enqueue, tryFastPathRequest, cancelBackgroundJobs, type ScrapeJob } from "./scraper/host";
 import { EXTRACT_VIDEO_URL, VIDEO_HOOK_INSTALL } from "../shared/scrape-scripts";
 
 const isDev = !app.isPackaged;
@@ -815,6 +815,7 @@ async function extractViaCapture(
   iframeUrl: string,
   label: string,
   timeoutMs = 30000,
+  background = false,
 ): Promise<{ url: string; type: "hls" | "mp4" } | null> {
   try {
     const result = await enqueue({
@@ -823,6 +824,7 @@ async function extractViaCapture(
       injectAfter: EXTRACT_VIDEO_URL,
       timeoutMs,
       isVideoJob: true,
+      priority: !background,
     });
     if (result?.url) {
       console.info(`[${label}] capture hit → ${result.url}`);
@@ -1018,20 +1020,20 @@ async function extractVideaXml(
   }
 }
 
-async function extractVidea(iframeUrl: string) {
+async function extractVidea(iframeUrl: string, background = false) {
   // Direct XML API first (exact source URLs, sub-second), then static HTML
   // scrape, then headless capture as the last resort.
   return (await extractVideaXml(iframeUrl))
     ?? (await extractViaHtml(iframeUrl, "extractVidea"))
-    ?? extractViaCapture(iframeUrl, "extractVidea", 25000);
+    ?? extractViaCapture(iframeUrl, "extractVidea", 25000, background);
 }
 
-async function extractStreamwish(iframeUrl: string) {
+async function extractStreamwish(iframeUrl: string, background = false) {
   // streamwish inlines its hls source in a packed-JS blob — the static pass
   // resolves it in well under a second. Headless capture (which also rides
   // out Cloudflare challenges) remains the fallback.
   return (await extractViaHtml(iframeUrl, "extractStreamwish"))
-    ?? extractViaCapture(iframeUrl, "extractStreamwish", 35000);
+    ?? extractViaCapture(iframeUrl, "extractStreamwish", 35000, background);
 }
 
 // ok.ru can't be captured by the generic hook: its stream URLs come off
@@ -1192,16 +1194,22 @@ async function extractViaHtml(
         referer: `${u.protocol}//${u.host}/`,
         origin: `${u.protocol}//${u.host}`,
       };
+      const headers: Record<string, string> = {
+        "User-Agent": PLAYBACK_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Pantoufa-Proxy": "1",
+      };
+      // Mobile parity: mobile fetches streamwish-family embeds WITHOUT a
+      // Referer (their rotated mirrors tarpit the streamwish.to literal — the
+      // same reason the playback branch now uses the video-host root).
+      if (!/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(u.hostname)) {
+        headers.Referer = canon.referer;
+        headers.Origin = canon.origin;
+      }
       const resp = await session.defaultSession.fetch(pageUrl, {
         method: "GET",
-        headers: {
-          "User-Agent": PLAYBACK_UA,
-          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9",
-          "Referer": canon.referer,
-          "Origin": canon.origin,
-          "X-Pantoufa-Proxy": "1",
-        },
+        headers,
         redirect: "follow",
         cache: "no-store",
         // Fail fast on dead/blocked mirrors. Without this a streamwish CDN
@@ -1671,6 +1679,7 @@ async function fetchSourceViaWorkingEdge(url: string, headers: Record<string, st
 // file://, document.referrer is empty and mp4upload anti-hotlinks it.
 async function extractMp4upload(
   iframeUrl: string,
+  background = false,
 ): Promise<{ url: string; type: "hls" | "mp4" } | null> {
   // Force the canonical www host + embed form (matches normalizeEmbedUrl in
   // the renderer) so the page returns the player, not the download page.
@@ -1757,6 +1766,9 @@ async function extractMp4upload(
       injectAfter: EXTRACT_VIDEO_URL,
       timeoutMs: 30000,
       isVideoJob: true,
+      // Background warm-ups must stay cancellable and never hold a
+      // priority slot (mobile threads priority the same way).
+      priority: !background,
     });
     if (result?.url) {
       console.info(`[extractMp4upload] headless capture hit → ${result.url}`);
@@ -1849,101 +1861,6 @@ async function extractVid3rb(
 }
 
 function registerVideoProxy() {
-  const scraperSession = session.fromPartition("persist:scraper");
-
-  // Intercept outgoing requests and inject the correct Referer + Origin
-  // passport ONLY if they're missing. The video proxy handler sets its own
-  // headers via per-request strategy race — those must NOT be overridden.
-  // This interceptor is a fallback safety net for bare requests (embed page
-  // navigation, player JS fetches inside the scraper BrowserWindow).
-  scraperSession.webRequest.onBeforeSendHeaders(
-    {
-      urls: [
-        // mp4upload
-        "*://*.mp4upload.com/*",
-        // streamwish family — all known CDN subdomains
-        "*://*.streamwish.to/*", "*://*.hgcloud.cc/*", "*://*.hgcloud.to/*",
-        "*://*.wishfast.com/*", "*://*.wishembed.pro/*", "*://*.jwembed.com/*",
-        "*://*.hlswish.com/*", "*://*.vibuxer.com/*", "*://*.audinifer.com/*",
-        "*://*.masukestin.com/*", "*://*.hanerix.com/*",
-        // voe
-        "*://*.voe.sx/*",
-        // doodstream
-        "*://*.dood.li/*", "*://*.doodstream.com/*", "*://*.dood.watch/*",
-        "*://*.dood.to/*", "*://*.dood.sh/*", "*://*.dood.so/*",
-        "*://*.dood.cx/*", "*://*.dood.video/*",
-        // uqload
-        "*://*.uqload.io/*", "*://*.uqload.com/*", "*://*.uqload.net/*",
-        // share4max / megamax
-        "*://*.share4max.com/*", "*://*.megamax.com/*",
-        // videa
-        "*://*.videa.hu/*", "*://*.vidvaita.info/*", "*://*.vidit.info/*",
-        // okru
-        "*://*.ok.ru/*",
-        // dailymotion
-        "*://*.dailymotion.com/*", "*://*.dmcdn.net/*",
-      ],
-    },
-    (details, callback) => {
-      try {
-        const hdrs = details.requestHeaders;
-
-        const hasReferer = Object.keys(hdrs).some(
-          (k) => k.toLowerCase() === "referer",
-        );
-
-        if (!hasReferer) {
-          const host = new URL(details.url).hostname.toLowerCase();
-        let ref = "";
-        let ori = "";
-        if (/mp4upload/.test(host)) {
-          ref = "https://www.mp4upload.com/";
-          ori = "https://www.mp4upload.com";
-        } else if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(host)) {
-          ref = "https://streamwish.to/";
-          ori = "https://streamwish.to";
-        } else if (/voe\./.test(host)) {
-          ref = "https://voe.sx/";
-          ori = "https://voe.sx";
-        } else if (/dood/.test(host)) {
-          ref = "https://dood.li/";
-          ori = "https://dood.li";
-        } else if (/uqload/.test(host)) {
-          ref = "https://uqload.io/";
-          ori = "https://uqload.io";
-        } else if (/share4max|megamax/.test(host)) {
-          ref = "https://share4max.com/";
-          ori = "https://share4max.com";
-        } else if (/streamruby|rubyvidhub|rubystm|ruby/.test(host)) {
-          ref = "https://streamruby.com/";
-          ori = "https://streamruby.com";
-        } else if (/ok\.ru|odnoklassniki|mycdn\.me/.test(host)) {
-          ref = "https://ok.ru/";
-          ori = "https://ok.ru";
-        } else if (/videa|vidvaita|vidit/.test(host)) {
-          ref = "https://videa.hu/";
-          ori = "https://videa.hu";
-        } else if (/dailymotion|dmcdn/.test(host)) {
-          ref = "https://www.dailymotion.com/";
-          ori = "https://www.dailymotion.com";
-        } else {
-          const root = host.split(".").slice(-2).join(".");
-          ref = `https://${root}/`;
-          ori = `https://${root}`;
-        }
-        hdrs["Referer"] = ref;
-        hdrs["Origin"] = ori;
-      }
-
-      callback({ requestHeaders: hdrs });
-      } catch {
-        // Malformed URL or interceptor bug — let the request through
-        // unchanged rather than dropping it silently.
-        callback({ requestHeaders: details.requestHeaders });
-      }
-    },
-  );
-
   // Ported from mobile app (app/watch/[episode].tsx). Each provider has a
   // canonical embed origin that its CDN whitelists. mp4upload's segment
   // host (a4.mp4upload.com:183) rejects www.mp4upload.com embed-URL
@@ -1961,9 +1878,12 @@ function registerVideoProxy() {
     // Check both the CDN host AND the embed host so rotating streamwish
     // mirrors (cybervynx.com) whose CDN domain doesn't match any static
     // regex still get the mandatory streamwish.to Referer.
-    if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish/.test(host)
-        || /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish/.test(eHost)) {
-      return { referer: "https://streamwish.to/", origin: "https://streamwish.to" };
+    if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(host)
+        || /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(eHost)) {
+      // Mobile parity: the video host's registrable root, NOT streamwish.to —
+      // rotated mirrors tarpit the literal (see the onBeforeSendHeaders branch).
+      const root = host.split(".").slice(-2).join(".");
+      return { referer: `https://${root}/`, origin: `https://${root}` };
     }
     if (/voe\./.test(host)) {
       return { referer: "https://voe.sx/", origin: "https://voe.sx" };
@@ -2041,9 +1961,12 @@ function registerVideoProxy() {
     if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(target.hostname)
         || /streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(embed.hostname)) {
       return [
-        { name: "embed", headers: embedHeaders },
+        // canonical now equals the video-host root (mobile's rule and the
+        // measured-fast strategy). no-referer is the fastest fallback;
+        // embed last because the witanime gate origin tarpits.
         { name: "canonical", headers: canonicalHeaders },
-        { name: "target-self", headers: targetHeaders },
+        { name: "no-referer", headers: noRefererHeaders },
+        { name: "embed", headers: embedHeaders },
       ];
     }
 
@@ -2739,6 +2662,10 @@ app.whenReady().then(() => {
   }
   session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
     try {
+      // Scraper slot fast-path: even before the page's player fires, capture
+      // the first real .m3u8 a hidden scraper window requests (and kill its
+      // invalid-host loads). Returns false for every non-slot request.
+      if (tryFastPathRequest(details, callback)) return;
       const u = details.url;
       // Skip if this URL is being fetched BY the proxy itself — the
       // proxy operates on defaultSession too, and without this check
@@ -2873,17 +2800,15 @@ app.whenReady().then(() => {
           ori = "https://www.mp4upload.com";
           force = true;
         } else if (/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(host)) {
-          // streamwish rotates the embed mirror that mints the token, and its
-          // CDN whitelists THAT mirror's Referer — not a fixed streamwish.to.
-          // The renderer hands us the live embed origin (setVideoReferer) for
-          // the stream it's playing direct; prefer it, fall back to the literal.
-          if (currentDirectEmbedOrigin) {
-            ref = currentDirectEmbedOrigin + "/";
-            ori = currentDirectEmbedOrigin;
-          } else {
-            ref = "https://streamwish.to/";
-            ori = "https://streamwish.to";
-          }
+          // Mobile parity (videoPlaybackHeaders): streamwish-family CDNs accept
+          // the VIDEO host's registrable root (audinifer.com, vibuxer.com, …).
+          // The streamwish.to literal and a stale embed origin both trip the
+          // mirror's hotlink tarpit — measured live: 7–15s (or a 22s HLS
+          // "Initial load exceeded" stall) against 1.2s with the video-host
+          // root. This was the hgcloud "loads then stalls" cause.
+          const root = host.split(".").slice(-2).join(".");
+          ref = `https://${root}/`;
+          ori = `https://${root}`;
         } else if (/voe\./.test(host)) {
           ref = "https://voe.sx/";
           ori = "https://voe.sx";
@@ -3030,7 +2955,7 @@ app.whenReady().then(() => {
   // custom player. No ads ever load, no token race.
   ipcMain.handle("pantoufa:direct-extract", async (
     _evt,
-    opts: { provider: string; iframeUrl: string },
+    opts: { provider: string; iframeUrl: string; background?: boolean },
   ): Promise<{ url: string; type: "hls" | "mp4"; subtitles?: MediaSubtitle[]; denied?: boolean } | null> => {
     // The embed page itself may sit on a cheap TLD the ad heuristic blocks
     // (anime4up's *.shop player host) — allow it before any fetch.
@@ -3040,16 +2965,16 @@ app.whenReady().then(() => {
         return await extractDailymotion(opts.iframeUrl);
       }
       if (opts.provider === "videa") {
-        return await extractVidea(opts.iframeUrl);
+        return await extractVidea(opts.iframeUrl, opts.background);
       }
       if (opts.provider === "mega") {
         return await resolveMegaStream(opts.iframeUrl);
       }
       if (opts.provider === "streamwish") {
-        return await extractStreamwish(opts.iframeUrl);
+        return await extractStreamwish(opts.iframeUrl, opts.background);
       }
       if (opts.provider === "mp4upload") {
-        return await extractMp4upload(opts.iframeUrl);
+        return await extractMp4upload(opts.iframeUrl, opts.background);
       }
       if (opts.provider === "anime4upcdn") {
         return await extractAnime4upCdn(opts.iframeUrl);
@@ -3074,13 +2999,16 @@ app.whenReady().then(() => {
         opts.provider === "voe" ||
         opts.provider === "share4max" ||
         opts.provider === "streamruby" ||
-        opts.provider === "uqload"
+        opts.provider === "uqload" ||
+        // videas.fr embeds inline their source like streamwish; the generic
+        // static pass + capture resolves them (mobile has the same pairing).
+        opts.provider === "videas"
       ) {
         const viaHtml = await extractViaHtml(opts.iframeUrl, `extract:${opts.provider}`);
         if (viaHtml) return viaHtml;
         // voe/share4max sometimes sit behind Cloudflare → allow extra time.
         const timeout = opts.provider === "uqload" ? 25000 : 32000;
-        return await extractViaCapture(opts.iframeUrl, `extract:${opts.provider}`, timeout);
+        return await extractViaCapture(opts.iframeUrl, `extract:${opts.provider}`, timeout, opts.background);
       }
       return null;
     };
@@ -3096,6 +3024,70 @@ app.whenReady().then(() => {
     }
     return null;
   });
+
+  // Cheap liveness probe for a media URL the renderer is about to play:
+  // a Range GET of the first 2 bytes (no full download) tells it whether the
+  // URL still resolves before handing it to the <video>/hls.js player.
+  // Mobile parity: mobile probes with videoPlaybackHeaders(iframeUrl). The
+  // defaultSession onBeforeSendHeaders handler stamps a host-canonical Referer,
+  // but streamwish-family mirrors mint their token against the EMBED origin
+  // (only known to the renderer), so a failed first attempt is retried with the
+  // embed origin explicitly and the X-Pantoufa-Proxy marker, which tells that
+  // handler to leave the headers alone (same mechanism the video proxy uses).
+  ipcMain.handle("pantoufa:probe-media", async (
+    _evt,
+    opts: { url: string; iframeUrl?: string } | string,
+  ): Promise<{ ok: boolean; status: number }> => {
+    const rawUrl = typeof opts === "string" ? opts : opts?.url;
+    const iframeUrl = typeof opts === "string" ? "" : opts?.iframeUrl || "";
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const finish = (ok: boolean, status: number) => { clearTimeout(timer); return { ok, status }; };
+    try {
+      const url = new URL(String(rawUrl || ""));
+      if (url.protocol !== "http:" && url.protocol !== "https:") return finish(false, 0);
+      allowHost(url.toString());
+      const attempt = async (headers: Record<string, string>) => {
+        const res = await session.defaultSession.fetch(url.toString(), {
+          method: "GET",
+          headers,
+          signal: controller.signal,
+          redirect: "follow",
+        });
+        // Status/headers are all that's needed; cancelling the stream matters
+        // because a server that ignores Range would otherwise buffer the whole
+        // video into the main process. Fire-and-forget: a hung cancel must not
+        // hold the probe IPC open past the 8s abort.
+        void res.body?.cancel().catch(() => {});
+        return res;
+      };
+      try {
+        const res = await attempt({ Range: "bytes=0-1", Accept: "*/*" });
+        if (res.ok || res.status === 206) return finish(true, res.status);
+      } catch {}
+      if (iframeUrl) {
+        try {
+          const origin = new URL(iframeUrl).origin;
+          const res = await attempt({
+            Range: "bytes=0-1",
+            Accept: "*/*",
+            Referer: `${origin}/`,
+            Origin: origin,
+            "X-Pantoufa-Proxy": "1",
+          });
+          if (res.ok || res.status === 206) return finish(true, res.status);
+        } catch {}
+      }
+      return finish(false, 0);
+    } catch {
+      return finish(false, 0);
+    }
+  });
+
+  // A user Play-click arrived: drop every queued/in-flight background scrape
+  // (warm-ups, home/listing pre-resolves) so the priority extraction starts
+  // immediately instead of waiting behind warm-up captures.
+  ipcMain.handle("pantoufa:cancel-background-scrapes", async () => ({ cancelled: cancelBackgroundJobs() }));
 
   // Sidecar subtitle text (VTT) for the custom player. Fetched here so the
   // renderer gets a same-origin blob URL — a bare <track src> would need CORS

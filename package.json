@@ -1,6 +1,6 @@
 {
   "name": "pantoufa-desktop",
-  "version": "0.7.33",
+  "version": "0.7.34",
   "description": "Pantoufa anime desktop app — both witanime + anime4up, no backend needed.",
   "author": "techvibedz <contact@techvibedz.com>",
   "main": "dist-electron/electron/main.js",
@@ -21,7 +21,8 @@
     "release:all": "npm run build && electron-builder --win --linux --publish always",
     "ship": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1",
     "ship:dry": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1 -DryRun",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p electron/tsconfig.json"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p electron/tsconfig.json",
+    "test": "node scripts/check-host-queue.cjs && node scripts/check-provider-parity.cjs && node scripts/check-mega-stream.cjs && node scripts/test-network-fallback.cjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.105.4",

@@ -671,18 +671,21 @@ function provider(url, name) {
   // anime4up's featured servers: labeled anime4up1/anime4up2, embedded on
   // throwaway rotating *.shop hosts under a stable /Anime4up-S\d/ path.
   if (/anime4up\\s*\\d/i.test(name || '')) return 'anime4upcdn';
-  if (/anime4up-s\\d|\\/mal\\/\\d+\\/\\d+\\/(?:sub|dub)/.test(url)) return 'anime4upcdn';
+  if (/anime4up-s\\d|\\/mal\\/\\d+\\/\\d+\\/(?:sub|dub)|44y4h0r\\.shop|z4m2r9t\\.shop|k1c6x8p\\.shop/.test(url)) return 'anime4upcdn';
   if (/mp4upload/.test(url)) return 'mp4upload';
   if (/dailymotion|dai\\.ly/.test(url)) return 'dailymotion';
   if (/streamwish|hlswish|wishembed|wishfast|hgcloud|jwembed|vibuxer|audinifer|masukestin|hanerix|playerwish/.test(url)) return 'streamwish';
   if (/voe\\./.test(url)) return 'voe';
   if (/share4max|megamax/.test(url)) return 'share4max';
   if (/rubyvidhub|streamruby|rubystm|ruby/.test(url)) return 'streamruby';
-  if (/doodstream|dood\\.|dsvplay|d-s\\.io|vidply/.test(url)) return 'doodstream';
+  if (/doodstream|dood\\.|dsvplay|d-s\\.io|vidply|ds2play|ds2video|d0o0d|do0od|all3do|doply|playmogo/.test(url)) return 'doodstream';
   if (/uqload/.test(url)) return 'uqload';
-  if (/ok\\.ru/.test(url)) return 'okru';
-  if (/videa\\.|vidvaita|vidit/.test(url)) return 'videa';
+  if (/ok\\.ru|odnoklassniki/.test(url)) return 'okru';
+  if (/app\\.videas\\.fr/.test(url)) return 'videas';
+  if (/videa\\.|vidvaita|vidit|videakid/.test(url)) return 'videa';
   if (/vk\\.com/.test(url)) return 'vk';
+  if (/mega\\.(?:nz|co\\.nz)/.test(url)) return 'mega';
+  if (/vid3rb|anime3rb/.test(url)) return 'vid3rb';
   if (/luluvdo|lulustream|luluvid/.test(url)) return 'luluvdo';
   if (/yonaplay/.test(url)) return 'yonaplay';
   return 'generic';

@@ -1166,6 +1166,18 @@ export function fetchCompleteVideoServers(
 
   return completeVideoServerRequests.run(key, async () => {
     const deadline = Date.now() + 30_000;
+    // Mobile parity: mobile validates every warmed direct URL with a Range
+    // probe before marking it playable (probeMediaUrl). Desktop did not, so a
+    // dead token surfaced as "server broken" only after the user clicked. A
+    // missing probe API (older preload / test harness) or a MEGA custom-scheme
+    // URL (non-HTTP) keeps the URL. Kept nested so the mobile
+    // check-server-discovery harness — which only extracts this function —
+    // still resolves it.
+    const isReachableMedia = async (videoUrl: string, iframeUrl?: string): Promise<boolean> => {
+      if (videoUrl.startsWith("pantoufa-video:")) return true;
+      const probe = await window.pantoufa.probeMedia?.(videoUrl, iframeUrl).catch(() => null);
+      return !probe || probe.ok;
+    };
     const primaryIsUp4 = /anime4up/i.test(episodeUrl);
     const primaryIsA3rb = /anime3rb\.com\/episode\//i.test(episodeUrl);
     const episodeNumber = options.episodeNumber ?? episodeNumberFromUrl(episodeUrl);
@@ -1270,8 +1282,15 @@ export function fetchCompleteVideoServers(
       for (const server of selectWarmupServers(servers)) {
         if (warming.has(server.iframeUrl)) continue;
         warming.add(server.iframeUrl);
-        void resolveVideo(server.iframeUrl, server.provider, { fresh: !!options.force }).then((result) => {
+        void resolveVideo(server.iframeUrl, server.provider, { fresh: !!options.force, background: true }).then(async (result) => {
           if (!result.success || result.data.type === "iframe" || !validateMediaUrl(result.data.videoUrl, server.provider)) return;
+          // Warm URLs are speculative: don't surface a dead token as playable.
+          // Evict the cached resolve so a Play click re-extracts instead of
+          // replaying the dead URL for the rest of the 90s TTL.
+          if (!(await isReachableMedia(result.data.videoUrl, server.iframeUrl))) {
+            invalidateResolveCache(server.iframeUrl);
+            return;
+          }
           options.onPartial?.(completePayload([{ ...server, videoUrl: result.data.videoUrl }], {
             animeTitle: resolvedTitle, animeHref: options.animeHref || "", episodeTitle: base?.data.episodeTitle || "",
           }));
@@ -1357,12 +1376,17 @@ export function fetchCompleteVideoServers(
     let lastPlayableSignature = "";
     const resolveOne = async (server: VideoServer) => {
       const result = await withTimeout(
-        resolveVideo(server.iframeUrl, server.provider, { fresh: !!options.force && !warming.has(server.iframeUrl) }),
+        resolveVideo(server.iframeUrl, server.provider, { fresh: !!options.force && !warming.has(server.iframeUrl), background: true }),
         25_000,
         { success: false, error: "Timed out" } as ResolvePayload,
       ).catch(() => null);
       if (!result?.success || result.data.type === "iframe" || !validateMediaUrl(result.data.videoUrl, server.provider)) return;
+      if (!(await isReachableMedia(result.data.videoUrl, server.iframeUrl))) {
+        invalidateResolveCache(server.iframeUrl);
+        return;
+      }
       playable.set(server.iframeUrl, { ...server, videoUrl: result.data.videoUrl });
+      if (Date.now() > deadline) return;
       const ready = selectServerCandidates(candidates).flatMap((candidate) => {
         const hit = playable.get(candidate.iframeUrl);
         return hit ? [hit] : [];
@@ -1518,6 +1542,9 @@ export async function enrichServersFromUp4(servers: (VideoServer & { source?: st
 const CUSTOM_PLAYER_PROVIDERS = new Set([
   "voe", "share4max", "streamruby", "uqload", "okru",
   "streamwish", "doodstream", "vk", "mega",
+  // videas.fr embeds inline their source in packed JS like streamwish, so
+  // the generic static pass extracts them (mobile's extractVideas equivalent).
+  "videas",
   // anime3rb's first-party host: one static GET on the player page yields
   // direct tokenized .mp4 qualities, so extraction is near-instant and the
   // custom player is the normal path (iframe only as a last resort).
@@ -1534,8 +1561,8 @@ const CUSTOM_PLAYER_PROVIDERS = new Set([
 const EXPECT_DIRECT_PROVIDERS = new Set([...CUSTOM_PLAYER_PROVIDERS, "mp4upload", "videa", "anime4upcdn"]);
 
 type ResolvePayload = { success: true; data: { videoUrl: string; type: "hls" | "mp4" | "iframe"; subtitles?: { url: string; label?: string; lang?: string }[] } } | { success: false; error: string };
-export type ResolveVideoOptions = { fresh?: boolean; priority?: boolean };
-const resolveCache = new Map<string, { ts: number; promise: Promise<ResolvePayload> }>();
+export type ResolveVideoOptions = { fresh?: boolean; priority?: boolean; background?: boolean };
+const resolveCache = new Map<string, { ts: number; background: boolean; promise: Promise<ResolvePayload> }>();
 // 90s (was 15s): long enough that the prefetch fired when the server list
 // loads still serves the user's Play click, and that a click during a slow
 // in-flight extraction reuses that promise instead of starting a second
@@ -1550,34 +1577,44 @@ export function resolveVideo(
 ): Promise<ResolvePayload> {
   if (options.fresh) resolveCache.delete(iframeUrl);
   const hit = resolveCache.get(iframeUrl);
-  if (hit && Date.now() - hit.ts < RESOLVE_TTL) return hit.promise;
-  const promise = doResolveVideo(iframeUrl, provider).then((r) => {
+  // A foreground (user-click) resolve never reuses a background warm-up
+  // promise: cancelBackgroundScrapes may be settling that exact job, and the
+  // click must start its own priority extraction (mobile's pickServer
+  // resolves with fresh:true + priority:true). Warm-vs-warm reuse still works.
+  const reusable = hit && Date.now() - hit.ts < RESOLVE_TTL && !(hit.background && !options.background);
+  if (reusable && hit) return hit.promise;
+  // Only evict the cache when this promise is still the one stored: a stale
+  // background resolve can settle AFTER a foreground click replaced the entry
+  // (the click path deliberately supersedes background warm-ups), and an
+  // unconditional delete would throw away the fresh foreground entry.
+  const stillOwner = () => resolveCache.get(iframeUrl)?.promise === promise;
+  const promise = doResolveVideo(iframeUrl, provider, options.background).then((r) => {
     // Don't cache hard failures, nor iframe fallbacks for providers we expect
     // to extract a direct stream from: those fallbacks mean extraction missed
     // this round, and caching them makes the next resolve (prefetch → click,
     // or a manual retry) replay the stale iframe instead of re-extracting.
     const isFallback = r.success && r.data?.type === "iframe";
     if (!r.success || (isFallback && EXPECT_DIRECT_PROVIDERS.has(provider))) {
-      resolveCache.delete(iframeUrl);
+      if (stillOwner()) resolveCache.delete(iframeUrl);
     }
     return r;
-  }).catch((e) => { resolveCache.delete(iframeUrl); throw e; });
-  resolveCache.set(iframeUrl, { ts: Date.now(), promise });
+  }).catch((e) => { if (stillOwner()) resolveCache.delete(iframeUrl); throw e; });
+  resolveCache.set(iframeUrl, { ts: Date.now(), background: !!options.background, promise });
   return promise;
 }
 
 export function invalidateResolveCache(iframeUrl: string) { resolveCache.delete(iframeUrl); }
 
-async function doResolveVideo(iframeUrl: string, provider: string) {
+async function doResolveVideo(iframeUrl: string, provider: string, background = false) {
   if (provider === "mega") {
-    const direct = await window.pantoufa.directExtract?.(provider, iframeUrl).catch(() => null);
+    const direct = await window.pantoufa.directExtract?.(provider, iframeUrl, { background }).catch(() => null);
     return direct?.url && validateMediaUrl(direct.url, provider)
       ? { success: true as const, data: { videoUrl: direct.url, type: direct.type } }
       : { success: false as const, error: "Could not start MEGA native stream" };
   }
   if (provider === "dailymotion" || provider === "videa") {
     try {
-      const direct = await window.pantoufa.directExtract?.(provider, iframeUrl);
+      const direct = await window.pantoufa.directExtract?.(provider, iframeUrl, { background });
       if (direct?.url) return { success: true as const, data: { videoUrl: direct.url, type: direct.type } };
     } catch {}
     return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
@@ -1589,7 +1626,7 @@ async function doResolveVideo(iframeUrl: string, provider: string) {
   // the iframe only if extraction comes up empty.
   if (provider === "mp4upload") {
     try {
-      const direct = await window.pantoufa.directExtract?.(provider, iframeUrl);
+      const direct = await window.pantoufa.directExtract?.(provider, iframeUrl, { background });
       if (direct?.url) return { success: true as const, data: { videoUrl: direct.url, type: direct.type } };
     } catch {}
     return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
@@ -1599,7 +1636,7 @@ async function doResolveVideo(iframeUrl: string, provider: string) {
   // highest-resolution variant so playback runs at max quality.
   if (provider === "anime4upcdn") {
     try {
-      const direct = await window.pantoufa.directExtract?.(provider, iframeUrl);
+      const direct = await window.pantoufa.directExtract?.(provider, iframeUrl, { background });
       if (direct?.url) {
         return {
           success: true as const,
@@ -1624,7 +1661,7 @@ async function doResolveVideo(iframeUrl: string, provider: string) {
   // iframe so the user still gets a picture.
   if (CUSTOM_PLAYER_PROVIDERS.has(provider)) {
     try {
-      const direct = await window.pantoufa.directExtract?.(provider, iframeUrl);
+      const direct = await window.pantoufa.directExtract?.(provider, iframeUrl, { background });
       if (direct?.url) return { success: true as const, data: { videoUrl: direct.url, type: direct.type } };
     } catch {}
     return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };

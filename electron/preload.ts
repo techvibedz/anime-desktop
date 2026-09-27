@@ -61,10 +61,14 @@ contextBridge.exposeInMainWorld("pantoufa", {
   },
   setActiveIframe: (url: string | null) =>
     ipcRenderer.invoke("pantoufa:set-active-iframe", url),
-  directExtract: (provider: string, iframeUrl: string) =>
-    ipcRenderer.invoke("pantoufa:direct-extract", { provider, iframeUrl }) as Promise<
+  directExtract: (provider: string, iframeUrl: string, opts?: { background?: boolean }) =>
+    ipcRenderer.invoke("pantoufa:direct-extract", { provider, iframeUrl, background: !!opts?.background }) as Promise<
       { url: string; type: "hls" | "mp4"; subtitles?: { url: string; label?: string; lang?: string }[]; denied?: boolean } | null
     >,
+  probeMedia: (url: string, iframeUrl?: string) =>
+    ipcRenderer.invoke("pantoufa:probe-media", { url, iframeUrl }) as Promise<{ ok: boolean; status: number }>,
+  cancelBackgroundScrapes: () =>
+    ipcRenderer.invoke("pantoufa:cancel-background-scrapes") as Promise<{ cancelled: number }>,
   // Sidecar subtitle text (VTT) fetched in the main process so the renderer can
   // attach it as a same-origin blob <track> (no CDN CORS needed).
   fetchText: (url: string) => ipcRenderer.invoke("pantoufa:fetch-text", url) as Promise<string | null>,

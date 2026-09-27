@@ -94,6 +94,13 @@ const FAST_REEXTRACT_PROVIDERS = new Set([
   "vid3rb",
 ]);
 
+// Capture-based providers rotate CDN edges per extraction; some tokens land on
+// a hung edge that stalls the manifest until the 22s initial-load watchdog.
+// For these (all cheap to re-extract) a click-path Range probe turns that
+// stall into an immediate re-extract — the mobile pipeline probes warmed URLs
+// before play; this is the click-path equivalent.
+const PROBE_BEFORE_PLAY = new Set(["streamwish", "streamruby", "doodstream"]);
+
 function displayName(s: VideoServer): string {
   const n = (s.name || "").trim();
   if (!n || /^(server\s*\d*|4up\s*s\d*)$/i.test(n)) {
@@ -890,10 +897,14 @@ export function WatchPage() {
     if (prefetchedRef.current.has(srv.iframeUrl) || prefetchedRef.current.size >= 2) return;
     prefetchedRef.current.add(srv.iframeUrl);
     console.info(`[player] prefetching resolve for ${srv.provider}`);
-    resolveVideo(srv.iframeUrl, srv.provider).catch(() => {});
+    resolveVideo(srv.iframeUrl, srv.provider, { background: true }).catch(() => {});
   }, [sortedServers, activeIdx, userActivated, episodeUrl]);
 
   const activateServer = useCallback((idx: number) => {
+    // The user picked a server — drop queued background warm-up jobs so they
+    // don't hold the scraper slots ahead of this click (mobile's
+    // scraper/bus.ts _cancelBackground does the same on pickServer).
+    void window.pantoufa.cancelBackgroundScrapes?.().catch(() => {});
     activeServerUrlRef.current = sortedServers[idx]?.iframeUrl || null;
     setActiveIdx(idx);
     setUserActivated(true);
@@ -1109,6 +1120,20 @@ export function WatchPage() {
               invalidateResolveCache(resolveUrl);
               await new Promise((res) => setTimeout(res, 800));
               continue;
+            }
+            // Prove the token answers before handing it to the player; a hung
+            // edge otherwise burns the full initial-load watchdog. Only
+            // re-extracts while attempts remain — the last attempt is always
+            // accepted so a probe quirk can never block playback entirely.
+            if (gotDirect && PROBE_BEFORE_PLAY.has(srv.provider) && attempt < MAX_ATTEMPTS) {
+              const probe = await window.pantoufa.probeMedia?.(r.data.videoUrl, resolveUrl).catch(() => null);
+              if (cancelled) return;
+              if (probe && !probe.ok) {
+                console.warn(`[player] ${srv.provider}: extracted URL failed the liveness probe, re-extracting (attempt ${attempt}/${MAX_ATTEMPTS})`);
+                invalidateResolveCache(resolveUrl);
+                await new Promise((res) => setTimeout(res, 800));
+                continue;
+              }
             }
             console.info(`[player] ${srv.provider}: ${r.data.type} → ${r.data.videoUrl}`);
             setResolved({

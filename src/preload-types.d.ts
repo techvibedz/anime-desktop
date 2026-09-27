@@ -7,6 +7,7 @@ export type ScrapeJob = {
   injectAfter: string;
   timeoutMs: number;
   isVideoJob?: boolean;
+  priority?: boolean;
 };
 
 export type UpdateInfo = {
@@ -33,7 +34,10 @@ declare global {
       directExtract: (
         provider: string,
         iframeUrl: string,
+        opts?: { background?: boolean },
       ) => Promise<{ url: string; type: "hls" | "mp4"; subtitles?: { url: string; label?: string; lang?: string }[]; denied?: boolean } | null>;
+      probeMedia: (url: string, iframeUrl?: string) => Promise<{ ok: boolean; status: number }>;
+      cancelBackgroundScrapes: () => Promise<{ cancelled: number }>;
       fetchText: (url: string) => Promise<string | null>;
       fetchHtml: (
         url: string,
