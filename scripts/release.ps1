@@ -137,14 +137,21 @@ if (-not $DryRun) {
 Write-Host "`n[4/4] Creating GitHub release & uploading assets…" -ForegroundColor Yellow
 if (-not $DryRun) {
   $Release = @{ tag_name = $Tag; name = "v$Version"; body = $Body; draft = $false; prerelease = $false }
+  # Write the JSON to a file and post it with -InFile: Windows PowerShell 5.1
+  # encodes string bodies as ISO-8859-1, so any non-ASCII byte (e.g. the em
+  # dash in release notes) corrupts the JSON and GitHub answers 400 "Problems
+  # parsing JSON". Bytes on disk avoid that entirely.
+  $BodyFile = [System.IO.Path]::GetTempFileName()
+  [System.IO.File]::WriteAllText($BodyFile, ($Release | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
   try {
-    $rel = Invoke-RestMethod -Uri "$ApiBase/releases" -Method Post -Headers $ApiHeaders -Body ($Release | ConvertTo-Json -Compress) -ContentType "application/json"
+    $rel = Invoke-RestMethod -Uri "$ApiBase/releases" -Method Post -Headers $ApiHeaders -InFile $BodyFile -ContentType "application/json; charset=utf-8"
   } catch {
     if ($_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::UnprocessableEntity) {
       Write-Host "  Release $Tag already exists, using existing."
       $rel = Invoke-RestMethod -Uri "$ApiBase/releases/tags/$Tag" -Headers $ApiHeaders
-    } else { throw }
+    } else { Remove-Item $BodyFile -ErrorAction SilentlyContinue; throw }
   }
+  Remove-Item $BodyFile -ErrorAction SilentlyContinue
 
   # Upload assets
   $UploadBase = "https://uploads.github.com/repos/techvibedz/anime-desktop/releases/$($rel.id)/assets"
