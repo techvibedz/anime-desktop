@@ -3,13 +3,14 @@
 // Renderer (React) talks to us via IPC: `window.pantoufa.scrape(...)` is
 // exposed in preload.ts, which forwards to the IPC handler here.
 
-import { app, BrowserWindow, ipcMain, net, protocol, session, shell } from "electron";
+import { app, BrowserWindow, ipcMain, net, powerMonitor, protocol, session, shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 import { createDecipheriv, randomBytes } from "node:crypto";
 import https from "node:https";
 import { isIP } from "node:net";
+import { networkInterfaces } from "node:os";
 
 // Disable QUIC so Chromium falls back to TCP/HTTP2. Restrictive ISPs
 // often block or mangle QUIC (UDP/443), causing ERR_QUIC_PROTOCOL_ERROR
@@ -1670,6 +1671,156 @@ async function fetchSourceViaWorkingEdge(url: string, headers: Record<string, st
   } catch { return null; }
 }
 
+// ── Network-change recovery ──────────────────────────────────────────────
+// Chromium caches DoH answers and pools TCP/HTTP2 sockets in the shared
+// defaultSession. After the user switches networks mid-session (Wi-Fi →
+// hotspot / tethering, unplug, wake from sleep), that stale state can keep
+// every session.fetch / net.fetch path failing — the video proxy, direct
+// extraction, the wit-servers handshake, the scraper slot windows — while the
+// Node/system-DNS fallbacks (fetch-html etc.) keep working. That is exactly
+// the "some servers stop working after changing connection, until an app
+// restart" symptom. The mobile app has no shared session and re-resolves per
+// request, so it recovers on its own; this is the desktop equivalent: detect
+// the switch, flush the stale network state, and tell the renderer to drop
+// its negative caches and re-run server discovery.
+const DOH_SERVERS = [
+  "https://cloudflare-dns.com/dns-query",
+  "https://dns.google/dns-query",
+  "https://dns.quad9.net/dns-query",
+];
+
+// Virtual adapters (Hyper-V/WSL/Docker/VPN tunnels) appear and disappear with
+// no real connectivity change — counting them would reset healthy streams.
+const VIRTUAL_ADAPTER_RE = /hyper-v|vethernet|wsl|docker|vmware|virtualbox|tailscale|zerotier|wireguard|openvpn|tap-|tun\d|radmin|ngrok|loopback|bluetooth/i;
+
+async function probeDoh(): Promise<boolean> {
+  const results = await Promise.all(
+    DOH_SERVERS.map(async (server) => {
+      try {
+        const res = await fetch(`${server}?name=example.com&type=A`, {
+          headers: { accept: "application/dns-json" },
+          signal: AbortSignal.timeout(4000),
+        });
+        if (!res.ok) return false;
+        // A captive portal can answer 200 with junk — require a real record.
+        const json = (await res.json().catch(() => null)) as { Answer?: unknown[] } | null;
+        const answers = json?.Answer;
+        return Array.isArray(answers) && answers.length > 0;
+      } catch {
+        return false;
+      }
+    }),
+  );
+  return results.some(Boolean);
+}
+
+// Any HTTP answer through the OS resolver proves the system DNS + a neutral
+// host are usable (the mobile app's generate_204 probe).
+async function probeSystemResolver(): Promise<boolean> {
+  try {
+    const res = await fetch("https://www.gstatic.com/generate_204", {
+      signal: AbortSignal.timeout(4000),
+      cache: "no-store",
+    });
+    return res.ok || res.status === 204;
+  } catch {
+    return false;
+  }
+}
+
+// 'secure' has NO system-resolver fallback by design (see the DoH comment in
+// whenReady), so a network that blocks the DoH endpoints themselves (captive
+// portals, some mobile carriers) would lose ALL Chromium resolution. Re-probe
+// the endpoints through the OS resolver on every network change and fall back
+// to 'automatic' (DoH first, system resolver second — the mobile policy) ONLY
+// when DoH is unreachable AND the system resolver actually works; on a
+// DNS-blocking ISP the system fallback is the liability 'secure' exists to
+// avoid. Two consecutive probe misses are required so a transient blip right
+// after the switch can't downgrade a working network.
+let dohSyncSeq = 0;
+async function syncSecureDnsMode(reason: string): Promise<void> {
+  const seq = ++dohSyncSeq;
+  let reachable = await probeDoh();
+  if (!reachable) {
+    await new Promise((r) => setTimeout(r, 3000));
+    reachable = await probeDoh();
+  }
+  const systemWorks = reachable ? true : await probeSystemResolver();
+  // A newer reset ran while this one was probing — its decision wins.
+  if (seq !== dohSyncSeq) return;
+  const mode = reachable || !systemWorks ? "secure" : "automatic";
+  try {
+    app.configureHostResolver({ secureDnsMode: mode, secureDnsServers: DOH_SERVERS });
+    console.info(
+      `[net] DoH ${
+        reachable
+          ? "reachable → secure"
+          : systemWorks
+            ? "unreachable → automatic (system fallback)"
+            : "unreachable, no system DNS → secure (no better option)"
+      } (${reason})`,
+    );
+  } catch (e) {
+    console.warn("[net] configureHostResolver failed:", e);
+  }
+}
+
+async function resetNetworkState(reason: string): Promise<void> {
+  console.info(`[net] network change detected (${reason}) — resetting network state`);
+  // Reachable-edge IPs were resolved on the old network; re-resolve them.
+  sourceEdgeIpsPromise = null;
+  try {
+    // Close the dead sockets and flush the stale resolver before the DoH mode
+    // is re-decided — and only then tell the renderer, so its re-discovery
+    // never races a network stack that is still being reset.
+    await Promise.all([
+      session.defaultSession.clearHostResolverCache().catch(() => {}),
+      session.defaultSession.closeAllConnections().catch(() => {}),
+    ]);
+    await syncSecureDnsMode(reason);
+  } catch (e) {
+    console.warn("[net] reset failed:", e);
+  } finally {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("pantoufa:network-changed");
+    }
+  }
+}
+
+let networkSignature = "";
+let networkResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+function currentNetworkSignature(): string {
+  const addrs: string[] = [];
+  for (const [name, list] of Object.entries(networkInterfaces())) {
+    if (VIRTUAL_ADAPTER_RE.test(name)) continue;
+    for (const a of list || []) {
+      if (!a.internal && a.family === "IPv4") addrs.push(a.address);
+    }
+  }
+  return addrs.sort().join("|");
+}
+
+// Poll the non-internal IPv4 set: Chromium's own NetworkChangeNotifier does
+// not reliably fire inside Electron, which is why the stale state above used to
+// survive a connection switch. 5s poll / 2s debounce: DHCP renewals and
+// interface flaps fire bursts, a real switch resets once, after it settles.
+function watchNetworkChanges(): void {
+  networkSignature = currentNetworkSignature();
+  setInterval(() => {
+    const next = currentNetworkSignature();
+    if (next === networkSignature) return;
+    networkSignature = next;
+    if (networkResetTimer) clearTimeout(networkResetTimer);
+    networkResetTimer = setTimeout(() => void resetNetworkState("interface change"), 2000);
+  }, 5000);
+  // Sockets are dead after sleep even when the IP never changed.
+  powerMonitor.on("resume", () => {
+    if (networkResetTimer) clearTimeout(networkResetTimer);
+    networkResetTimer = setTimeout(() => void resetNetworkState("resume from sleep"), 1000);
+  });
+}
+
 // Pull the real .mp4 URL straight out of mp4upload's embed page from the
 // main process, the same way we do for dailymotion/videa/streamwish. The
 // renderer then plays it in the native <video> element via the proxy
@@ -2500,15 +2651,16 @@ app.whenReady().then(() => {
   try {
     app.configureHostResolver({
       secureDnsMode: "secure",
-      secureDnsServers: [
-        "https://cloudflare-dns.com/dns-query",
-        "https://dns.google/dns-query",
-        "https://dns.quad9.net/dns-query",
-      ],
+      secureDnsServers: DOH_SERVERS,
     });
   } catch (e) {
     console.warn("configureHostResolver failed:", e);
   }
+
+  // Watch for connection switches (Wi-Fi → hotspot, unplug, wake from sleep)
+  // and reset the shared Chromium network state when one happens — without it,
+  // stale DoH answers / dead sockets keep some servers dead until a restart.
+  watchNetworkChanges();
 
   // Offline-download playback: stream a saved .mp4 from <userData>/downloads.
   // URL shape: pantoufa-file://x/<id>. Electron's file: fetch returns the

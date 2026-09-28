@@ -24,6 +24,10 @@ export function createRequestCache<T>(ttlMs: number, now: () => number = Date.no
         return Promise.reject(error);
       }
       const tracked = loading.then((value) => {
+        // Ownership check: a clear() or a newer forced run may have superseded
+        // this entry while it was in flight — a stale completion must not
+        // repopulate the cache (e.g. invalidation after a network change).
+        if (inFlight.get(key) !== tracked) return value;
         if (!options.valid || options.valid(value)) values.set(key, { value, ts: now() });
         return value;
       }).finally(() => {
@@ -37,6 +41,10 @@ export function createRequestCache<T>(ttlMs: number, now: () => number = Date.no
     },
     clear() {
       values.clear();
+      // Also drop pending entries: an invalidation must stop new callers from
+      // receiving the stale in-flight result (whose write the guard above now
+      // also suppresses).
+      inFlight.clear();
     },
   };
 }

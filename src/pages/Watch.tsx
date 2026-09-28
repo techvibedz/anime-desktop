@@ -5,7 +5,7 @@ import {
   fetchVideoServers, fetchCompleteVideoServers, enrichServersFromUp4, resolveVideo, fetchEpisodes, fetchEpisodesUp4,
   resolveUp4EpisodeUrl, fetchAnime3rbServers, fetchAnime3rbServersByUrl,
   isDefinitiveMiss, clearDefinitiveMiss,
-  invalidateServersCache, invalidateResolveCache,
+  invalidateServersCache, invalidateResolveCache, invalidateNetworkCaches,
   type VideoServer, type Episode,
 } from "../lib/api";
 import {
@@ -660,6 +660,23 @@ export function WatchPage() {
     if (directUp4RetryTimer.current) { clearTimeout(directUp4RetryTimer.current); directUp4RetryTimer.current = null; }
     setRetryServersNonce((n) => n + 1);
   }, [episodeUrl, titleParam, meta.animeTitle, animeTitleFromDetail, slugTitle]);
+
+  // Connection switched (Wi-Fi ↔ hotspot, wake from sleep): the main process
+  // has already flushed Chromium's resolver/socket state and re-checked DoH.
+  // Drop this session's negative/empty network caches, then re-run discovery
+  // when nothing is playing, so a server that failed during the swap comes
+  // back without an app restart. Mid-playback we only clear the broken marks
+  // — re-running discovery would tear down the stream; if it died from the
+  // swap, the player's own error path re-extracts against the reset network.
+  useEffect(() => {
+    const off = window.pantoufa.onNetworkChanged?.(() => {
+      console.info("[player] network changed — invalidating caches");
+      invalidateNetworkCaches();
+      if (status === "playing") setBrokenIds(new Set());
+      else refreshServers();
+    });
+    return off;
+  }, [refreshServers, status]);
 
   // Merge anime4up servers once an anime4up URL is known (explicit ?up4=
   // or resolved cross-source). Runs CONCURRENTLY with the primary witanime

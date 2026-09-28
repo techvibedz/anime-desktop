@@ -1,6 +1,7 @@
 import { Routes, Route, Navigate, useLocation, useNavigate } from "react-router-dom";
 import { lazy, Suspense, useEffect } from "react";
 import { useAuth } from "./lib/auth";
+import { invalidateNetworkCaches } from "./lib/api";
 import { pullFavoritesFromCloud } from "./lib/favorites";
 import { pullHistoryFromCloud } from "./lib/history";
 import { pullCompletionFromCloud, CompletionProvider } from "./lib/completion";
@@ -54,6 +55,16 @@ export default function App() {
       pullCompletionFromCloud().catch(() => {});
     }
   }, [user?.id]);
+
+  // Connection switched: the main process already flushed Chromium's network
+  // state. Drop the renderer's negative/empty scrape caches even when the
+  // watch screen is not mounted, so a source first queried during the outage
+  // isn't remembered as empty; the watch screen's own listener re-runs
+  // discovery on top of this.
+  useEffect(() => {
+    const off = window.pantoufa.onNetworkChanged?.(() => invalidateNetworkCaches());
+    return off;
+  }, []);
 
   if (!ready) {
     return (

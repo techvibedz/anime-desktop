@@ -81,6 +81,12 @@ async function doFetchCandidates(title: string): Promise<any[]> {
 
 const altTitlesCache = new Map<string, string[]>();
 
+/** Drop every memoized result (including the [] misses cached during a network
+ *  outage) so the next lookup re-queries Jikan. Called on network change. */
+export function clearAltTitlesCache(): void {
+  altTitlesCache.clear();
+}
+
 /** Alternative names (romaji / English / Japanese / synonyms) for the best
  * Jikan match of `query`, most-canonical first. Empty array on any miss. */
 export async function getAltTitles(query: string): Promise<string[]> {

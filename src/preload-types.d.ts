@@ -28,6 +28,7 @@ declare global {
       onUpdateError: (handler: (info: { message: string }) => void) => () => void;
       onVideoCaptured: (handler: (info: { url: string }) => void) => () => void;
       setMuted: (muted: boolean) => Promise<boolean>;
+      onNetworkChanged: (handler: () => void) => () => void;
       onIframeFailed: (handler: (info: { url: string }) => void) => () => void;
       onFullscreenChanged: (handler: (fullscreen: boolean) => void) => () => void;
       setActiveIframe: (url: string | null) => Promise<void>;

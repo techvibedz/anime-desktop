@@ -171,6 +171,13 @@ export type AnimeYearType = { year: number | null; isMovie: boolean | null };
 const YT_CACHE_PREFIX = "@anime_yt_v1:";
 const YT_TTL = 7 * 24 * 60 * 60 * 1000;
 const ytMem = new Map<string, AnimeYearType>();
+
+/** Drop memoized year/format results (including the null misses cached during
+ *  a network outage) so the next lookup re-queries AniList. Called on network
+ *  change — a frozen miss disables anime3rb's old-vs-new disambiguation. */
+export function clearAnimeYearTypeCache(): void {
+  ytMem.clear();
+}
 const YEAR_TYPE_QUERY = `query ($s: String) { Page(perPage: 5) { media(search: $s, type: ANIME) { title { romaji english } seasonYear format } } }`;
 
 export async function getAnimeYearType(title: string): Promise<AnimeYearType> {

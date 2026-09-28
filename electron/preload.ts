@@ -49,6 +49,13 @@ contextBridge.exposeInMainWorld("pantoufa", {
     return () => ipcRenderer.removeListener("pantoufa:video-captured", listener);
   },
   setMuted: (muted: boolean) => ipcRenderer.invoke("pantoufa:set-muted", muted),
+  // Main process detected a connection switch and reset Chromium's network
+  // state; the renderer should drop its negative caches and retry discovery.
+  onNetworkChanged: (handler: () => void) => {
+    const listener = () => handler();
+    ipcRenderer.on("pantoufa:network-changed", listener);
+    return () => ipcRenderer.removeListener("pantoufa:network-changed", listener);
+  },
   onIframeFailed: (handler: (info: { url: string }) => void) => {
     const listener = (_evt: unknown, info: { url: string }) => handler(info);
     ipcRenderer.on("pantoufa:iframe-failed", listener);

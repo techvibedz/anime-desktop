@@ -30,8 +30,8 @@ import {
   tm_seasonNum,
   type RawServer,
 } from "./scraper";
-import { getAltTitles } from "./altTitles";
-import { getAnimeYearType } from "./airing";
+import { getAltTitles, clearAltTitlesCache } from "./altTitles";
+import { getAnimeYearType, clearAnimeYearTypeCache } from "./airing";
 import { animeTitleKey } from "./history";
 import { createRequestCache, withTimeout } from "./requestCache";
 import {
@@ -1604,6 +1604,27 @@ export function resolveVideo(
 }
 
 export function invalidateResolveCache(iframeUrl: string) { resolveCache.delete(iframeUrl); }
+
+/** Called when the main process reports a network change: drop every
+ *  session-scoped cache that can hold an empty/negative result produced while
+ *  the connection was down. Without this, a source first queried during the
+ *  outage stays remembered as "has nothing" for the rest of the session (the
+ *  null promise memos below are never invalidated), so its servers never come
+ *  back until the app restarts. Successful-only caches are left alone — their
+ *  URLs stay valid across networks.
+ */
+export function invalidateNetworkCaches(): void {
+  serversCache.clear();
+  completeVideoServerRequests.clear();
+  resolveCache.clear();
+  a3rbServersMem.clear();
+  a3rbBridgeTried.clear();
+  definitiveMiss.clear();
+  witAnimeUrlCache.clear();
+  up4AnimeUrlCache.clear();
+  clearAltTitlesCache();
+  clearAnimeYearTypeCache();
+}
 
 async function doResolveVideo(iframeUrl: string, provider: string, background = false) {
   if (provider === "mega") {
