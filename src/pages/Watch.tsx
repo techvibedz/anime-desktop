@@ -345,6 +345,18 @@ export function WatchPage() {
 
   const serverDiscoveryGuardRef = useRef(createGenerationGuard());
   const activeServerUrlRef = useRef<string | null>(null);
+  // Latest-value views of the discovery state for callbacks whose identity
+  // must stay stable while playback runs. `sortedServers` gets a fresh array
+  // on every discovery emission (late sources stream in during playback), so
+  // callbacks that close over it directly changed identity constantly —
+  // re-running the resolve/wiring effects and visibly reloading the video
+  // mid-watch for no user-visible reason.
+  const sortedServersRef = useRef(sortedServers);
+  useEffect(() => { sortedServersRef.current = sortedServers; }, [sortedServers]);
+  const activeIdxRef = useRef(activeIdx);
+  useEffect(() => { activeIdxRef.current = activeIdx; }, [activeIdx]);
+  const brokenIdsRef = useRef(brokenIds);
+  useEffect(() => { brokenIdsRef.current = brokenIds; }, [brokenIds]);
 
   // Mobile-parity discovery: WitAnime, Anime4up, and Anime3rb start together,
   // candidates appear as each source answers, and direct streams are warmed in
@@ -394,6 +406,10 @@ export function WatchPage() {
       if (imgParam) setPosterFromDetail(imgParam);
       setStatus("resolving");
       setLoadingServers(false);
+      // The resolve effect is activation-keyed; a "Refresh servers" click
+      // re-runs this branch and resets resolved/status, so bump the counter to
+      // re-wire the local file — otherwise the refresh leaves a dead spinner.
+      setRetryNonce((n) => n + 1);
       return () => { serverDiscoveryGuardRef.current.next(); };
     }
     console.info(`[player] discovering all sources for episode: ${episodeUrl}`);
@@ -922,7 +938,7 @@ export function WatchPage() {
     // don't hold the scraper slots ahead of this click (mobile's
     // scraper/bus.ts _cancelBackground does the same on pickServer).
     void window.pantoufa.cancelBackgroundScrapes?.().catch(() => {});
-    activeServerUrlRef.current = sortedServers[idx]?.iframeUrl || null;
+    activeServerUrlRef.current = sortedServersRef.current[idx]?.iframeUrl || null;
     setActiveIdx(idx);
     setUserActivated(true);
     setResolved(null);
@@ -931,7 +947,7 @@ export function WatchPage() {
     reextractCount.current = 0;
     iframeFailedRef.current = false;
     setIframeLoaded(false);
-  }, [sortedServers]);
+  }, []);
 
   // Slow-connection quality step-down. The anime3rb qualities are separate
   // servers over fixed-bitrate progressive MP4s — no ABR exists, so when the
@@ -942,23 +958,25 @@ export function WatchPage() {
   // position across the switch (saved progress only lands every 10s).
   const stepDownSeekRef = useRef(0);
   const stepDownQuality = useCallback((): boolean => {
-    if (activeIdx === null) return false;
-    const cur = sortedServers[activeIdx];
+    const idx = activeIdxRef.current;
+    if (idx === null) return false;
+    const list = sortedServersRef.current;
+    const cur = list[idx];
     if (!cur || cur.provider !== "vid3rb") return false;
     const curRes = resOf(cur.name);
     if (!curRes) return false;
     let best = -1, bestRes = 0;
-    sortedServers.forEach((s, i) => {
-      if (s.provider !== "vid3rb" || brokenIds.has(s.id)) return;
+    list.forEach((s, i) => {
+      if (s.provider !== "vid3rb" || brokenIdsRef.current.has(s.id)) return;
       const r = resOf(s.name);
       if (r > 0 && r < curRes && r > bestRes) { best = i; bestRes = r; }
     });
     if (best === -1) return false;
-    console.warn(`[player] ${cur.name} keeps rebuffering — stepping down to ${sortedServers[best].name}`);
+    console.warn(`[player] ${cur.name} keeps rebuffering — stepping down to ${list[best].name}`);
     stepDownSeekRef.current = videoRef.current?.currentTime || 0;
     activateServer(best);
     return true;
-  }, [activeIdx, sortedServers, brokenIds, activateServer]);
+  }, [activateServer]);
 
   // Auto-activate for party clients (auto=1) and autoplay hops — skip the
   // click-to-start gate so the client plays immediately and syncs to the host.
@@ -967,11 +985,12 @@ export function WatchPage() {
   }, [autoStart, userActivated, activeIdx, activateServer]);
 
   const advanceToNext = useCallback(() => {
-    if (activeIdx === null) return;
-    const failedId = sortedServers[activeIdx]?.id;
+    const idx = activeIdxRef.current;
+    if (idx === null) return;
+    const failedId = sortedServersRef.current[idx]?.id;
     if (failedId) setBrokenIds((prev) => new Set(prev).add(failedId));
     setStatus("failed");
-  }, [activeIdx, sortedServers]);
+  }, []);
 
   // A failed server used to leave the player stopped on a "failed" state until
   // the user manually picked another one. Auto-switch to the next non-broken
@@ -1056,11 +1075,19 @@ export function WatchPage() {
 
   // Resolve the active server only after user clicks (lazy-load to prevent
   // tokenized stream URLs from expiring while the user is reading the page).
+  // Deliberately depends on the activation counter (every act of picking a
+  // server / re-extract bumps it), NOT on `sortedServers`/`activeIdx` — a late
+  // discovery emission used to re-run this effect mid-playback, which nulled
+  // `resolved`, unmounted the player, re-resolved and re-seeked: the video
+  // "reloaded by itself" while watching. Selection is tracked by
+  // `activeServerUrlRef` so list reordering can't switch the stream either.
   useEffect(() => {
     if (!userActivated) return;
-    if (activeIdx === null || !sortedServers[activeIdx]) return;
-    const srv = sortedServers.find((server) => server.iframeUrl === activeServerUrlRef.current)
-      || sortedServers[activeIdx];
+    const list = sortedServersRef.current;
+    const idx = activeIdxRef.current;
+    if (idx === null || !list[idx]) return;
+    const srv = list.find((server) => server.iframeUrl === activeServerUrlRef.current)
+      || list[idx];
     let cancelled = false;
     setResolved(null);
     setStatus("resolving");
@@ -1188,7 +1215,7 @@ export function WatchPage() {
     })();
 
     return () => { cancelled = true; };
-  }, [activeIdx, sortedServers, advanceToNext, retryNonce, refreshA3rbPlayerUrl]);
+  }, [userActivated, retryNonce, refreshA3rbPlayerUrl, advanceToNext]);
 
   // Mark the embed we're capturing for once the iframe is rendering.
   // The captured-URL listener uses this to ignore stale captures from
@@ -1312,14 +1339,23 @@ export function WatchPage() {
     });
   }, [advanceToNext]);
 
+  // Primitive views of the resolved stream for the wiring effect. Depending
+  // on the `resolved` OBJECT re-ran the effect when a sidecar subtitle track
+  // attached mid-playback (same URL, same bytes, new object) — which destroyed
+  // the engine, reloaded the stream and seeked back to the last 10s progress
+  // mark. Same for the stable callbacks below.
+  const resolvedUrl = resolved?.url;
+  const resolvedType = resolved?.type;
+  const resolvedEmbed = resolved?.embed;
+
   // Wire HLS / direct mp4 + stall watchdog. Skip when an iframe is
   // rendering — the provider's own player handles itself.
   useEffect(() => {
-    if (!resolved || !videoRef.current) return;
-    if (resolved.type === "dailymotion" || resolved.type === "iframe") return;
+    if (!resolvedUrl || !resolvedType || !videoRef.current) return;
+    if (resolvedType === "dailymotion" || resolvedType === "iframe") return;
     const v = videoRef.current;
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
-    const proxied = proxify(resolved.url, resolved.embed);
+    const proxied = proxify(resolvedUrl, resolvedEmbed || resolvedUrl);
     // Reset re-extract gate for the new stream — covers both HLS and
     // mp4 paths so the second error path also has a recovery shot.
     reextractUsedRef.current = false;
@@ -1376,7 +1412,7 @@ export function WatchPage() {
     // step-down target, and its dead qualities fail FAST (zero bytes, no
     // metadata) rather than dripping — so give them a shorter no-data window
     // before stepping down instead of waiting out the deadline.
-    const isVid3rbStream = /vid3rb\.com/i.test(resolved.url);
+    const isVid3rbStream = /vid3rb\.com/i.test(resolvedUrl);
     const startDeadlineMs = isVid3rbStream ? 10000 : INITIAL_LOAD_DEADLINE_MS;
     const noDataLimitMs = isVid3rbStream ? 10000 : STALL_THRESHOLD_MS;
     const metadataDeadlineMs = isVid3rbStream ? 60000 : 45000;
@@ -1429,7 +1465,7 @@ export function WatchPage() {
           return;
         }
         console.warn(`[player] Initial load exceeded ${INITIAL_LOAD_DEADLINE_MS}ms with no buffer growth — advancing`);
-        triggerReextract(`${resolved.type.toUpperCase()} initial load timed out`);
+        triggerReextract(`${resolvedType.toUpperCase()} initial load timed out`);
         return;
       }
 
@@ -1457,7 +1493,7 @@ export function WatchPage() {
           if (isBufferingMidStream && inPlaceRecoveries < MAX_INPLACE_RECOVERIES) {
             inPlaceRecoveries++;
             const pos = v.currentTime;
-            if (resolved.type === "hls" && hlsRef.current) {
+            if (resolvedType === "hls" && hlsRef.current) {
               console.warn(`[player] mid-stream HLS stall ${elapsed}ms — flush + reload #${inPlaceRecoveries} @ ${pos.toFixed(1)}s`);
               // A bare startLoad() resumes from hls.js's internal load pointer
               // and will NOT abort a fragment request that's hung inside its
@@ -1556,7 +1592,7 @@ export function WatchPage() {
     
     const interval = setInterval(checkStall, 1000);
 
-    if (resolved.type === "hls" && Hls.isSupported()) {
+    if (resolvedType === "hls" && Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: false,
@@ -1618,7 +1654,7 @@ export function WatchPage() {
       let networkRecoveryCount = 0;
       // Tell main which embed mirror minted this stream's token — streamwish
       // rotates mirrors and its CDN whitelists that mirror's Referer.
-      window.pantoufa?.setVideoReferer?.(resolved.embed);
+      window.pantoufa?.setVideoReferer?.(resolvedEmbed || null);
       // Direct first (mobile parity); fall back to the main-process proxy ONCE
       // if the raw CDN rejects us before a single frame plays (wrong-mirror
       // Referer / CORS). The proxy's strategy-race + cookie sharing is the
@@ -1641,7 +1677,7 @@ export function WatchPage() {
         try { hls.startLoad(); } catch {}
         return true;
       };
-      hls.loadSource(resolved.url);
+      hls.loadSource(resolvedUrl);
       hls.attachMedia(v);
       hls.on(Hls.Events.FRAG_LOADED, () => {
         if (!played) lastTimeUpdate = Date.now();
@@ -1765,8 +1801,8 @@ export function WatchPage() {
       // vid3rb also plays direct: its signed CDN URLs answer Range requests,
       // need no Referer/cookies and aren't IP-locked (noip=yes) — while the
       // proxy would buffer the whole ~300MB file before the first byte.
-      const playsDirect = resolved.url.startsWith("pantoufa-file:") || /mp4upload|videa\.hu|vidvaita|vidit|vid3rb\.com/i.test(resolved.url);
-      v.src = playsDirect ? resolved.url : proxied;
+      const playsDirect = resolvedUrl.startsWith("pantoufa-file:") || /mp4upload|videa\.hu|vidvaita|vidit|vid3rb\.com/i.test(resolvedUrl);
+      v.src = playsDirect ? resolvedUrl : proxied;
     }
 
     return () => {
@@ -1788,11 +1824,11 @@ export function WatchPage() {
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
       try { v.removeAttribute("src"); v.load(); } catch {}
     };
-  }, [resolved, advanceToNext, stepDownQuality]);
+  }, [resolvedUrl, resolvedType, resolvedEmbed, advanceToNext, stepDownQuality]);
 
   // Resume position — wait for metadata before seeking.
   useEffect(() => {
-    if (!episodeUrl || !videoRef.current || !resolved) return;
+    if (!episodeUrl || !videoRef.current || !resolvedUrl) return;
     const v = videoRef.current;
     let cancelled = false;
 
@@ -1831,7 +1867,7 @@ export function WatchPage() {
     }
 
     return () => { cancelled = true; };
-  }, [episodeUrl, resolved]);
+  }, [episodeUrl, resolvedUrl]);
 
   // Wire video element ↔ custom-player React state
   useEffect(() => {
