@@ -10,11 +10,13 @@ import {
 } from "../lib/api";
 import {
   STREAM_BUFFER_POLICY,
+  applyAudioIntent,
   bufferAheadSeconds,
   createGenerationGuard,
   mergeVideoServers,
   sortVideoServers,
   videoContentType,
+  type AudioIntent,
 } from "../lib/videoProviders";
 import { saveProgress, getProgress } from "../lib/history";
 import { cueAt, parseVtt, type SubtitleCue } from "../lib/subtitles";
@@ -92,6 +94,10 @@ const FAST_REEXTRACT_PROVIDERS = new Set([
   "videa",
   // vid3rb resolves from one static player-page GET — also essentially free.
   "vid3rb",
+  // anime4upcdn is one static page GET plus (since the dead-edge failover) a
+  // bounded stream probe — cheap enough that an empty/denied first extraction
+  // deserves one automatic retry before the server is marked broken.
+  "anime4upcdn",
 ]);
 
 // Capture-based providers rotate CDN edges per extraction; some tokens land on
@@ -264,6 +270,11 @@ export function WatchPage() {
   const [buffered, setBuffered] = useState(0);
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
+  // The user's audio intent, independent of the media element (see
+  // applyAudioIntent). React's volume/muted state only mirrors the element, so
+  // it cannot heal a drifted mute or carry a deliberate mute across a
+  // re-extract; this ref can.
+  const userAudioIntentRef = useRef<AudioIntent>({ muted: false, volume: 1 });
   const [playbackRate, setPlaybackRate] = useState(1);
   const [showRateMenu, setShowRateMenu] = useState(false);
   const [subtitlePrefs, setSubtitlePrefs] = useState<SubtitlePrefs>(readSubtitlePrefs);
@@ -1354,6 +1365,9 @@ export function WatchPage() {
     if (!resolvedUrl || !resolvedType || !videoRef.current) return;
     if (resolvedType === "dailymotion" || resolvedType === "iframe") return;
     const v = videoRef.current;
+    // A remounted element starts unmuted at volume 1 — carry the user's audio
+    // intent over (a deliberate mute must survive a server swap).
+    applyAudioIntent(v, userAudioIntentRef.current);
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
     const proxied = proxify(resolvedUrl, resolvedEmbed || resolvedUrl);
     // Reset re-extract gate for the new stream — covers both HLS and
@@ -1553,6 +1567,13 @@ export function WatchPage() {
       hasPlayedRef.current = true;
       lastTime = v.currentTime;
       lastTimeUpdate = Date.now();
+      // Heal a mute/drift the element picked up mid-stream (anything other
+      // than the user's own controls) and leave a log so a stuck mute is
+      // diagnosable from the console instead of "the sound died".
+      const before = `${v.muted ? "muted" : "unmuted"}@${v.volume.toFixed(2)}`;
+      if (applyAudioIntent(v, userAudioIntentRef.current)) {
+        console.warn(`[player] audio drift corrected: ${before} → ${v.muted ? "muted" : "unmuted"}@${v.volume.toFixed(2)}`);
+      }
     };
 
     const onTimeUpdate = () => {
@@ -2108,10 +2129,12 @@ export function WatchPage() {
     const val = Number(e.target.value);
     v.volume = val;
     v.muted = val === 0;
+    userAudioIntentRef.current = { muted: val === 0, volume: val };
   }, []);
   const toggleMute = useCallback(() => {
     const v = videoRef.current; if (!v) return;
     v.muted = !v.muted;
+    userAudioIntentRef.current = { muted: v.muted, volume: v.volume };
   }, []);
   const setRate = useCallback((r: number) => {
     const v = videoRef.current; if (!v) return;
@@ -2139,18 +2162,28 @@ export function WatchPage() {
   // Keyboard shortcuts
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      // Never steal keys from text entry (chat, searches).
+      const target = e.target as HTMLElement | null;
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
+          || target instanceof HTMLSelectElement || target?.isContentEditable) return;
       switch (e.key) {
         case " ": case "k": e.preventDefault(); togglePlay(); showControls(); break;
         case "ArrowLeft": e.preventDefault(); skip(-10); showControls(); break;
         case "ArrowRight": e.preventDefault(); skip(10); showControls(); break;
         case "ArrowUp": {
           const v = videoRef.current; if (!v) return;
-          e.preventDefault(); v.volume = Math.min(1, v.volume + 0.1); showControls(); break;
+          e.preventDefault();
+          v.volume = Math.min(1, v.volume + 0.1);
+          if (v.muted && v.volume > 0) v.muted = false;
+          userAudioIntentRef.current = { muted: v.muted, volume: v.volume };
+          showControls(); break;
         }
         case "ArrowDown": {
           const v = videoRef.current; if (!v) return;
-          e.preventDefault(); v.volume = Math.max(0, v.volume - 0.1); showControls(); break;
+          e.preventDefault();
+          v.volume = Math.max(0, v.volume - 0.1);
+          userAudioIntentRef.current = { muted: v.muted, volume: v.volume };
+          showControls(); break;
         }
         case "m": toggleMute(); showControls(); break;
         case "f": toggleFs(); break;

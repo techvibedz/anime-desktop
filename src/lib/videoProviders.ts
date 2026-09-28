@@ -21,6 +21,26 @@ export const STREAM_BUFFER_POLICY = {
   minBufferForPlaybackSeconds: 4,
 } as const;
 
+// The user's audio intent, tracked independently of the media element. The
+// element's `muted`/`volume` can drift (browser-initiated mute, provider page
+// state, a fresh element after re-extract) and the React state is only a
+// mirror of the element, so it cannot act as the source of truth. Enforcing
+// this intent on playback start heals a stuck mute (and logs it, so the next
+// report has evidence) and keeps a deliberate user mute across server swaps.
+export type AudioIntent = { muted: boolean; volume: number };
+
+/** Push the intent onto a media element when it drifted; true if changed. */
+export function applyAudioIntent(
+  media: { muted: boolean; volume: number },
+  intent: AudioIntent,
+): boolean {
+  let changed = false;
+  if (media.muted !== intent.muted) { media.muted = intent.muted; changed = true; }
+  const volume = Math.min(1, Math.max(0, intent.volume));
+  if (media.volume !== volume) { media.volume = volume; changed = true; }
+  return changed;
+}
+
 export function createGenerationGuard() {
   let current = 0;
   return {

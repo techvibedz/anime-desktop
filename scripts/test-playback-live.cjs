@@ -17,7 +17,7 @@ app.whenReady().then(async () => {
   const scripts = require('../dist-electron/shared/scrape-scripts.js');
   const source = fs.readFileSync(path.join(__dirname, '../electron/main.ts'), 'utf8');
   const ast = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, true);
-  const names = ['extractMp4upload', 'unpackPacked', 'extractAnime4upCdn', 'fetchViaSystemDns', 'fetchSourceViaWorkingEdge', 'parseAnime4upStreamUrl', 'parseAnime4upSubtitles', 'jsonArrayAfter', 'anime4upEdgeHosts', 'allowHost'];
+  const names = ['extractMp4upload', 'unpackPacked', 'extractAnime4upCdn', 'anime4upStreamAlive', 'fetchViaSystemDns', 'fetchSourceViaWorkingEdge', 'parseAnime4upStreamUrl', 'parseAnime4upSubtitles', 'jsonArrayAfter', 'anime4upEdgeHosts', 'allowHost'];
   const declarations = [];
   const visit = (node) => {
     if (ts.isFunctionDeclaration(node) && names.includes(node.name?.text)) declarations.push(node.getText(ast));

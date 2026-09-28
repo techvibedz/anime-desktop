@@ -1494,6 +1494,44 @@ async function fetchViaSystemDns(
   }
 }
 
+// A parsed VnxPlayer master URL is only useful if its edge actually serves a
+// playlist. Measured live (2026-09): anime4up's rotating cdn1 edge answered
+// every token — including one cdn2 served fine — with 403 + a non-playlist
+// body (no #EXTM3U, no x-vnx-worker-version), while cdn2 served HLS normally.
+// The page-level refusal check never sees this, so anime4up1 "loaded" and then
+// burned the player's proxy/re-extract budget on a URL that could never play.
+// Range-probe the first bytes (site's DoH stack first, OS resolver second).
+// Tri-state: "dead" only when an edge actually ANSWERED without a playlist —
+// an unanswered probe (timeout, tarpit) is "unknown" and must not mark a
+// playable server dead.
+async function anime4upStreamAlive(streamUrl: string): Promise<"alive" | "dead" | "unknown"> {
+  const headers = { "User-Agent": PLAYBACK_UA, Accept: "*/*", Range: "bytes=0-8191" };
+  let answered = false;
+  try {
+    const res = await session.defaultSession.fetch(streamUrl, {
+      headers,
+      redirect: "follow",
+      cache: "no-store",
+      signal: AbortSignal.timeout(4000),
+    });
+    answered = true;
+    if ((res.ok || res.status === 206) && /#EXTM3U/i.test(await res.text())) return "alive";
+    return "dead";
+  } catch {}
+  try {
+    const res = await fetch(streamUrl, {
+      method: "GET",
+      headers,
+      redirect: "follow",
+      signal: AbortSignal.timeout(4000),
+    });
+    answered = true;
+    if ((res.ok || res.status === 206) && /#EXTM3U/i.test((await res.text()).replace(/\\\//g, "/"))) return "alive";
+    return "dead";
+  } catch {}
+  return answered ? "dead" : "unknown";
+}
+
 async function extractAnime4upCdn(
   iframeUrl: string,
 ): Promise<{ url: string; type: "hls"; subtitles?: MediaSubtitle[]; denied?: boolean } | null> {
@@ -1563,24 +1601,46 @@ async function extractAnime4upCdn(
     break;
   }
   let stream = parseAnime4upStreamUrl(html);
-  if (!stream && refused && siblingUrl && siblingUrl !== iframeUrl) {
+  const primaryStream = stream;
+  let streamDead = false;
+  // The stream edge can be dead independently of the page (see
+  // anime4upStreamAlive): probe it so a dead primary falls through to the
+  // sibling here instead of reaching the player and failing there. allowHost
+  // FIRST — the probe runs through the session and the rotating .shop CDN
+  // hosts are ad-blocked until allowed.
+  if (stream) {
+    allowHost(stream);
+    if ((await anime4upStreamAlive(stream)) === "dead") {
+      console.info(`[extractAnime4upCdn] stream edge not answering for ${iframeUrl}, trying sibling`);
+      stream = null;
+      streamDead = true;
+    }
+  }
+  // Only when the primary page actually loaded (refusal or a dead stream
+  // edge) — a totally unreachable site means the sibling won't answer either.
+  if (!stream && html && siblingUrl && siblingUrl !== iframeUrl) {
     allowHost(siblingUrl);
     const page = await fetchPlayerPage(siblingUrl, 8000);
     const siblingStream = page ? parseAnime4upStreamUrl(page) : null;
-    if (siblingStream) {
-      console.info(`[extractAnime4upCdn] featured server refused, sibling has it: ${siblingUrl}`);
-      html = page as string;
-      stream = siblingStream;
+    if (siblingStream && siblingStream !== primaryStream) {
+      allowHost(siblingStream);
+      // "unknown" (unanswered probe) is attempted — better than a known-dead
+      // primary; only a definitive dead answer skips it.
+      if ((await anime4upStreamAlive(siblingStream)) !== "dead") {
+        console.info(`[extractAnime4upCdn] sibling has a live stream: ${siblingUrl}`);
+        html = page as string;
+        stream = siblingStream;
+      }
     }
   }
   if (!stream) {
-    // VnxPlayer's "this domain is not authorized" page. It means THIS episode's
-    // featured server cannot play right now (anime4up's own page gets the same
-    // page for the same URL), so the caller must NOT fall back to the iframe —
-    // that would render the refusal inside the player. Report it as denied and
-    // let the player mark the server broken and switch.
-    if (refused) {
-      console.info(`[extractAnime4upCdn] VnxPlayer refused this server: ${iframeUrl}`);
+    // VnxPlayer's "this domain is not authorized" page, or a stream edge that
+    // answered nothing even through the sibling. Either way THIS server can't
+    // play right now, so the caller must NOT fall back to the iframe — that
+    // would paint the refusal / a dead player inside the app. Report it as
+    // denied and let the player mark the server broken and switch.
+    if (refused || streamDead) {
+      console.info(`[extractAnime4upCdn] no playable stream for this server: ${iframeUrl}`);
       return { url: "", type: "hls", denied: true };
     }
     return null;
@@ -2063,6 +2123,49 @@ async function extractVid3rb(
   return { url: fallback, type: /\.m3u8(\?|$)/i.test(fallback) ? "hls" : "mp4" };
 }
 
+// Open-ended Range requests must be chunked so the proxy never buffers a
+// whole 100MB+ progressive file before responding. HLS segments are the one
+// exception: they are the player's own unit of meaning (2-10MB) and capping
+// them at the 1MB first-chunk silently truncated everything bigger — hls.js's
+// xhr-loader counts the truncated window as the complete segment
+// (stats.loaded = stats.total), so the tail was dropped without an error and
+// playback stalled or garbled. Segments get one wide 32MB window (never
+// truncates a real segment, still bounds a pathological whole-file ".ts");
+// progressive media keeps the small first chunk (fast moov/first frames) then
+// 4MB steady chunks
+// (a 1MB cap on every chunk forced a fresh CDN round-trip every few seconds
+// and WAS the mid-playback stutter the tiny-cap comment warned about).
+function mediaChunkRange(
+  isLargeMedia: boolean,
+  isHlsSegment: boolean,
+  range: string | null,
+): string | null {
+  if (!isLargeMedia) return range;
+  const FIRST_CHUNK = 1 * 1024 * 1024;
+  const STEADY_CHUNK = 4 * 1024 * 1024;
+  // Real segments are a few MB — a 32MB window never truncates one, while a
+  // pathological whole-file ".ts" still gets bounded instead of buffering the
+  // entire body in the main process. A client-sent segment range is already
+  // bounded by hls.js (byte-range playlists), so leave it alone.
+  const SEGMENT_MAX = 32 * 1024 * 1024;
+  if (isHlsSegment) {
+    if (!range) return `bytes=0-${SEGMENT_MAX - 1}`;
+    return range;
+  }
+  if (!range) return `bytes=0-${FIRST_CHUNK - 1}`;
+  // bytes=START- (open-ended) → bytes=START-(START+CHUNK-1)
+  const m = range.match(/^bytes=(\d+)-(\d*)$/);
+  if (m) {
+    const start = parseInt(m[1], 10);
+    const end = m[2] ? parseInt(m[2], 10) : NaN;
+    const cap = start === 0 ? FIRST_CHUNK : STEADY_CHUNK;
+    if (!isFinite(end) || end - start > cap - 1) {
+      return `bytes=${start}-${start + cap - 1}`;
+    }
+  }
+  return range;
+}
+
 function registerVideoProxy() {
   // Ported from mobile app (app/watch/[episode].tsx). Each provider has a
   // canonical embed origin that its CDN whitelists. mp4upload's segment
@@ -2417,10 +2520,9 @@ function registerVideoProxy() {
       // Chunk open-ended Range requests so we never wait on a 100+MB
       // download before responding. For mp4 sources the browser sends
       // `Range: bytes=0-` which used to suck the whole file into RAM,
-      // causing the renderer to time out → black screen. For HLS .ts /
-      // .m4s segments we use a larger cap; for direct .mp4 playback we
-      // use a small first-chunk so the moov atom + first frames arrive
-      // fast and the user sees the picture quickly.
+      // causing the renderer to time out → black screen. For direct .mp4
+      // playback we use a small first-chunk so the moov atom + first
+      // frames arrive fast.
       const isMp4 = /\.mp4(\?|$)/i.test(target);
       const isHlsSegment = /\.(m4s|ts)(\?|$)/i.test(target);
       const isManifest = /\.(m3u8|mpd)(\?|$)/i.test(target);
@@ -2433,33 +2535,7 @@ function registerVideoProxy() {
       const lastSeg = target.split("?")[0].split("#")[0].split("/").pop() || "";
       const hasExtension = /\.[a-z0-9]{2,5}$/i.test(lastSeg);
       const isLargeMedia = isMp4 || isHlsSegment || (!isManifest && !hasExtension);
-      // Small opening chunk for fast first picture, but big chunks once
-      // playback is rolling: a 1MB cap on every request means a fresh CDN
-      // round-trip every ~2-4s of mp4, and that per-chunk latency IS the
-      // mid-playback stutter (vid3rb/anime3rb especially — its CDN answers
-      // Range fine and isn't IP-locked, so the only cost was our tiny cap).
-      // 4MB matches the proven HLS-segment cap: enough to amortize latency
-      // without the long per-chunk arrayBuffer waits (and 4-way cold-start
-      // strategy races) that made 8MB stall and fail.
-      const FIRST_CHUNK = 1 * 1024 * 1024;
-      const STEADY_CHUNK = 4 * 1024 * 1024;
-      let range = request.headers.get("range");
-      if (isLargeMedia) {
-        if (!range) {
-          range = `bytes=0-${FIRST_CHUNK - 1}`;
-        } else {
-          // bytes=START- (open-ended) → bytes=START-(START+CHUNK-1)
-          const m = range.match(/^bytes=(\d+)-(\d*)$/);
-          if (m) {
-            const start = parseInt(m[1], 10);
-            const end = m[2] ? parseInt(m[2], 10) : NaN;
-            const cap = start === 0 ? FIRST_CHUNK : STEADY_CHUNK;
-            if (!isFinite(end) || end - start > cap - 1) {
-              range = `bytes=${start}-${start + cap - 1}`;
-            }
-          }
-        }
-      }
+      const range = mediaChunkRange(isLargeMedia, isHlsSegment, request.headers.get("range"));
 
       // Progressive media is chunked, so a single transient chunk failure (a CDN
       // connection drop or one timed-out strategy race — NOT an expired token) must
