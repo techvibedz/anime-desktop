@@ -1494,6 +1494,59 @@ async function fetchViaSystemDns(
   }
 }
 
+// ── Host throttle: shared per-hostname cooldown after a rate-limit ───────
+// A burst of retries against a host that already answered 429 is what turns a
+// transient rate-limit into a long blackhole. Player-page/source fetches await
+// this cooldown before hitting the network, and record the server's own
+// Retry-After window when they get throttled.
+const hostThrottleUntil = new Map<string, number>();
+
+function hostFrom(urlOrHost: string): string {
+  try { return new URL(urlOrHost).hostname.toLowerCase(); } catch { return urlOrHost.toLowerCase(); }
+}
+
+function noteHostThrottle(host: string, retryAfterMs: number | null): void {
+  hostThrottleUntil.set(host, Date.now() + Math.min(Math.max(retryAfterMs ?? 1500, 1500), 30_000));
+}
+
+function hostCooldownRemaining(host: string): number {
+  const until = hostThrottleUntil.get(host);
+  if (!until) return 0;
+  const remaining = until - Date.now();
+  if (remaining <= 0) { hostThrottleUntil.delete(host); return 0; }
+  return remaining;
+}
+
+async function awaitHostCooldown(urlOrHost: string, capMs = 5000): Promise<void> {
+  const remaining = hostCooldownRemaining(hostFrom(urlOrHost));
+  if (remaining > 0) await new Promise((r) => setTimeout(r, Math.min(remaining, capMs)));
+}
+
+// Server-requested retry delay (Retry-After in seconds or as an HTTP-date).
+// Module-level so the extractors below can record cooldowns as well.
+function retryAfterMs(header: string | null, capMs = 10_000): number {
+  if (!header) return 0;
+  const trimmed = header.trim();
+  const seconds = Number(trimmed);
+  if (Number.isFinite(seconds) && seconds > 0) return Math.min(capMs, seconds * 1000);
+  const date = Date.parse(trimmed);
+  return Number.isFinite(date) ? Math.min(capMs, Math.max(0, date - Date.now())) : 0;
+}
+
+// Concurrent pantoufa:direct-extract calls for one provider+URL share a single
+// extraction instead of firing identical request bursts at the provider.
+const directExtractInFlight = new Map<string, Promise<{ url: string; type: "hls" | "mp4"; subtitles?: MediaSubtitle[]; denied?: boolean } | null>>();
+
+function dedupeInFlight<T>(map: Map<string, Promise<T>>, key: string, factory: () => Promise<T>): Promise<T> {
+  const existing = map.get(key);
+  if (existing) return existing;
+  const pending = factory();
+  map.set(key, pending);
+  const settle = () => { if (map.get(key) === pending) map.delete(key); };
+  pending.then(settle, settle);
+  return pending;
+}
+
 // A parsed VnxPlayer master URL is only useful if its edge actually serves a
 // playlist. Measured live (2026-09): anime4up's rotating cdn1 edge answered
 // every token — including one cdn2 served fine — with 403 + a non-playlist
@@ -1554,6 +1607,7 @@ async function extractAnime4upCdn(
   } catch {}
   allowHost(iframeUrl);
   const fetchPlayerPage = async (url: string, timeout: number): Promise<string | null> => {
+    await awaitHostCooldown(url);
     const headers = {
       "User-Agent": PLAYBACK_UA,
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1569,6 +1623,9 @@ async function extractAnime4upCdn(
         redirect: "follow",
         cache: "no-store",
       });
+      const retryAfter = retryAfterMs(resp.headers.get("retry-after"));
+      if (resp.status === 429 || (resp.status === 503 && retryAfter > 0))
+        noteHostThrottle(hostFrom(url), retryAfter);
       if (resp.ok) return (await resp.text()).replace(/\\\//g, "/");
     } catch (e) {
       console.warn(`[extractAnime4upCdn] chromium page fetch failed (${timeout}ms):`, e);
@@ -2062,6 +2119,7 @@ async function extractVid3rb(
   };
   let html: string | null = null;
   for (let attempt = 0; attempt < 2; attempt++) {
+    await awaitHostCooldown(playerUrl);
     if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
     try {
       const resp = await session.defaultSession.fetch(playerUrl, {
@@ -2072,6 +2130,9 @@ async function extractVid3rb(
         cache: "no-store",
       });
       console.info(`[extractVid3rb] GET ${playerUrl} (try ${attempt + 1}) → ${resp.status}`);
+      const retryAfter = retryAfterMs(resp.headers.get("retry-after"));
+      if (resp.status === 429 || (resp.status === 503 && retryAfter > 0))
+        noteHostThrottle(hostFrom(playerUrl), retryAfter);
       if (resp.ok) { html = await resp.text(); break; }
       // A dead player-page token answers 401/403 — retrying the same URL can
       // never help and used to burn 8s×2 plus a system-DNS attempt on every
@@ -3293,7 +3354,16 @@ app.whenReady().then(() => {
       return null;
     };
     try {
-      const result = await run();
+      // Key on `background`: a foreground click must never join a background
+      // warm-up. The click calls cancelBackgroundScrapes (which may settle
+      // that exact job as null) and needs its own priority extraction — the
+      // renderer's resolve cache enforces the same separation (api.ts,
+      // resolveVideo). Same-class duplicate calls still share one extraction.
+      const result = await dedupeInFlight(
+        directExtractInFlight,
+        `${opts.provider}|${opts.iframeUrl}|${opts.background ? "bg" : "fg"}`,
+        run,
+      );
       // Whatever host actually serves the media is legitimate — exempt it from
       // the TLD ad heuristic so the renderer's player requests aren't cancelled.
       if (result?.url) allowHost(result.url);
@@ -3553,16 +3623,6 @@ app.whenReady().then(() => {
     }
   });
 
-  // Server-requested retry delay (Retry-After in seconds or as an HTTP-date).
-  function retryAfterMs(header: string | null, capMs = 10_000): number {
-    if (!header) return 0;
-    const trimmed = header.trim();
-    const seconds = Number(trimmed);
-    if (Number.isFinite(seconds) && seconds > 0) return Math.min(capMs, seconds * 1000);
-    const date = Date.parse(trimmed);
-    return Number.isFinite(date) ? Math.min(capMs, Math.max(0, date - Date.now())) : 0;
-  }
-
   // Privileged HTML fetch from the main process (no CORS, any port). Used to
   // read anime4up episode pages directly: their server list lives in the
   // static HTML (<li data-watch>), so a plain GET is far faster and more
@@ -3595,11 +3655,13 @@ app.whenReady().then(() => {
       "Accept-Language": "ar,en;q=0.9",
       ...(opts.referer ? { Referer: opts.referer } : {}),
     };
+    await awaitHostCooldown(opts.url);
     // The normal resolver can blackhole both source sites. Use the reachable
     // edge first so title/episode lookups avoid the 8–12 second timeout.
     const viaEdge = await fetchSourceViaWorkingEdge(opts.url, sourceHeaders, PER_ATTEMPT_TIMEOUT_MS);
     if (viaEdge) return viaEdge;
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+      await awaitHostCooldown(opts.url);
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), PER_ATTEMPT_TIMEOUT_MS);
       let retryDelayMs = 600 * attempt;
@@ -3623,7 +3685,9 @@ app.whenReady().then(() => {
         // harder than the generic 600ms, otherwise the retry lands inside the
         // same rate-limit window and every attempt is wasted.
         if (res.status === 429 || res.status === 503) {
-          retryDelayMs = Math.max(retryAfterMs(res.headers.get("retry-after")), 1200 * attempt);
+          const retryAfter = retryAfterMs(res.headers.get("retry-after"));
+          if (res.status === 429 || retryAfter > 0) noteHostThrottle(hostFrom(opts.url), retryAfter);
+          retryDelayMs = Math.max(retryAfter, 1200 * attempt);
         }
       } catch {
         clearTimeout(t);

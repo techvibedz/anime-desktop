@@ -11,9 +11,13 @@ import {
 import {
   STREAM_BUFFER_POLICY,
   applyAudioIntent,
+  autoSwitchDelayMs,
   bufferAheadSeconds,
   createGenerationGuard,
   mergeVideoServers,
+  pickNextServer,
+  recoveryDelayMs,
+  serverFailureKey,
   sortVideoServers,
   videoContentType,
   type AudioIntent,
@@ -369,6 +373,25 @@ export function WatchPage() {
   const brokenIdsRef = useRef(brokenIds);
   useEffect(() => { brokenIdsRef.current = brokenIds; }, [brokenIds]);
 
+  // Auto-switch walk bookkeeping. The walk used to retry the first non-broken
+  // server every 1.2s forever — against rate-limited sources (429) that loop
+  // was itself the bug: it hammered every ~800ms-1.2s and never backed off.
+  // `autoSwitchCountRef` grows the per-switch delay (1.2s → capped 10s);
+  // `recoveryRoundRef` grows the pause before retrying the whole list once
+  // every server has failed (45s → capped 5min). Both reset the moment
+  // playback succeeds, and the recovery timer is deliberately NOT owned by the
+  // auto-advance effect's cleanup — late discovery emissions re-run that
+  // effect constantly and must not keep pushing the recovery out.
+  const autoSwitchCountRef = useRef(0);
+  const recoveryRoundRef = useRef(0);
+  const recoveryTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (status === "playing") {
+      autoSwitchCountRef.current = 0;
+      recoveryRoundRef.current = 0;
+    }
+  }, [status]);
+
   // Mobile-parity discovery: WitAnime, Anime4up, and Anime3rb start together,
   // candidates appear as each source answers, and direct streams are warmed in
   // provider/quality order. One source failing never hides the others.
@@ -384,6 +407,11 @@ export function WatchPage() {
     activeServerUrlRef.current = null;
     setActiveIdx(null);
     setBrokenIds(new Set());
+    autoSwitchCountRef.current = 0;
+    recoveryRoundRef.current = 0;
+    if (recoveryTimerRef.current) { clearTimeout(recoveryTimerRef.current); recoveryTimerRef.current = null; }
+    if (autoAdvanceTimer.current !== null) { clearTimeout(autoAdvanceTimer.current); autoAdvanceTimer.current = null; }
+    autoAdvanceTargetRef.current = null;
     setResolved(null);
     setStatus("idle");
     setUserActivated(false);
@@ -661,6 +689,9 @@ export function WatchPage() {
   // Clear any pending enrichment-retry timer on unmount.
   useEffect(() => () => {
     if (enrichRetryTimer.current) { clearTimeout(enrichRetryTimer.current); enrichRetryTimer.current = null; }
+    if (recoveryTimerRef.current) { clearTimeout(recoveryTimerRef.current); recoveryTimerRef.current = null; }
+    if (autoAdvanceTimer.current !== null) { clearTimeout(autoAdvanceTimer.current); autoAdvanceTimer.current = null; }
+    autoAdvanceTargetRef.current = null;
   }, []);
 
   // Manual "refresh servers" — re-scrape the primary list AND restart the
@@ -699,7 +730,14 @@ export function WatchPage() {
     const off = window.pantoufa.onNetworkChanged?.(() => {
       console.info("[player] network changed — invalidating caches");
       invalidateNetworkCaches();
-      if (status === "playing") setBrokenIds(new Set());
+      if (status === "playing") {
+        // Reconnected network: every "failed" verdict was collected against
+        // the dead link, so forget them (and any waiting recovery pause).
+        setBrokenIds(new Set());
+        autoSwitchCountRef.current = 0;
+        recoveryRoundRef.current = 0;
+        if (recoveryTimerRef.current) { clearTimeout(recoveryTimerRef.current); recoveryTimerRef.current = null; }
+      }
       else refreshServers();
     });
     return off;
@@ -904,7 +942,7 @@ export function WatchPage() {
   // Auto-pick the highest-ranked NON-broken server (highlight only).
   useEffect(() => {
     if (sortedServers.length === 0) return;
-    const firstGood = sortedServers.findIndex((s) => !brokenIds.has(s.id));
+    const firstGood = sortedServers.findIndex((s) => !brokenIds.has(serverFailureKey(s)));
     if (firstGood >= 0 && activeIdx === null) {
       activeServerUrlRef.current = sortedServers[firstGood].iframeUrl;
       setActiveIdx(firstGood);
@@ -949,6 +987,12 @@ export function WatchPage() {
     // don't hold the scraper slots ahead of this click (mobile's
     // scraper/bus.ts _cancelBackground does the same on pickServer).
     void window.pantoufa.cancelBackgroundScrapes?.().catch(() => {});
+    // Any (re)activation supersedes a waiting full-list recovery retry and a
+    // scheduled auto-switch — a manual pick must never be overridden by a
+    // timer that was already in flight.
+    if (recoveryTimerRef.current) { clearTimeout(recoveryTimerRef.current); recoveryTimerRef.current = null; }
+    if (autoAdvanceTimer.current !== null) { clearTimeout(autoAdvanceTimer.current); autoAdvanceTimer.current = null; }
+    autoAdvanceTargetRef.current = null;
     activeServerUrlRef.current = sortedServersRef.current[idx]?.iframeUrl || null;
     setActiveIdx(idx);
     setUserActivated(true);
@@ -978,7 +1022,7 @@ export function WatchPage() {
     if (!curRes) return false;
     let best = -1, bestRes = 0;
     list.forEach((s, i) => {
-      if (s.provider !== "vid3rb" || brokenIdsRef.current.has(s.id)) return;
+      if (s.provider !== "vid3rb" || brokenIdsRef.current.has(serverFailureKey(s))) return;
       const r = resOf(s.name);
       if (r > 0 && r < curRes && r > bestRes) { best = i; bestRes = r; }
     });
@@ -996,10 +1040,20 @@ export function WatchPage() {
   }, [autoStart, userActivated, activeIdx, activateServer]);
 
   const advanceToNext = useCallback(() => {
-    const idx = activeIdxRef.current;
-    if (idx === null) return;
-    const failedId = sortedServersRef.current[idx]?.id;
-    if (failedId) setBrokenIds((prev) => new Set(prev).add(failedId));
+    const list = sortedServersRef.current;
+    // The failure belongs to the server the resolve effect actually selected
+    // (tracked by URL); the index can have drifted when a late discovery
+    // emission inserted a row. Marking the wrong row left the failing server
+    // eligible and the walk looped back onto it.
+    const failed = list.find((s) => s.iframeUrl === activeServerUrlRef.current)
+      || list[activeIdxRef.current ?? -1];
+    if (failed) {
+      const key = serverFailureKey(failed);
+      // Count consecutive failures (not scheduling churn): the walk's backoff
+      // uses this, so it only grows when a server genuinely failed.
+      if (!brokenIdsRef.current.has(key)) autoSwitchCountRef.current += 1;
+      setBrokenIds((prev) => (prev.has(key) ? prev : new Set(prev).add(key)));
+    }
     setStatus("failed");
   }, []);
 
@@ -1007,24 +1061,61 @@ export function WatchPage() {
   // the user manually picked another one. Auto-switch to the next non-broken
   // server (mobile parity) after a short beat so a failure reads as a switch,
   // not a dead end.
+  //
+  // Bounded walk: servers are remembered as broken by `serverFailureKey`
+  // (stable across merge re-iding and vid3rb token refreshes), the walk never
+  // reselects the current server, each consecutive failure doubles the wait
+  // (capped), and when EVERY server is broken we stop entirely and retry the
+  // whole list on a much longer, growing timer. Before this, a rate-limited
+  // source (429) was hammered every ~800ms-1.2s indefinitely.
   const autoAdvanceTimer = useRef<number | null>(null);
+  // The switch decision the pending timer encodes. Discovery re-runs this
+  // effect constantly while late sources stream in; without remembering the
+  // target, every emission reset the timer and once the backoff delay grew
+  // past the emission interval the switch could be starved for minutes. Same
+  // target = same decision = let the scheduled timer run out.
+  const autoAdvanceTargetRef = useRef<string | null>(null);
   useEffect(() => {
-    if (status !== "failed" || !userActivated) return;
-    const next = sortedServers.findIndex((s) => !brokenIds.has(s.id));
-    if (next < 0) return;
-    if (autoAdvanceTimer.current) clearTimeout(autoAdvanceTimer.current);
-    autoAdvanceTimer.current = window.setTimeout(() => {
-      autoAdvanceTimer.current = null;
-      console.info(`[player] server failed — auto-switching to ${sortedServers[next]?.name}`);
-      activateServer(next);
-    }, 1200);
-    return () => {
-      if (autoAdvanceTimer.current) {
+    const clearPendingAdvance = () => {
+      if (autoAdvanceTimer.current !== null) {
         clearTimeout(autoAdvanceTimer.current);
         autoAdvanceTimer.current = null;
       }
+      autoAdvanceTargetRef.current = null;
     };
-  }, [status, userActivated, sortedServers, brokenIds, activateServer]);
+    if (status !== "failed" || !userActivated || isOffline) { clearPendingAdvance(); return; }
+    const next = pickNextServer(sortedServers, brokenIds, activeServerUrlRef.current);
+    if (next < 0) {
+      clearPendingAdvance();
+      if (recoveryTimerRef.current) return;
+      const delay = recoveryDelayMs(recoveryRoundRef.current);
+      recoveryRoundRef.current += 1;
+      console.info(`[player] every server failed — retrying the full list in ${Math.round(delay / 1000)}s`);
+      recoveryTimerRef.current = window.setTimeout(() => {
+        recoveryTimerRef.current = null;
+        if (unmountedRef.current) return;
+        setBrokenIds(new Set());
+        if (sortedServersRef.current.length > 0) activateServer(0);
+      }, delay);
+      return;
+    }
+    // A real candidate exists again (new discovery emission) — drop any
+    // pending full-list recovery and switch to it normally.
+    if (recoveryTimerRef.current) { clearTimeout(recoveryTimerRef.current); recoveryTimerRef.current = null; }
+    const targetUrl = sortedServers[next]?.iframeUrl ?? null;
+    if (autoAdvanceTargetRef.current === targetUrl && autoAdvanceTimer.current !== null) return;
+    clearPendingAdvance();
+    const delay = autoSwitchDelayMs(autoSwitchCountRef.current);
+    autoAdvanceTargetRef.current = targetUrl;
+    autoAdvanceTimer.current = window.setTimeout(() => {
+      autoAdvanceTimer.current = null;
+      autoAdvanceTargetRef.current = null;
+      const idx = sortedServersRef.current.findIndex((server) => server.iframeUrl === targetUrl);
+      if (idx < 0) return;
+      console.info(`[player] server failed — auto-switching to ${sortedServersRef.current[idx]?.name}`);
+      activateServer(idx);
+    }, delay);
+  }, [status, userActivated, sortedServers, brokenIds, activateServer, isOffline]);
 
   // Fast advance when iframe fails to load (did-fail-load in main process).
   // Fires within ~1s vs the iframe onError which takes ~5s on some platforms.
@@ -2200,7 +2291,7 @@ export function WatchPage() {
   }, [togglePlay, skip, toggleMute, toggleFs, showControls]);
 
   const active = activeIdx !== null ? sortedServers[activeIdx] : null;
-  const allBroken = sortedServers.length > 0 && sortedServers.every((s) => brokenIds.has(s.id));
+  const allBroken = sortedServers.length > 0 && sortedServers.every((s) => brokenIds.has(serverFailureKey(s)));
   const animeTitle = meta.animeTitle || animeTitleFromDetail;
   // We expect anime4up servers (cross-source) but haven't landed any yet and
   // the retry loop hasn't given up — show a subtle "still searching" hint so
@@ -2825,12 +2916,14 @@ export function WatchPage() {
         ) : (
           <div className="flex flex-wrap gap-2">
             {sortedServers.map((s, i) => {
-              const broken = brokenIds.has(s.id);
+              const broken = brokenIds.has(serverFailureKey(s));
               return (
                 <button
                   key={s.id}
                   onClick={() => {
-                    if (broken) setBrokenIds((prev) => { const c = new Set(prev); c.delete(s.id); return c; });
+                    if (broken) setBrokenIds((prev) => { const c = new Set(prev); c.delete(serverFailureKey(s)); return c; });
+                    // Manual pick: give the walk a fresh backoff budget.
+                    autoSwitchCountRef.current = 0;
                     activateServer(i);
                   }}
                   className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition ${

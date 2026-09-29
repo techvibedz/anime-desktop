@@ -37,6 +37,9 @@ function run(source, context) {
     } } },
     fetchViaSystemDns: async () => { fallbackCalls++; return playerHtml; },
     PLAYBACK_UA: 'test', AbortSignal, setTimeout, console, URL,
+    // main.ts host-throttle helper, defined outside the extracted slice; the
+    // throttle behavior itself is exercised by check-host-throttle.cjs.
+    awaitHostCooldown: async () => {},
   };
   run(`${fn}\nglobalThis.extractVid3rb = extractVid3rb;`, playerContext);
   const result = await playerContext.extractVid3rb('https://video.vid3rb.com/player/test#vid3rb=720');
@@ -54,6 +57,7 @@ function run(source, context) {
     } } },
     fetchViaSystemDns: async () => { fallbackCalls2++; return playerHtml; },
     PLAYBACK_UA: 'test', AbortSignal, setTimeout, console, URL,
+    awaitHostCooldown: async () => {},
   };
   run(`${fn}\nglobalThis.extractVid3rb = extractVid3rb;`, dead720Context);
   const fallbackResult = await dead720Context.extractVid3rb('https://video.vid3rb.com/player/test#vid3rb=720');

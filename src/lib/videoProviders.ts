@@ -277,6 +277,59 @@ function serverDedupeKey(raw: string): string {
   }
 }
 
+// Volatile params a provider re-issues on refresh (vid3rb signs its player URL
+// with a token+expiry that the re-extract path swaps in place). They are NOT
+// server identity — two URLs that differ only in these are the same server.
+const VOLATILE_SERVER_PARAMS = ["token", "expires", "expiry", "md5", "speed", "sig", "signature"];
+
+// Failure-tracking identity. MUST agree with the identity `mergeVideoServers`
+// dedupes on (`serverDedupeKey`): re-emissions can flip the URL between
+// equivalent forms (trailing slash, junk hash) and the merge keeps whichever
+// form arrived first, so a mark made against one form has to catch the other —
+// otherwise a just-failed server becomes eligible again on re-emission and the
+// walk ping-pongs (the 429 "auto-switching" loop this exists to kill). Same
+// normalization as serverDedupeKey (trailing slash stripped, non-vid3rb hash
+// dropped — `#vid3rb=<res>` stays, each quality is its own row) plus volatile
+// query-param stripping. Provider intentionally NOT part of the key: the merge
+// identity is the URL, and a re-emission can re-classify the provider.
+export function serverFailureKey(server: { provider: string; iframeUrl: string }): string {
+  try {
+    const url = new URL(server.iframeUrl);
+    if (!/^#vid3rb=\d+$/i.test(url.hash)) url.hash = "";
+    if (url.pathname.length > 1) url.pathname = url.pathname.replace(/\/+$/, "");
+    for (const param of VOLATILE_SERVER_PARAMS) url.searchParams.delete(param);
+    return `${url.hostname}${url.pathname}${url.search}${url.hash}`;
+  } catch {
+    return server.iframeUrl;
+  }
+}
+
+// First server that neither failed before nor is the one we are already on.
+// Skipping the active URL matters when a failure arrives without a mark (the
+// offline <video> error path sets "failed" but marks nothing): without the
+// skip the walk re-selects the same row every lap.
+export function pickNextServer<T extends { provider: string; iframeUrl: string }>(
+  servers: readonly T[],
+  brokenKeys: ReadonlySet<string>,
+  activeUrl: string | null,
+): number {
+  return servers.findIndex((s) => !brokenKeys.has(serverFailureKey(s)) && s.iframeUrl !== activeUrl);
+}
+
+// Auto-switch backoff: the wait doubles per consecutive failed server
+// (1.2s → 2.4s → 4.8s → 9.6s cap) so a rate-limited source sees at most one
+// request burst per lap instead of a hammering loop.
+export function autoSwitchDelayMs(consecutiveFailures: number): number {
+  return Math.min(1_200 * 2 ** Math.min(Math.max(consecutiveFailures - 1, 0), 3), 10_000);
+}
+
+// Full-list recovery wait, growing per failed walk (45s → 90s → 180s → 300s
+// cap) — after every server failed, the source is very likely rate-limiting
+// us and an instant lap would just burn another round.
+export function recoveryDelayMs(round: number): number {
+  return Math.min(45_000 * 2 ** Math.min(Math.max(round, 0), 3), 300_000);
+}
+
 const MEDIA_DECOY_RE =
   /test-videos\.co\.uk|bigbuckbunny|sample[-_.]|placeholder|tos\.mp4|googleapis\.com\/.*oggtheora|\/lol\/file\.mp4|doubleclick|adserv|\/vast|preroll|\/ads\//i;
 
