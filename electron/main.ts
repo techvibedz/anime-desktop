@@ -772,6 +772,9 @@ async function extractDailymotion(
 
   const resp = await session.defaultSession.fetch(endpoint, {
     method: "GET",
+    // A tarpitting metadata host must not hold the click (the extraction is
+    // deduped in-flight, so one hang blocked every caller) — bound it.
+    signal: AbortSignal.timeout(8000),
     headers: {
       "User-Agent": uaHint,
       "Accept": "application/json",
@@ -935,6 +938,9 @@ async function extractVideaXml(
     const fetchVidea = (target: string) =>
       session.defaultSession.fetch(target, {
         method: "GET",
+        // videa's XML endpoints occasionally tarpit; without a bound the
+        // in-flight dedupe made every caller wait on Chromium's socket default.
+        signal: AbortSignal.timeout(8000),
         headers: {
           "User-Agent": PLAYBACK_UA,
           "Accept": "*/*",
@@ -1055,6 +1061,9 @@ async function extractOkru(
   try {
     const resp = await session.defaultSession.fetch(embedUrl, {
       method: "GET",
+      // Bound the fetch — a hung ok.ru edge otherwise held the deduped
+      // extraction promise (and every click awaiting it) indefinitely.
+      signal: AbortSignal.timeout(8000),
       headers: {
         "User-Agent": VIDEO_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1212,6 +1221,10 @@ async function extractViaHtml(
         method: "GET",
         headers,
         redirect: "follow",
+        // Carry the defaultSession cookies (Cloudflare clearance, provider
+        // session) exactly like the playback proxy does — witanime's gate
+        // handoff and the rotating streamwish mirrors both bind to them.
+        credentials: "include",
         cache: "no-store",
         // Fail fast on dead/blocked mirrors. Without this a streamwish CDN
         // that TCP-times-out (ERR_CONNECTION_TIMED_OUT) hangs ~2min on the
@@ -1287,6 +1300,7 @@ async function extractDood(
     const embedUrl = idM ? `${u.origin}/e/${idM[1]}` : iframeUrl;
     const resp = await session.defaultSession.fetch(embedUrl, {
       method: "GET",
+      signal: AbortSignal.timeout(8000),
       headers: {
         "User-Agent": PLAYBACK_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1312,6 +1326,7 @@ async function extractDood(
     const fo = new URL(finalUrl);
     const r2 = await session.defaultSession.fetch(`${fo.origin}${md5Path}`, {
       method: "GET",
+      signal: AbortSignal.timeout(8000),
       headers: {
         "User-Agent": PLAYBACK_UA,
         "Referer": finalUrl,
@@ -1342,6 +1357,7 @@ async function extractVk(
   try {
     const resp = await session.defaultSession.fetch(iframeUrl, {
       method: "GET",
+      signal: AbortSignal.timeout(8000),
       headers: {
         "User-Agent": PLAYBACK_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1751,36 +1767,78 @@ async function fetchSourceViaWorkingEdge(url: string, headers: Record<string, st
     if (ips.length === 0) { sourceEdgeIpsPromise = null; return null; }
     // A black-holed candidate must not eat the caller's whole budget probing it.
     const perIpTimeout = Math.min(timeout, 2500);
-    for (const ip of ips.slice(0, 3)) {
-      const body = await new Promise<string | null>((resolve) => {
-        const req = https.get(url, {
-          headers,
-          timeout: perIpTimeout,
-          lookup: (_host, options, callback) => {
-            if (options.all) callback(null, [{ address: ip, family: 4 }]);
-            else callback(null, ip, 4);
-          },
-        }, (res) => {
-          const playerDenial = parsed.hostname === "w1.anime4up.rest" && /^\/Anime4up-S[12]\//i.test(parsed.pathname) && res.statusCode === 403;
-          if (res.statusCode !== 200 && !playerDenial) { res.resume(); resolve(null); return; }
-          const chunks: Buffer[] = [];
-          let size = 0;
-          res.on("data", (chunk: Buffer) => {
-            size += chunk.length;
-            if (size > 4 * 1024 * 1024) { req.destroy(); return; }
-            chunks.push(chunk);
-          });
-          res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-          res.on("error", () => resolve(null));
+    const candidates = ips.slice(0, 3);
+    const probeIp = (ip: string) => new Promise<string | null>((resolve) => {
+      const req = https.get(url, {
+        headers,
+        timeout: perIpTimeout,
+        lookup: (_host, options, callback) => {
+          if (options.all) callback(null, [{ address: ip, family: 4 }]);
+          else callback(null, ip, 4);
+        },
+      }, (res) => {
+        const playerDenial = parsed.hostname === "w1.anime4up.rest" && /^\/Anime4up-S[12]\//i.test(parsed.pathname) && res.statusCode === 403;
+        if (res.statusCode !== 200 && !playerDenial) { res.resume(); resolve(null); return; }
+        const chunks: Buffer[] = [];
+        let size = 0;
+        res.on("data", (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > 4 * 1024 * 1024) { req.destroy(); return; }
+          chunks.push(chunk);
         });
-        req.on("error", () => resolve(null));
-        req.on("timeout", () => req.destroy());
+        res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+        res.on("error", () => resolve(null));
       });
-      if (body !== null) {
-        // Self-calibrating: keep the edge that answered at the front of the list.
-        sourceEdgeIpsPromise = Promise.resolve([ip, ...ips.filter((x) => x !== ip)]);
-        return body;
+      req.on("error", () => resolve(null));
+      req.on("timeout", () => req.destroy());
+    });
+    // Hedged probing: a black-holed anycast edge used to burn its full 2.5s
+    // timeout before the next candidate was even tried (up to 7.5s added to
+    // every anime4up/anime3rb fetch). Start the next candidate when the
+    // current one fails OR after a short stagger — the first answer wins, and
+    // an unanswered parked IP never blocks the reachable edge.
+    const results: (string | null)[] = new Array(candidates.length).fill(null);
+    const launched = new Set<number>();
+    await new Promise<void>((resolve) => {
+      let done = false;
+      let settled = 0;
+      const timers: ReturnType<typeof setTimeout>[] = [];
+      const finish = () => {
+        if (done) return;
+        done = true;
+        for (const timer of timers) clearTimeout(timer);
+        resolve();
+      };
+      const settle = (i: number, body: string | null) => {
+        if (done) return;
+        results[i] = body;
+        settled++;
+        if (body !== null) { finish(); return; }
+        launch(i + 1);
+        // Every launched candidate failed → settle null. Without this the
+        // promise never resolved when all candidates black-holed (the exact
+        // scenario this function exists for) and the caller hung forever.
+        if (settled === candidates.length) finish();
+      };
+      const launch = (i: number) => {
+        if (done || launched.has(i) || i >= candidates.length) return;
+        launched.add(i);
+        probeIp(candidates[i]).then(
+          (body) => settle(i, body),
+          () => settle(i, null),
+        );
+      };
+      launch(0);
+      for (let i = 1; i < candidates.length; i++) {
+        timers.push(setTimeout(() => launch(i), 400 * i));
       }
+    });
+    const winner = results.findIndex((body) => body !== null);
+    if (winner >= 0) {
+      // Self-calibrating: keep the edge that answered at the front of the list.
+      const ip = candidates[winner];
+      sourceEdgeIpsPromise = Promise.resolve([ip, ...ips.filter((x) => x !== ip)]);
+      return results[winner];
     }
     // Every candidate black-holed — drop the memo so the next call re-resolves.
     sourceEdgeIpsPromise = null;
@@ -1968,7 +2026,12 @@ async function extractMp4upload(
   // UA (see PLAYBACK_UA) so the token we extract is valid for the <video>
   // request that plays it.
   let html = "";
-  for (let attempt = 0; attempt < 1 && !html; attempt++) {
+  // The comment above always intended retries but the loop condition was
+  // `attempt < 1` — a no-op, so one transient 5xx/Cloudflare interstitial
+  // silently dropped the stream to the black iframe fallback.
+  const MAX_HTML_ATTEMPTS = 3;
+  for (let attempt = 0; attempt < MAX_HTML_ATTEMPTS && !html; attempt++) {
+    const attemptStartedAt = Date.now();
     try {
       const resp = await session.defaultSession.fetch(embedUrl, {
         method: "GET",
@@ -1995,6 +2058,14 @@ async function extractMp4upload(
       }
     } catch (e) {
       console.warn(`[extractMp4upload] HTML fetch failed (try ${attempt + 1}):`, e);
+    }
+    if (!html && attempt < MAX_HTML_ATTEMPTS - 1 && Date.now() - attemptStartedAt < 3000) {
+      // Small backoff lets a Cloudflare check / rate-limit window pass. A
+      // tarpit that ate the full 8s timeout won't recover on a retry — break
+      // to the capture fallback instead of stacking 24s of dead waits.
+      await new Promise((resolve) => setTimeout(resolve, 600 * (attempt + 1)));
+    } else if (!html) {
+      break;
     }
   }
 
@@ -3343,7 +3414,10 @@ app.whenReady().then(() => {
         opts.provider === "uqload" ||
         // videas.fr embeds inline their source like streamwish; the generic
         // static pass + capture resolves them (mobile has the same pairing).
-        opts.provider === "videas"
+        opts.provider === "videas" ||
+        // luluvdo/lulustream serve plain .m3u8/.mp4 player requests the
+        // generic pass captures — keeps them on the native player.
+        opts.provider === "luluvdo"
       ) {
         const viaHtml = await extractViaHtml(opts.iframeUrl, `extract:${opts.provider}`);
         if (viaHtml) return viaHtml;
@@ -3475,43 +3549,18 @@ app.whenReady().then(() => {
       const episode = new URL(rawUrl);
       if (episode.protocol !== "https:" || episode.hostname !== "witanime.site" || !episode.pathname.startsWith("/watch/")) return null;
       const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+      // Episode-page fetch only (titles + the page HTML). The player handshake
+      // itself runs inside a hidden window — see the in-page script below.
       const request = async (url: string, init: RequestInit) => {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 12000);
-        try { return await session.defaultSession.fetch(url, { ...init, signal: controller.signal }); }
-        finally { clearTimeout(timer); }
+        try {
+          return await session.defaultSession.fetch(url, { ...init, credentials: "include", signal: controller.signal });
+        } finally { clearTimeout(timer); }
       };
       const page = await request(episode.toString(), { headers: { "User-Agent": ua, Accept: "text/html", Referer: "https://witanime.site/" } });
       if (!page.ok) return null;
       const html = await page.text();
-      const source = html.match(/sourcesUrl:\s*'([^']+)'/i)?.[1]?.replace(/\\\//g, "/");
-      const csrf = html.match(/<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i)?.[1];
-      if (!source || !csrf) return null;
-      const headers = {
-        "User-Agent": ua,
-        Accept: "application/json",
-        "X-CSRF-TOKEN": csrf,
-        "X-Requested-With": "XMLHttpRequest",
-        Referer: episode.toString(),
-        Origin: episode.origin,
-      };
-      const manifestResponse = await request(new URL(source, episode).toString(), { method: "POST", headers });
-      if (!manifestResponse.ok) return null;
-      const manifest = await manifestResponse.json().catch(() => null) as any;
-      const seenLabels = new Set<string>();
-      const entries: { quality: string; label: string; token: string }[] = [];
-      for (const [quality, group] of Object.entries(manifest?.players || {})) {
-        if (!Array.isArray(group)) continue;
-        for (const item of group as any[]) {
-          const label = String(item?.label || "witanime").toLowerCase();
-          const token = String(item?.token || "");
-          if (seenLabels.has(label) || !/^[a-f0-9]{64}$/i.test(token)) continue;
-          seenLabels.add(label);
-          entries.push({ quality, label, token });
-        }
-      }
-      const rank = (label: string) => label.includes("hgcloud") ? 0 : label.includes("videa") ? 1 : label.includes("mp4upload") ? 2 : 3;
-      entries.sort((a, b) => rank(a.label) - rank(b.label));
       // Provider from the manifest LABEL — the same mapping the in-page
       // extractor uses. The gate URL carries no provider pattern, so host
       // classification would call every entry generic and the watch screen
@@ -3523,46 +3572,130 @@ app.whenReady().then(() => {
         if (label.includes("mega")) return "mega";
         return "generic";
       };
-      const servers: { id: string; name: string; iframeUrl: string; provider: string }[] = [];
-      for (const entry of entries) {
-        const sourceUrl = `${episode.origin}/watch/stream-source/${entry.token}`;
-        let ready = await request(sourceUrl, { method: "POST", headers }).catch(() => null);
-        if (ready?.status === 429) {
-          await new Promise((resolve) => setTimeout(resolve, 800));
-          ready = await request(sourceUrl, { method: "POST", headers }).catch(() => null);
-        }
-        if (!ready?.ok) continue;
-        const gateUrl = `${episode.origin}/watch/stream-gate/${entry.token}`;
-        let target = "";
-        try {
-          const gate = await request(gateUrl, { headers, redirect: "manual" });
-          const body = await gate.text();
-          target = gate.headers.get("location")
-            || body.match(/http-equiv=["']refresh["'][^>]+content=["'][^"']*url=['"]?([^'"\s>]+)/i)?.[1]
-            || body.match(/<a[^>]+href=["']([^"']+)["']/i)?.[1]
-            || (gate.url !== gateUrl ? gate.url : "");
-        } catch {}
-        if (!target) {
-          const followed = await request(gateUrl, { headers, redirect: "follow" }).catch(() => null);
-          if (followed?.url && followed.url !== gateUrl) target = followed.url;
-        }
-        try { target = new URL(target, gateUrl).toString(); } catch { target = ""; }
-        // The gate used to 302 to the provider's embed; it now often serves the
-        // player itself (200, no redirect). In that case the GATE URL is the
-        // playable server — exactly what the in-page extractor returns — so keep
-        // it instead of dropping the entry (this was why every witanime server
-        // from the main-process handshake disappeared while the headless
-        // fallback still showed them).
-        if (!target || target === gateUrl) target = gateUrl;
-        if (servers.some((server) => server.iframeUrl === target)) continue;
-        servers.push({
-          id: entry.token,
-          name: `${entry.label} ${entry.quality}`.trim(),
-          iframeUrl: target,
-          provider: providerForLabel(entry.label),
+      // The player handshake must run INSIDE the witanime page: the gate token
+      // is bound to the session cookie AND the page's CSRF token, and
+      // main-process fetches have no site context (Chromium withholds SameSite
+      // cookies), so priming there created a different session and every gate
+      // 404'd — the server list then pointed at dead gate URLs and every native
+      // extraction fell back to the embed. One hidden window runs the flow
+      // in-page: POST sources manifest → prime each token → GET each gate.
+      // The gate's 302 target is captured network-side via onBeforeRedirect
+      // (a cross-origin redirect is unreadable from the page's fetch), and is
+      // the REAL provider embed the native extractors can play.
+      const gateRedirects = new Map<string, string>();
+      const onGateRedirect = (details: Electron.OnBeforeRedirectListenerDetails) => {
+        const token = details.url.match(/witanime\.site\/watch\/stream-gate\/([a-f0-9]{64})/i)?.[1];
+        if (token && details.redirectURL) gateRedirects.set(token, details.redirectURL);
+      };
+      session.defaultSession.webRequest.onBeforeRedirect(onGateRedirect);
+      let handshake: unknown = null;
+      try {
+        handshake = await enqueue({
+          url: episode.toString(),
+          injectAfter: `new Promise((resolve) => {
+            (async () => {
+              try {
+                // Cloudflare interstitials / late hydration: wait for the
+                // player config to exist before giving up.
+                const waitStart = Date.now();
+                while (!document.querySelector('[x-data*="watchPlayer"]') && Date.now() - waitStart < 20000) {
+                  await new Promise((r) => setTimeout(r, 250));
+                }
+                if (!document.querySelector('[x-data*="watchPlayer"]')) {
+                  resolve([{ debug: true, href: location.href, title: document.title, htmlLen: document.documentElement.innerHTML.length }]);
+                  return;
+                }
+                const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+                const csrf = (csrfMeta && csrfMeta.content) || "";
+                const headers = { "X-CSRF-TOKEN": csrf, "X-Requested-With": "XMLHttpRequest", "Accept": "application/json" };
+                const player = document.querySelector('[x-data*="watchPlayer"]');
+                const cfg = (player && player.getAttribute("x-data")) || "";
+                const m = cfg.match(/sourcesUrl:\\s*'([^']+)'/);
+                if (!m) { resolve([{ debug: "no-sources-url", cfgLen: cfg.length, cfgHead: cfg.slice(0, 120) }]); return; }
+                // The x-data attribute stores sourcesUrl with escaped slashes
+                // (\u005c/) — unescape without regex-escaping games (same trick
+                // the in-page scraper script uses).
+                const sourcesUrl = m[1].split(String.fromCharCode(92) + "/").join("/");
+                let manifestResp;
+                try {
+                  manifestResp = await fetch(sourcesUrl, { method: "POST", headers });
+                } catch (err) {
+                  resolve([{ debug: "manifest-fetch: " + String(err), href: location.href, sourcesUrl: sourcesUrl.slice(0, 100), csrfLen: csrf.length }]);
+                  return;
+                }
+                if (!manifestResp.ok) { resolve([{ debug: "manifest-" + manifestResp.status, sourcesUrl: sourcesUrl.slice(0, 80) }]); return; }
+                const manifest = await manifestResp.json();
+                const entries = [];
+                const seen = {};
+                Object.keys(manifest.players || {}).forEach((q) => {
+                  (manifest.players[q] || []).forEach((e) => {
+                    const label = String(e.label || "witanime").toLowerCase();
+                    if (seen[label] || !/^[a-f0-9]{64}$/.test(String(e.token || ""))) return;
+                    seen[label] = 1;
+                    entries.push({ quality: q, label: label, token: e.token });
+                  });
+                });
+                const rank = (l) => l.includes("hgcloud") ? 0 : l.includes("videa") ? 1 : l.includes("mp4upload") ? 2 : 3;
+                entries.sort((a, b) => rank(a.label) - rank(b.label));
+                const out = [];
+                for (const e of entries) {
+                  try {
+                    let ready = await fetch("/watch/stream-source/" + e.token, { method: "POST", headers });
+                    if (ready.status === 429) {
+                      await new Promise((r) => setTimeout(r, 900));
+                      ready = await fetch("/watch/stream-source/" + e.token, { method: "POST", headers });
+                    }
+                    if (!ready.ok) continue;
+                    out.push({ label: e.label, quality: e.quality, token: e.token });
+                  } catch (err) {}
+                  await new Promise((r) => setTimeout(r, 150));
+                }
+                // The gate's anti-bot layer rejects fetch (Sec-Fetch-Mode:
+                // cors) and top-level navigations, but accepts IFRAME
+                // navigations (measured live: fetch → 404, iframe → 302).
+                // Attach a hidden iframe per gate; main captures each
+                // redirectURL via onBeforeRedirect.
+                for (const e of out) {
+                  const frame = document.createElement("iframe");
+                  frame.style.display = "none";
+                  frame.src = "/watch/stream-gate/" + e.token;
+                  document.body.appendChild(frame);
+                }
+                await new Promise((r) => setTimeout(r, 1500));
+                resolve(out);
+              } catch (err) { resolve([{ debug: "catch: " + String(err).slice(0, 160), href: location.href }]); }
+            })();
+          })`,
+          timeoutMs: 30000,
+          priority: true,
+          stopAfter: true,
         });
+        // Give the gate redirects a beat to land after the job resolves.
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      } finally {
+        session.defaultSession.webRequest.onBeforeRedirect(null);
       }
-      if (servers.length) console.info(`[wit-servers] ${servers.length}/${entries.length} ready (${servers.map((s) => s.name).join(", ")})`);
+      const servers: { id: string; name: string; iframeUrl: string; provider: string }[] = [];
+      if (Array.isArray(handshake) && handshake.length && (handshake[0] as any)?.debug) {
+        console.info(`[wit-servers] handshake detail: ${JSON.stringify(handshake).slice(0, 400)}`);
+      }
+      if (Array.isArray(handshake)) {
+        for (const item of handshake as { label?: string; quality?: string; token?: string }[]) {
+          const token = String(item?.token || "");
+          // Debug/diagnostic rows carry no token — never surface them.
+          if (!/^[a-f0-9]{64}$/i.test(token)) continue;
+          let target = gateRedirects.get(token) || "";
+          if (!/^https?:\/\//i.test(target)) target = `${episode.origin}/watch/stream-gate/${token}`;
+          if (servers.some((s) => s.iframeUrl === target)) continue;
+          servers.push({
+            id: token,
+            name: `${item.label || "witanime"} ${item.quality || ""}`.trim(),
+            iframeUrl: target,
+            provider: providerForLabel(String(item.label || "")),
+          });
+        }
+      }
+      if (servers.length) console.info(`[wit-servers] ${servers.length} ready (${servers.map((s) => `${s.name} → ${s.iframeUrl.slice(0, 50)}`).join(", ")})`);
       const deent = (value: string) => value.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
       // The new witanime watch page has no dedicated episode heading: its only
       // <h1> is the anime title and its <h3>s belong to the "related" rails, so
@@ -3590,7 +3723,8 @@ app.whenReady().then(() => {
         episodeTitle,
         animeTitle: animeLink ? deent(animeLink[1]) : (h1 ? deent(h1[1]) : ""),
       };
-    } catch {
+    } catch (e) {
+      console.warn("[wit-servers] failed:", e);
       return null;
     }
   });

@@ -20,6 +20,10 @@ export type ScrapeJob = {
   // Used for the watch page's server-list scrape so it never waits behind
   // background home/listing scrapes.
   priority?: boolean;
+  // Stop + blank the slot window after the job settles. For URL-resolution
+  // jobs (witanime gate → provider embed) that land on a page which would
+  // otherwise keep a player buffering in a hidden window.
+  stopAfter?: boolean;
 };
 
 type Pending = {
@@ -474,7 +478,7 @@ async function runJob(slotIdx: number, p: Pending) {
     // POST-job cleanup, NOT the pre-job about:blank prefix that broke
     // connectivity (removed above): the next job's loadURL is a fresh nav that
     // supersedes this blank.
-    if (p.job.isVideoJob && !win.isDestroyed()) {
+    if ((p.job.isVideoJob || p.job.stopAfter) && !win.isDestroyed()) {
       try { win.webContents.stop(); } catch {}
       win.loadURL("about:blank").catch(() => {});
     }

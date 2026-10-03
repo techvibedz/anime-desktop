@@ -1404,10 +1404,22 @@ export function fetchCompleteVideoServers(
     };
 
     // Warm the best three first so the recommended server becomes playable
-    // quickly, then validate the remaining direct candidates concurrently.
-    await Promise.all(selectServerCandidates(candidates).map(resolveOne));
+    // quickly, then validate the remaining direct candidates with a small
+    // worker pool. Firing every candidate at once saturated the 3-slot scraper
+    // pool and the providers' rate limiters (429s) — the churn that made
+    // servers slow to become playable and intermittently fail.
+    const directCandidates = selectServerCandidates(candidates);
+    const RESOLVE_CONCURRENCY = 3;
+    let resolveCursor = 0;
+    await Promise.all(Array.from({ length: Math.min(RESOLVE_CONCURRENCY, directCandidates.length) }, async () => {
+      while (true) {
+        const i = resolveCursor++;
+        if (i >= directCandidates.length) break;
+        await resolveOne(directCandidates[i]);
+      }
+    }));
 
-    const directServers = selectServerCandidates(candidates).flatMap((candidate) => {
+    const directServers = directCandidates.flatMap((candidate) => {
       const hit = playable.get(candidate.iframeUrl);
       return hit ? [hit] : [];
     });
@@ -1545,6 +1557,11 @@ const CUSTOM_PLAYER_PROVIDERS = new Set([
   // videas.fr embeds inline their source in packed JS like streamwish, so
   // the generic static pass extracts them (mobile's extractVideas equivalent).
   "videas",
+  // luluvdo/lulustream players request a plain .m3u8/.mp4 the generic static
+  // pass + capture engine can resolve; without this the policy said
+  // directThenIframe but the resolver never even tried and always painted the
+  // embed.
+  "luluvdo",
   // anime3rb's first-party host: one static GET on the player page yields
   // direct tokenized .mp4 qualities, so extraction is near-instant and the
   // custom player is the normal path (iframe only as a last resort).

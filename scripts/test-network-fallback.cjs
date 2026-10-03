@@ -108,5 +108,31 @@ function run(source, context) {
   // Self-calibration: the edge that answered goes to the front of the list.
   await edgeContext.fetchSourceViaWorkingEdge('https://w1.anime4up.rest/episode/', {}, 5000);
   assert.deepEqual(probes.slice(2), ['104.21.44.172'], 'working edge remembered');
+
+  // All candidates black-holed: the hedged probe must settle null (not hang)
+  // so the caller can fall back to the normal fetch path. Regression guard —
+  // an earlier hedge only resolved on success and deadlocked this case.
+  const deadProbes = [];
+  const deadContext = {
+    isIP, AbortSignal, Promise, Set, URL, Buffer, Math, console, setTimeout, clearTimeout,
+    fetch: async () => ({ json: async () => ({ Answer: [{ data: '188.114.96.7' }] }) }),
+    https: {
+      get: (url, opts, cb) => {
+        let ip = null;
+        if (opts.lookup) opts.lookup('host', {}, (_e, addr) => { ip = addr; });
+        deadProbes.push(ip);
+        const req = new EventEmitter();
+        req.destroy = () => req.emit('error', new Error('socket hang up'));
+        setTimeout(() => req.emit('timeout'), 5);
+        return req;
+      },
+    },
+  };
+  run(`${edgeFn}\nglobalThis.fetchSourceViaWorkingEdge = fetchSourceViaWorkingEdge;`, deadContext);
+  const deadResult = await Promise.race([
+    deadContext.fetchSourceViaWorkingEdge('https://w1.anime4up.rest/episode/', {}, 5000),
+    new Promise((resolve) => setTimeout(() => resolve('HUNG'), 3000)),
+  ]);
+  assert.equal(deadResult, null, 'all-black-holed candidates settle null instead of hanging');
   console.log('PASS Anime3rb request spacing, player DNS fallback, and source-edge probing');
 })().catch((error) => { console.error(error); process.exitCode = 1; });
