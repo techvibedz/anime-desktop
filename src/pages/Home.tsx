@@ -1,12 +1,19 @@
-import { memo, useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import { clearHomeCache, fetchHome, type HomeSection, type FeaturedItem, type AnimeItem, type EpisodeItem } from "../lib/api";
 import { AnimeCard, EpisodeCard } from "../components/AnimeCard";
+import { AnimeOfTheDay } from "../components/AnimeOfTheDay";
 import { EpisodeActionModal } from "../components/EpisodeActionModal";
+import { MalCardBadge } from "../components/MalRating";
 import { Shimmer } from "../components/Shimmer";
 import { SourceRail } from "../components/SourceRail";
-import { dismissFromContinue, getContinueWatching, pullHistoryFromCloud, type WatchEntry } from "../lib/history";
+import { animeTitleKey, dismissFromContinue, getContinueWatching, normAnimeKey, pullHistoryFromCloud, type WatchEntry } from "../lib/history";
+import { getFavorites } from "../lib/favorites";
 import { usePosterImage } from "../lib/posters";
+import { usePrefersReducedMotion } from "../lib/motion";
+import { canonTitle } from "../lib/relations";
+import { fetchForYou, pickSeeds, type RankedRec, type RecItem } from "../lib/recommend";
+import { resolveSourceUrl } from "../lib/schedule";
 import { reconcileCompletionFromEpisodes } from "../lib/completion";
 import { extractEpisodeNumber } from "../lib/episode-utils";
 import { t } from "../lib/i18n";
@@ -115,6 +122,8 @@ export function HomePage() {
     <div className="space-y-12">
       <Hero featured={featured} />
 
+      <AnimeOfTheDay />
+
       {history.length > 0 && (
         <section className="space-y-4">
           <h2 className="text-xl font-bold text-white">{t.continueWatching}</h2>
@@ -167,6 +176,8 @@ export function HomePage() {
         </section>
       )}
 
+      <ForYouRail history={history} />
+
       {sections.map((s) => (
         <Section key={s.id} section={s} onOpenEpisode={setEpisodePopup} />
       ))}
@@ -204,12 +215,15 @@ function ContinueArtwork({ entry }: { entry: WatchEntry }) {
 // re-renders only the hero — not the continue-watching row and every rail.
 function Hero({ featured }: { featured: FeaturedItem[] }) {
   const [idx, setIdx] = useState(0);
+  const reduceMotion = usePrefersReducedMotion();
 
   useEffect(() => {
     if (featured.length < 2) return;
+    // Honor the OS "reduce motion" switch: manual dots stay, auto-advance stops.
+    if (reduceMotion) return;
     const id = setInterval(() => setIdx((i) => (i + 1) % featured.length), 7000);
     return () => clearInterval(id);
-  }, [featured.length]);
+  }, [featured.length, reduceMotion]);
 
   // Warm the next slide's artwork so the crossfade never flashes empty.
   useEffect(() => {
@@ -329,3 +343,111 @@ const Section = memo(function Section({
     </section>
   );
 });
+
+/* ── For You (مقترح لك) ──
+   Personalised rail seeded by watch history: the 3 most recent distinct anime
+   are resolved against AniList and their community recommendations merged +
+   ranked (lib/recommend). Tapping a card resolves it to a source page.
+   Hidden entirely when there's nothing to show — a secondary rail must never
+   render as an empty hole (mirrors the mobile home screen). */
+const seedKeyOf = (e: { animeTitle: string; animeHref: string }) =>
+  normAnimeKey(e.animeHref) || animeTitleKey(e.animeTitle);
+
+function ForYouRail({ history }: { history: WatchEntry[] }) {
+  const navigate = useNavigate();
+  const [items, setItems] = useState<RankedRec[]>([]);
+  const [busyId, setBusyId] = useState<number | null>(null);
+  const historyRef = useRef(history);
+  historyRef.current = history;
+
+  // Refetch only when the seed SET changes (a newly watched anime, or one
+  // drops out) — not on every progress tick / focus refresh.
+  const seedKey = useMemo(
+    () => pickSeeds(history, seedKeyOf, 3).map((s) => s.animeTitle).join("|"),
+    [history],
+  );
+
+  useEffect(() => {
+    const seeds = pickSeeds(historyRef.current, seedKeyOf, 3);
+    if (seeds.length === 0) { setItems([]); return; }
+    let alive = true;
+    void (async () => {
+      const favorites = await getFavorites().catch(() => []);
+      // Nothing the user already watched / bookmarked may come back as a rec.
+      const keys = new Set<string>();
+      const canons = new Set<string>();
+      const remember = (title: string | null | undefined) => {
+        if (!title) return;
+        const k = animeTitleKey(title);
+        if (k) keys.add(k);
+        canons.add(canonTitle(title));
+      };
+      for (const e of historyRef.current) remember(e.animeTitle);
+      for (const f of favorites) remember(f.title);
+      const excluded = (item: RecItem) =>
+        [item.title, item.titleEnglish].some((title) => {
+          if (!title) return false;
+          return keys.has(animeTitleKey(title)) || canons.has(canonTitle(title));
+        });
+      const ranked = await fetchForYou(historyRef.current, seedKeyOf, { excluded, cap: 15 }).catch(() => [] as RankedRec[]);
+      if (alive) setItems(ranked);
+    })();
+    return () => { alive = false; };
+  }, [seedKey]);
+
+  const open = async (item: RankedRec) => {
+    if (busyId != null) return;
+    setBusyId(item.anilistId);
+    try {
+      const href = await resolveSourceUrl(item.title).catch(() => null);
+      // No source carries it → the AniList detail page still has something useful.
+      navigate(href ? `/anime/${encodeURIComponent(href)}` : `/title/${item.anilistId}`);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  if (items.length === 0) return null;
+  return (
+    <section className="lazy-section space-y-4">
+      <h2 className="flex items-center gap-2 text-xl font-bold text-white">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" className="text-accent"><path d="M12 2l1.8 5.6L19.5 9l-4.6 3.4L16.4 18 12 14.8 7.6 18l1.5-5.6L4.5 9l5.7-1.4z" /></svg>
+        {t.recsForYou}
+      </h2>
+      <div className="flex gap-4 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+        {items.map((item) => (
+          <button
+            key={item.anilistId}
+            type="button"
+            onClick={() => open(item)}
+            disabled={busyId === item.anilistId}
+            className="group block w-[150px] shrink-0 text-start"
+          >
+            <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface ring-1 ring-transparent transition-shadow duration-200 group-hover:shadow-glow group-hover:ring-accent/50">
+              {item.image ? (
+                <img
+                  src={item.image}
+                  alt={item.title}
+                  loading="lazy"
+                  decoding="async"
+                  className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.04]"
+                />
+              ) : (
+                <div className="h-full w-full shimmer" />
+              )}
+              <MalCardBadge title={item.title} style={{ left: "auto", right: "0.5rem" }} />
+              {busyId === item.anilistId && (
+                <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/50">
+                  <span className="h-6 w-6 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                </div>
+              )}
+            </div>
+            <h3 className="mt-2 line-clamp-2 text-[12.5px] font-semibold leading-snug text-text-secondary transition-colors group-hover:text-white">
+              {item.title}
+            </h3>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}

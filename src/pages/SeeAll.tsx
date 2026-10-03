@@ -6,12 +6,30 @@ import {
 } from "../lib/api";
 import { AnimeCard, EpisodeCard } from "../components/AnimeCard";
 import { EpisodeActionModal } from "../components/EpisodeActionModal";
+import { CompletionBadge } from "../components/CompletionBadge";
+import { CardLayoutControl } from "../components/CardLayoutControl";
+import { useCardLayout, type CardLayout } from "../lib/cardLayout";
+import { extractEpisodeNumber } from "../lib/episode-utils";
 import { Shimmer } from "../components/Shimmer";
 import { t } from "../lib/i18n";
 
 type ItemKind = "anime" | "episode";
 
+// comfortable = the grids as they always were; compact packs one step denser;
+// list renders one row per item (poster thumb + text).
+const ANIME_GRID: Record<CardLayout, string> = {
+  comfortable: "grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-6",
+  compact: "grid grid-cols-3 gap-2 sm:grid-cols-5 lg:grid-cols-8",
+  list: "flex flex-col gap-2",
+};
+const EPISODE_GRID: Record<CardLayout, string> = {
+  comfortable: "grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6",
+  compact: "grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8",
+  list: "flex flex-col gap-2",
+};
+
 export function SeeAllPage() {
+  const { layout, setLayout } = useCardLayout("see-all");
   const { section } = useParams<{ section: string }>();
   const location = useLocation();
   const [items, setItems] = useState<(AnimeItem | EpisodeItem | SearchResult)[]>([]);
@@ -146,6 +164,9 @@ export function SeeAllPage() {
       <div className="flex items-center gap-3">
         <Link to="/" className="text-text-muted hover:text-white">→ {t.back}</Link>
         <h1 className="text-3xl font-bold">{title || t.loading}</h1>
+        <div className="ms-auto">
+          <CardLayoutControl layout={layout} onChange={setLayout} />
+        </div>
       </div>
       {error && (
         <div className="flex items-center gap-3 text-sm text-text-secondary">
@@ -154,17 +175,84 @@ export function SeeAllPage() {
         </div>
       )}
       {loading ? (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-6">
-          {Array.from({ length: 18 }).map((_, i) => <Shimmer key={i} className="aspect-[2/3]" />)}
+        <div className={ANIME_GRID[layout]}>
+          {Array.from({ length: layout === "list" ? 6 : 18 }).map((_, i) => (
+            <Shimmer key={i} className={layout === "list" ? "h-28" : "aspect-[2/3]"} />
+          ))}
         </div>
       ) : kind === "episode" ? (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
-          {(items as EpisodeItem[]).map((it) => (
-            <EpisodeCard key={it.href + it.animeHref} episode={it} onOpen={setEpisodePopup} />
+        layout === "list" ? (
+          <div className="flex flex-col gap-2">
+            {(items as EpisodeItem[]).map((it) => {
+              const num = extractEpisodeNumber(it.title, it.href);
+              return (
+                <button
+                  key={it.href + it.animeHref}
+                  type="button"
+                  onClick={() => setEpisodePopup(it)}
+                  className="group flex items-center gap-3 rounded-xl bg-surface p-2 text-start ring-1 ring-white/5 transition hover:ring-accent/50"
+                >
+                  <div className="relative aspect-[2/3] w-16 shrink-0 overflow-hidden rounded-lg bg-bg">
+                    {it.image ? (
+                      <img src={it.image} alt={it.title} className="h-full w-full object-cover" loading="lazy" decoding="async" />
+                    ) : (
+                      <div className="h-full w-full shimmer" />
+                    )}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    {it.animeTitle && <p className="line-clamp-1 text-[11px] font-semibold text-accent/90">{it.animeTitle}</p>}
+                    <h3 className="line-clamp-1 text-sm font-semibold text-text-secondary transition-colors group-hover:text-white">
+                      {it.title}
+                    </h3>
+                    {num != null && (
+                      <span className="mt-1 inline-block rounded bg-accent px-1.5 py-0.5 text-[10px] font-bold text-black">
+                        {t.episode} {num}
+                      </span>
+                    )}
+                  </div>
+                  <CompletionBadge hrefs={[it.animeHref]} titles={[it.animeTitle]} className="shrink-0" />
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <div className={EPISODE_GRID[layout]}>
+            {(items as EpisodeItem[]).map((it) => (
+              <EpisodeCard key={it.href + it.animeHref} episode={it} onOpen={setEpisodePopup} />
+            ))}
+          </div>
+        )
+      ) : layout === "list" ? (
+        <div className="flex flex-col gap-2">
+          {(items as AnimeItem[]).map((it) => (
+            <Link
+              key={it.href}
+              to={`/anime/${encodeURIComponent(it.href)}`}
+              className="group flex items-center gap-3 rounded-xl bg-surface p-2 ring-1 ring-white/5 transition hover:ring-accent/50"
+            >
+              <div className="relative aspect-[2/3] w-16 shrink-0 overflow-hidden rounded-lg bg-bg">
+                {it.image ? (
+                  <img src={it.image} alt={it.title} className="h-full w-full object-cover" loading="lazy" decoding="async" />
+                ) : (
+                  <div className="h-full w-full shimmer" />
+                )}
+                <CompletionBadge hrefs={[it.href]} titles={[it.title]} className="absolute bottom-1 end-1" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 className="line-clamp-2 text-sm font-semibold text-text-secondary transition-colors group-hover:text-white">
+                  {it.title}
+                </h3>
+                {it.type && (
+                  <span className="mt-1 inline-block rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-semibold text-white/90">
+                    {it.type}
+                  </span>
+                )}
+              </div>
+            </Link>
           ))}
         </div>
       ) : (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
+        <div className={ANIME_GRID[layout]}>
           {(items as AnimeItem[]).map((it) => <AnimeCard key={it.href} item={it} />)}
         </div>
       )}

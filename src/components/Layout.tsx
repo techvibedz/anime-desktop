@@ -2,6 +2,9 @@ import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef } from "react";
 import { useAuth } from "../lib/auth";
 import { clearHomeCache } from "../lib/api";
+import { getUnreadCount, subscribeNotifications } from "../lib/notifications";
+import { isAdmin } from "../lib/presence";
+import { useOnlineStatus } from "../lib/net";
 import { t } from "../lib/i18n";
 
 // Stroke icon set — one visual voice for the whole sidebar.
@@ -28,13 +31,79 @@ const NAV = [
   { to: "/mylist", label: t.myList, end: false, d: "M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1Z" },
 ];
 
+const NAV_SECONDARY = [
+  { to: "/news", label: t.newsTitle, d: "M4 4h16v16H4z|M8 8h8|M8 12h8|M8 16h5" },
+  { to: "/notifications", label: t.notifications, badge: true, d: "M6 8a6 6 0 1 1 12 0c0 7 3 8 3 8H3s3-1 3-8|M10.5 21a1.5 1.5 0 0 0 3 0" },
+  { to: "/chat", label: t.chatUserThreadTitle, d: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" },
+  { to: "/report", label: t.reportTitle, d: "M12 9v4|M12 17h.01|M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" },
+  { to: "/profile", label: t.profileTitle, d: "M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2|M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z" },
+  { to: "/settings", label: t.settingsTitle, d: "M4 21v-7|M4 10V3|M12 21v-9|M12 8V3|M20 21v-5|M20 12V3|M1 14h6|M9 8h6|M17 16h6" },
+];
+
+const NAV_ADMIN = [
+  { to: "/admin/live", label: t.liveUsersTitle, d: "M12 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z|M8.5 8.5a5 5 0 0 0 0 7|M15.5 15.5a5 5 0 0 0 0-7|M5.5 5.5a9 9 0 0 0 0 13|M18.5 18.5a9 9 0 0 0 0-13" },
+  { to: "/admin/users", label: t.usersTitle, d: "M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2|M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z|M23 21v-2a4 4 0 0 0-3-3.87|M16 3.13a4 4 0 0 1 0 7.75" },
+  { to: "/admin/chats", label: t.chatAdminInboxTitle, d: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" },
+  { to: "/admin/logs", label: t.logsTitle, d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z|M14 2v6h6|M8 13h8|M8 17h8" },
+];
+
+function NavItem({ item, unread }: { item: { to: string; label: string; end?: boolean; d: string; badge?: boolean }; unread: number }) {
+  return (
+    <NavLink
+      to={item.to}
+      end={item.end}
+      className={({ isActive }) =>
+        `group relative flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors duration-150 ${
+          isActive
+            ? "bg-white/[0.06] text-accent"
+            : "text-text-muted hover:bg-white/[0.04] hover:text-white"
+        }`
+      }
+    >
+      {({ isActive }) => (
+        <>
+          {isActive && (
+            <span className="absolute inset-y-2 start-0 w-0.5 rounded-full bg-accent" aria-hidden />
+          )}
+          <Icon d={item.d} />
+          <span className="min-w-0 flex-1 truncate">{item.label}</span>
+          {item.badge && unread > 0 && (
+            <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-accent px-1.5 text-[10px] font-bold text-black">
+              {unread > 99 ? "99+" : unread}
+            </span>
+          )}
+        </>
+      )}
+    </NavLink>
+  );
+}
+
 export function Layout() {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
   const [showMenu, setShowMenu] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
+  const [unread, setUnread] = useState(0);
   const menuRef = useRef<HTMLDivElement>(null);
+  const { online } = useOnlineStatus();
+  const admin = isAdmin(user?.email);
+
+  // Unread notification badge — re-renders whenever the feed changes.
+  useEffect(() => {
+    let alive = true;
+    const load = () => {
+      void getUnreadCount().then((n) => {
+        if (alive) setUnread(n);
+      });
+    };
+    load();
+    const off = subscribeNotifications(load);
+    return () => {
+      alive = false;
+      off();
+    };
+  }, []);
 
   // Force the current page to reload its data: drop the home cache (so it
   // re-scrapes instead of replaying an empty/stale list) and bump a key on
@@ -68,29 +137,25 @@ export function Layout() {
 
         <nav className="flex-1 space-y-0.5 overflow-y-auto px-3">
           {NAV.map((item) => (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              end={item.end}
-              className={({ isActive }) =>
-                `group relative flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors duration-150 ${
-                  isActive
-                    ? "bg-white/[0.06] text-accent"
-                    : "text-text-muted hover:bg-white/[0.04] hover:text-white"
-                }`
-              }
-            >
-              {({ isActive }) => (
-                <>
-                  {isActive && (
-                    <span className="absolute inset-y-2 start-0 w-0.5 rounded-full bg-accent" aria-hidden />
-                  )}
-                  <Icon d={item.d} />
-                  {item.label}
-                </>
-              )}
-            </NavLink>
+            <NavItem key={item.to} item={item} unread={unread} />
           ))}
+
+          <div className="my-2 border-t border-white/5" />
+          {NAV_SECONDARY.map((item) => (
+            <NavItem key={item.to} item={item} unread={unread} />
+          ))}
+
+          {admin && (
+            <>
+              <div className="my-2 border-t border-white/5" />
+              <div className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-text-muted/70">
+                {t.chatAdminInboxTitle}
+              </div>
+              {NAV_ADMIN.map((item) => (
+                <NavItem key={item.to} item={item} unread={unread} />
+              ))}
+            </>
+          )}
         </nav>
 
         <div className="space-y-1 border-t border-white/5 p-3">
@@ -117,7 +182,11 @@ export function Layout() {
               className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-start transition-colors hover:bg-white/[0.04]"
             >
               <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-sm font-bold text-black">
-                {user?.email?.[0]?.toUpperCase() ?? "?"}
+                {user?.user_metadata?.avatar_url ? (
+                  <img src={user.user_metadata.avatar_url} alt="" className="h-8 w-8 rounded-full object-cover" />
+                ) : (
+                  user?.email?.[0]?.toUpperCase() ?? "?"
+                )}
               </span>
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-xs text-text-secondary" dir="ltr">
@@ -127,6 +196,20 @@ export function Layout() {
             </button>
             {showMenu && (
               <div className="absolute bottom-full start-0 z-modal mb-2 w-full rounded-xl border border-white/10 bg-raised p-1.5 shadow-card">
+                <Link
+                  to="/profile"
+                  onClick={() => setShowMenu(false)}
+                  className="block rounded-lg px-3 py-2 text-start text-sm text-white hover:bg-white/5"
+                >
+                  {t.profileTitle}
+                </Link>
+                <Link
+                  to="/settings"
+                  onClick={() => setShowMenu(false)}
+                  className="block rounded-lg px-3 py-2 text-start text-sm text-white hover:bg-white/5"
+                >
+                  {t.settingsTitle}
+                </Link>
                 <button
                   onClick={async () => { await signOut(); navigate("/login"); }}
                   className="w-full rounded-lg px-3 py-2 text-start text-sm text-white hover:bg-white/5"
@@ -141,6 +224,11 @@ export function Layout() {
 
       <main className="min-h-screen ps-60">
         <div className="mx-auto max-w-[1700px] px-8 py-7">
+          {online === false && (
+            <div className="mb-4 rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-2.5 text-sm text-amber-200">
+              {t.offlineNotice}
+            </div>
+          )}
           {/* Bumping refreshKey remounts the active page so its data-fetch effects re-run. */}
           <div key={refreshKey}>
             <Outlet />

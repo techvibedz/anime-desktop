@@ -10,8 +10,18 @@ import { useParams, useNavigate, Link } from "react-router-dom";
 import { fetchAniListDetail, type AniListDetail } from "../lib/seasons";
 import { translateToArabic } from "../lib/translate";
 import { arGenre, arFormat } from "../lib/anilistLabels";
+import { CardLayoutControl } from "../components/CardLayoutControl";
+import { useCardLayout, type CardLayout } from "../lib/cardLayout";
 import { Shimmer } from "../components/Shimmer";
 import { t } from "../lib/i18n";
+
+// comfortable = the grid as it always was; compact packs one step denser;
+// list renders one row per related title (poster thumb + text).
+const REL_GRID: Record<CardLayout, string> = {
+  comfortable: "grid grid-cols-6 gap-4",
+  compact: "grid grid-cols-8 gap-3",
+  list: "flex flex-col gap-2",
+};
 
 const STATUS_AR: Record<string, string> = {
   RELEASING: t.statusReleasing,
@@ -31,6 +41,7 @@ function fmtDate(unixSec: number | null): string | null {
 }
 
 export function TitlePage() {
+  const { layout, setLayout } = useCardLayout("title");
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const numId = Number(id);
@@ -163,22 +174,46 @@ export function TitlePage() {
       {/* Related */}
       {detail.relations.length > 0 && (
         <section className="space-y-3">
-          <h2 className="font-display text-lg font-bold text-white">{t.titleRelated}</h2>
-          <div className="grid grid-cols-6 gap-4">
-            {detail.relations.map((r) => (
-              <Link key={r.id} to={`/title/${r.id}`} className="group block">
-                <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface">
-                  {r.image ? (
-                    <img src={r.image} alt={r.title} className="h-full w-full object-cover transition group-hover:scale-105" loading="lazy" />
-                  ) : <div className="h-full w-full shimmer" />}
-                  <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/85 to-transparent" />
-                  <div className="absolute inset-x-0 bottom-0 p-2">
-                    <h3 className="line-clamp-2 text-[12px] font-semibold text-white">{r.title}</h3>
-                  </div>
-                </div>
-              </Link>
-            ))}
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="font-display text-lg font-bold text-white">{t.titleRelated}</h2>
+            <CardLayoutControl layout={layout} onChange={setLayout} />
           </div>
+          {layout === "list" ? (
+            <div className="flex flex-col gap-2">
+              {detail.relations.map((r) => (
+                <Link
+                  key={r.id}
+                  to={`/title/${r.id}`}
+                  className="group flex items-center gap-3 rounded-xl bg-surface p-2 ring-1 ring-white/5 transition hover:ring-accent/50"
+                >
+                  <div className="relative aspect-[2/3] w-16 shrink-0 overflow-hidden rounded-lg bg-bg">
+                    {r.image ? (
+                      <img src={r.image} alt={r.title} className="h-full w-full object-cover" loading="lazy" />
+                    ) : <div className="h-full w-full shimmer" />}
+                  </div>
+                  <h3 className="line-clamp-2 min-w-0 flex-1 text-sm font-semibold text-text-secondary transition-colors group-hover:text-white">
+                    {r.title}
+                  </h3>
+                </Link>
+              ))}
+            </div>
+          ) : (
+            <div className={REL_GRID[layout]}>
+              {detail.relations.map((r) => (
+                <Link key={r.id} to={`/title/${r.id}`} className="group block">
+                  <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface">
+                    {r.image ? (
+                      <img src={r.image} alt={r.title} className="h-full w-full object-cover transition group-hover:scale-105" loading="lazy" />
+                    ) : <div className="h-full w-full shimmer" />}
+                    <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/85 to-transparent" />
+                    <div className="absolute inset-x-0 bottom-0 p-2">
+                      <h3 className="line-clamp-2 text-[12px] font-semibold text-white">{r.title}</h3>
+                    </div>
+                  </div>
+                </Link>
+              ))}
+            </div>
+          )}
         </section>
       )}
     </div>

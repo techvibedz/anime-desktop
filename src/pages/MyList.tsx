@@ -5,18 +5,35 @@ import { getHistory, type WatchEntry, isCompleted, progressPercent } from "../li
 import { extractEpisodeNumber } from "../lib/episode-utils";
 import { usePosterImage } from "../lib/posters";
 import { CompletionBadge } from "../components/CompletionBadge";
+import { CardLayoutControl } from "../components/CardLayoutControl";
+import { useCardLayout, type CardLayout } from "../lib/cardLayout";
 import { t } from "../lib/i18n";
 
-const TABS: { id: FavoriteList | "history"; label: string }[] = [
-  { id: "watching", label: t.currentlyWatching },
-  { id: "planned", label: t.planToWatch },
-  { id: "history", label: t.history },
-];
+// comfortable = the grid as it always was; compact packs one step denser;
+// list renders one row per item (poster thumb + text).
+const FAV_GRID: Record<CardLayout, string> = {
+  comfortable: "grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6",
+  compact: "grid grid-cols-3 gap-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8",
+  list: "flex flex-col gap-2",
+};
+const HISTORY_GRID: Record<CardLayout, string> = {
+  comfortable: "grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3",
+  compact: "grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4",
+  list: "flex flex-col gap-3",
+};
 
 export function MyListPage() {
+  const { layout, setLayout } = useCardLayout("mylist");
   const [tab, setTab] = useState<FavoriteList | "history">("watching");
   const [favs, setFavs] = useState<FavoriteAnime[]>([]);
   const [history, setHistory] = useState<WatchEntry[]>([]);
+
+  // Live tab counts (mobile parity: app/(tabs)/mylist.tsx filter pills).
+  const tabs: { id: FavoriteList | "history"; label: string; count: number }[] = [
+    { id: "watching", label: t.currentlyWatching, count: favs.filter((f) => f.list === "watching").length },
+    { id: "planned", label: t.planToWatch, count: favs.filter((f) => f.list === "planned").length },
+    { id: "history", label: t.history, count: history.length },
+  ];
 
   async function reload() {
     setFavs(await getFavorites());
@@ -28,17 +45,23 @@ export function MyListPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-3xl font-bold">{t.myListTitle}</h1>
+      <div className="flex items-center justify-between gap-4">
+        <h1 className="text-3xl font-bold">{t.myListTitle}</h1>
+        <CardLayoutControl layout={layout} onChange={setLayout} />
+      </div>
       <div className="flex gap-1 border-b border-white/10">
-        {TABS.map((tabDef) => (
+        {tabs.map((tabDef) => (
           <button
             key={tabDef.id}
             onClick={() => setTab(tabDef.id)}
-            className={`relative px-4 py-2.5 text-sm font-semibold transition-colors ${
+            className={`relative flex items-center gap-1.5 px-4 py-2.5 text-sm font-semibold transition-colors ${
               tab === tabDef.id ? "text-accent" : "text-text-muted hover:text-white"
             }`}
           >
             {tabDef.label}
+            <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${tab === tabDef.id ? "bg-accent/15 text-accent" : "bg-white/5 text-text-muted"}`}>
+              {tabDef.count}
+            </span>
             {tab === tabDef.id && <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-accent" />}
           </button>
         ))}
@@ -48,16 +71,16 @@ export function MyListPage() {
         history.length === 0 ? (
           <Empty msg={t.emptyHistory} />
         ) : (
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          <div className={HISTORY_GRID[layout]}>
             {history.map((e) => <HistoryRow key={e.episodeHref} entry={e} />)}
           </div>
         )
       ) : filtered && filtered.length === 0 ? (
         <Empty msg={t.emptyList} />
       ) : (
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
+        <div className={FAV_GRID[layout]}>
           {filtered!.map((f) => (
-            <FavRow key={f.href} fav={f} onRemove={async () => { await removeFavorite(f.href); reload(); }} />
+            <FavRow key={f.href} fav={f} layout={layout} onRemove={async () => { await removeFavorite(f.href); reload(); }} />
           ))}
         </div>
       )}
@@ -65,11 +88,44 @@ export function MyListPage() {
   );
 }
 
-function FavRow({ fav, onRemove }: { fav: FavoriteAnime; onRemove: () => void }) {
+function FavRow({ fav, layout, onRemove }: { fav: FavoriteAnime; layout: CardLayout; onRemove: () => void }) {
   // Records synced from the cloud (or saved before witanime rotated TLDs) can
   // hold artwork from a retired host — re-resolve it from the anime page, and
   // show a static placeholder (not an endless shimmer) if that fails too.
   const poster = usePosterImage(fav.image, fav.href);
+  if (layout === "list") {
+    return (
+      <div className="group flex items-center gap-3 rounded-xl bg-surface p-2 ring-1 ring-white/5 transition hover:ring-accent/50">
+        <Link to={`/anime/${encodeURIComponent(fav.href)}`} className="flex min-w-0 flex-1 items-center gap-3">
+          <div className="relative aspect-[2/3] w-16 shrink-0 overflow-hidden rounded-lg bg-bg">
+            {poster.src ? (
+              <img src={poster.src} alt={fav.title} className="h-full w-full object-cover" loading="lazy" decoding="async" onError={poster.onError} />
+            ) : poster.repairing ? (
+              <div className="h-full w-full shimmer" />
+            ) : (
+              <div className="h-full w-full bg-raised" />
+            )}
+            <CompletionBadge hrefs={[fav.href]} titles={[fav.title]} className="absolute bottom-1 end-1" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h3 className="line-clamp-2 text-sm font-semibold text-text-secondary transition-colors group-hover:text-white">
+              {fav.title}
+            </h3>
+            <p className="mt-1 text-xs text-text-muted">
+              {fav.list === "watching" ? t.currentlyWatching : t.planToWatch}
+            </p>
+          </div>
+        </Link>
+        <button
+          onClick={onRemove}
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-black/70 text-white transition-colors hover:bg-red-600"
+          title={t.remove}
+        >
+          ×
+        </button>
+      </div>
+    );
+  }
   return (
     <div className="group relative">
       <Link to={`/anime/${encodeURIComponent(fav.href)}`} className="block">

@@ -1,5 +1,5 @@
-import { useEffect, useState, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useEffect, useState, useCallback, useRef } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../lib/auth";
 import {
   createRoom,
@@ -11,6 +11,7 @@ import {
   type PartyMember,
   type PartyRole,
 } from "../lib/watchParty";
+import { normalizePartyCode, partyShareText } from "../lib/partyInvite";
 import { t } from "../lib/i18n";
 
 function Avatars({ members, meId }: { members: PartyMember[]; meId?: string }) {
@@ -57,9 +58,27 @@ export function WatchPartyPage() {
   const [codeInput, setCodeInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [searchParams] = useSearchParams();
+  const joinParam = normalizePartyCode(searchParams.get("join"));
+  const autoJoinedRef = useRef(false);
 
   useEffect(() => subscribeRoom(setRoomInfo), []);
   useEffect(() => subscribeMembers(setMembers), []);
+
+  // Invite link (?join=CODE): prefill and auto-join once a session exists.
+  useEffect(() => {
+    if (joinParam) setCodeInput(joinParam);
+  }, [joinParam]);
+
+  useEffect(() => {
+    if (!ready || !user || !joinParam || roomInfo || autoJoinedRef.current) return;
+    autoJoinedRef.current = true;
+    setBusy(true);
+    joinRoom(joinParam, user)
+      .catch(() => setErr(t.wpInvalidCode))
+      .finally(() => setBusy(false));
+  }, [ready, user?.id, joinParam, roomInfo]);
 
   // Client: the instant the host broadcasts an episode, follow into the player.
   useEffect(() => {
@@ -105,6 +124,18 @@ export function WatchPartyPage() {
             <p className="mt-3 text-xs text-text-muted">
               {roomInfo.role === "host" ? t.wpShareHint : t.wpHostPicking}
             </p>
+            <button
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(partyShareText(roomInfo.code));
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 1500);
+                } catch {}
+              }}
+              className="mt-4 rounded-full border border-accent/40 bg-white/5 px-5 py-2 text-xs font-bold text-white transition hover:bg-white/10"
+            >
+              {copied ? t.copied : t.wpInvite}
+            </button>
           </div>
 
           <div className="flex items-center gap-2">

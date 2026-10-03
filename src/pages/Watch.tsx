@@ -4,7 +4,7 @@ import Hls from "hls.js";
 import {
   fetchVideoServers, fetchCompleteVideoServers, enrichServersFromUp4, resolveVideo, fetchEpisodes, fetchEpisodesUp4,
   resolveUp4EpisodeUrl, fetchAnime3rbServers, fetchAnime3rbServersByUrl,
-  isDefinitiveMiss, clearDefinitiveMiss,
+  isDefinitiveMiss, clearDefinitiveMiss, prefetchAnime3rbServers,
   invalidateServersCache, invalidateResolveCache, invalidateNetworkCaches,
   type VideoServer, type Episode,
 } from "../lib/api";
@@ -31,9 +31,19 @@ import {
   type DownloadStatus, type DownloadMeta,
 } from "../lib/downloads";
 import { DownloadPicker } from "../components/DownloadPicker";
+import { CompanionPanel } from "../components/CompanionPanel";
 import { t } from "../lib/i18n";
 import { useAuth } from "../lib/auth";
 import { useWatchPartySync, createRoom } from "../lib/watchParty";
+import { getAutoplayNext, getAutoSkipIntro, getPrefetchNext } from "../lib/settings";
+import {
+  getEpisodeSkipTimes, activeSkipInterval,
+  type EpisodeSkipTimes, type ActiveSkip,
+} from "../lib/aniskip";
+import {
+  NEXT_EPISODE_COUNTDOWN_SECONDS, nextSleepPreset, sleepMinutesLeft,
+} from "../lib/playerExtras";
+import { seasonNum, slugToTitle } from "../lib/relations";
 
 type ServerWithSource = VideoServer & { source?: string };
 
@@ -308,6 +318,47 @@ export function WatchPage() {
   // uses it to avoid force-resuming a pause the user actually wanted (a pause
   // aborts the media fetch, which fires `stalled`).
   const userPausedRef = useRef(false);
+
+  // ── PLAYER EXTRAS (AniSkip · autoplay-next · sleep timer · PiP · companion) ──
+  // AniSkip OP/ED intervals for this episode. `activeSkip` drives the manual
+  // skip pill; with auto-skip on we seek instantly and never set it. The 85s
+  // heuristic further down stays as the fallback when AniSkip has no data.
+  const [skipTimes, setSkipTimes] = useState<EpisodeSkipTimes | null>(null);
+  const [activeSkip, setActiveSkip] = useState<ActiveSkip | null>(null);
+  const autoSkipIntroRef = useRef(false);
+  const skippedIntervalsRef = useRef<Set<string>>(new Set());
+  // Next-episode autoplay countdown (gated by the Settings preference).
+  const [nextCountdown, setNextCountdown] = useState<number | null>(null);
+  const autoplayNextRef = useRef(true);
+  const autoAdvancedRef = useRef(false);
+  const prefetchNextRef = useRef(true);
+  const a3rbPrefetchGuardRef = useRef<string | null>(null);
+  const nextEpisodeRef = useRef<Episode | null>(null);
+  // Sleep timer: chosen preset in minutes (null = off), wall-clock deadline,
+  // and a 30s-refreshed "minutes left" label.
+  const [sleepPreset, setSleepPreset] = useState<number | null>(null);
+  const [sleepEndsAt, setSleepEndsAt] = useState<number | null>(null);
+  const [sleepMinutes, setSleepMinutes] = useState(0);
+  // Small HUD pill for skip / sleep-timer feedback (mobile's showToast).
+  const [hudToast, setHudToast] = useState<string | null>(null);
+  const [isPip, setIsPip] = useState(false);
+  const [companionOpen, setCompanionOpen] = useState(false);
+  // Sidecar subtitle on/off (mobile's cycle ends at "off"); the size/position
+  // prefs above are unaffected.
+  const [subtitlesOn, setSubtitlesOn] = useState(true);
+
+  // Load the player preferences once.
+  useEffect(() => {
+    getAutoplayNext().then((v) => { autoplayNextRef.current = v; }).catch(() => {});
+    getAutoSkipIntro().then((v) => { autoSkipIntroRef.current = v; }).catch(() => {});
+    getPrefetchNext().then((v) => { prefetchNextRef.current = v; }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (hudToast == null) return;
+    const timer = window.setTimeout(() => setHudToast(null), 2200);
+    return () => window.clearTimeout(timer);
+  }, [hudToast]);
 
   // ── WATCH PARTY ──
   // Sync this player with a room. Host broadcasts its <video> state on a
@@ -1365,6 +1416,7 @@ export function WatchPage() {
   // very bottom of the frame, neither of which we want.
   const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[] | null>(null);
   const [subtitleText, setSubtitleText] = useState<string | null>(null);
+  const subtitleTrackLabel = resolved?.subtitles?.[0]?.label || resolved?.subtitles?.[0]?.lang || t.subtitleTrack(1);
   useEffect(() => {
     const track = resolved?.subtitles?.[0];
     if (!track?.url || !window.pantoufa?.fetchText) {
@@ -2151,7 +2203,7 @@ export function WatchPage() {
     };
   }, [siblings, episodeUrl]);
 
-  const navTo = useCallback((ep: Episode) => {
+  const navTo = useCallback((ep: Episode, auto = false) => {
     if (partyClientRef.current) return; // host drives episode changes in a party
     if (!ep.href) return;
     // Match the anime4up sibling by episode number. Do NOT try to derive
@@ -2167,9 +2219,213 @@ export function WatchPage() {
     const title = titleParam || meta.animeTitle || animeTitleFromDetail;
     if (title) p.set("title", title);
     if (ep.number != null) p.set("ep", String(ep.number));
+    // Autoplay hop: play the next episode straight away instead of landing on
+    // the click-to-start gate (same convention as mobile's auto="1").
+    if (auto) p.set("auto", "1");
     const qs = p.toString();
     navigate(`/watch/${encodeURIComponent(ep.href)}${qs ? `?${qs}` : ""}`);
   }, [up4Siblings, animeParam, titleParam, meta.animeTitle, animeTitleFromDetail, navigate]);
+
+  /* ── AniSkip OP/ED (mobile parity) ──
+     Fetch per-episode intervals once the title/slug is known, then watch the
+     playhead. Manual mode shows the Skip Intro/Outro pill; auto mode seeks.
+     Only direct playback exposes a clock — a cross-origin embed can't be
+     observed or seeked, so embeds keep the plain heuristic affordance. */
+  useEffect(() => {
+    if (!episodeUrl) return;
+    const resolvedTitle = titleParam || meta.animeTitle || animeTitleFromDetail || slugTitle;
+    if (!resolvedTitle && !resolvedAnimeHref) return;
+    let cancelled = false;
+    getEpisodeSkipTimes({
+      title: resolvedTitle,
+      episodeNumber: currentEpNumber,
+      slugOrUrl: animeParam || resolvedAnimeHref || episodeUrl,
+      durationSeconds: duration,
+    }).then((res) => {
+      if (!cancelled && res?.found) setSkipTimes(res);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+    // `duration` intentionally not a dep: it flips 0 → real once playback
+    // starts and must not re-trigger the lookup.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [episodeUrl, currentEpNumber, titleParam, meta.animeTitle, animeTitleFromDetail, slugTitle, animeParam, resolvedAnimeHref]);
+
+  const skipActiveInterval = useCallback((active: ActiveSkip) => {
+    if (partyClientRef.current) return;
+    const v = videoRef.current; if (!v) return;
+    v.currentTime = v.duration ? Math.min(active.interval.endTime, v.duration) : active.interval.endTime;
+    setHudToast(active.type === "op" ? t.introSkipped : t.outroSkipped);
+    setActiveSkip(null);
+  }, []);
+
+  useEffect(() => {
+    if (!skipTimes?.found) { setActiveSkip(null); return; }
+    if (resolved?.type === "iframe" || resolved?.type === "dailymotion") { setActiveSkip(null); return; }
+    const check = () => {
+      const v = videoRef.current; if (!v) return;
+      const cur = v.currentTime || 0;
+      if (cur <= 0) return;
+      const currentActive = activeSkipInterval(cur, skipTimes);
+      if (currentActive) {
+        if (autoSkipIntroRef.current) {
+          if (!skippedIntervalsRef.current.has(currentActive.type)) {
+            skippedIntervalsRef.current.add(currentActive.type);
+            skipActiveInterval(currentActive);
+          }
+        } else {
+          setActiveSkip((prev) => (prev?.type === currentActive.type ? prev : currentActive));
+        }
+      } else {
+        setActiveSkip((prev) => (prev ? null : prev));
+      }
+    };
+    check();
+    const timer = window.setInterval(check, 500);
+    return () => window.clearInterval(timer);
+  }, [skipTimes, resolved?.type, skipActiveInterval]);
+
+  /* ── Autoplay next episode (countdown card, gated by Settings) ── */
+  useEffect(() => { nextEpisodeRef.current = next; }, [next]);
+  // Near-end watcher — direct playback only (embeds can't report `ended`).
+  useEffect(() => {
+    if (!resolvedUrl || resolved?.type === "iframe" || resolved?.type === "dailymotion") return;
+    const v = videoRef.current; if (!v) return;
+    const check = () => {
+      if (autoAdvancedRef.current || partyClientRef.current) return;
+      if (!autoplayNextRef.current || !nextEpisodeRef.current?.href) return;
+      const d = v.duration;
+      const nearEnd = (isFinite(d) && d > 0 && d - v.currentTime <= 10) || v.ended;
+      if (!nearEnd) return;
+      autoAdvancedRef.current = true;
+      setNextCountdown(NEXT_EPISODE_COUNTDOWN_SECONDS);
+    };
+    v.addEventListener("timeupdate", check);
+    v.addEventListener("ended", check);
+    return () => {
+      v.removeEventListener("timeupdate", check);
+      v.removeEventListener("ended", check);
+    };
+  }, [resolvedUrl, resolved?.type, episodeUrl]);
+
+  // Tick the countdown; zero navigates via navTo(auto). Watch-now / cancel
+  // clear the state while autoAdvancedRef stays burned for this episode.
+  useEffect(() => {
+    if (nextCountdown == null) return;
+    if (nextCountdown <= 0) {
+      setNextCountdown(null);
+      // A sleep timer / manual pause that landed during the countdown wins.
+      if (!userPausedRef.current && !partyClientRef.current) {
+        const ep = nextEpisodeRef.current;
+        if (ep?.href) navTo(ep, true);
+      }
+      return;
+    }
+    const timer = window.setTimeout(() => setNextCountdown((n) => (n == null ? null : n - 1)), 1000);
+    return () => window.clearTimeout(timer);
+  }, [nextCountdown, navTo]);
+
+  /* ── Sleep timer ── */
+  const cycleSleepTimer = useCallback(() => {
+    const nextPreset = nextSleepPreset(sleepPreset);
+    if (nextPreset == null) {
+      setSleepPreset(null);
+      setSleepEndsAt(null);
+      setHudToast(t.sleepTimerOff);
+    } else {
+      setSleepPreset(nextPreset);
+      setSleepEndsAt(Date.now() + nextPreset * 60_000);
+      setSleepMinutes(nextPreset);
+      setHudToast(t.sleepTimerOn(nextPreset));
+    }
+  }, [sleepPreset]);
+
+  useEffect(() => {
+    if (sleepEndsAt == null) return;
+    const fire = () => {
+      const v = videoRef.current;
+      if (v) {
+        userPausedRef.current = true;
+        try { v.pause(); } catch {}
+      } else {
+        // ponytail: cross-origin embeds can't be paused from the renderer —
+        // mute the window as the best available "stop". Add an iframe pause
+        // IPC if stopping embed audio ever matters.
+        setMutedSafe(true);
+      }
+      setSleepPreset(null);
+      setSleepEndsAt(null);
+      setHudToast(t.sleepTimerEnded);
+    };
+    const delay = sleepEndsAt - Date.now();
+    if (delay <= 0) { fire(); return; }
+    const timeout = window.setTimeout(fire, delay);
+    const labelTimer = window.setInterval(
+      () => setSleepMinutes(sleepMinutesLeft(sleepEndsAt, Date.now())),
+      30_000,
+    );
+    return () => { window.clearTimeout(timeout); window.clearInterval(labelTimer); };
+  }, [sleepEndsAt]);
+
+  /* ── Picture-in-Picture (custom <video> only; embeds have their own) ── */
+  const togglePip = useCallback(() => {
+    const v = videoRef.current; if (!v) return;
+    if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {});
+    else v.requestPictureInPicture?.().catch(() => {});
+  }, []);
+  useEffect(() => {
+    const v = videoRef.current; if (!v) return;
+    const onEnter = () => setIsPip(true);
+    const onLeave = () => setIsPip(false);
+    v.addEventListener("enterpictureinpicture", onEnter);
+    v.addEventListener("leavepictureinpicture", onLeave);
+    return () => {
+      v.removeEventListener("enterpictureinpicture", onEnter);
+      v.removeEventListener("leavepictureinpicture", onLeave);
+    };
+  }, [resolvedUrl]);
+
+  /* ── رفيق الأنمي — season-aware identity for the companion ── */
+  const companionCtx = useMemo(() => {
+    const parentHref = animeParam || resolvedAnimeHref || "";
+    const base = titleParam || meta.animeTitle || animeTitleFromDetail || slugTitle || "";
+    const seasonFromTitle = seasonNum(base);
+    const seasonFromHref = seasonNum(parentHref) || (episodeUrl ? seasonNum(episodeUrl) : 0);
+    // Only append a season when the title doesn't carry one and the URL slug
+    // proves it; never invent one.
+    const title = seasonFromTitle === 0 && seasonFromHref > 0
+      ? `${base} (الموسم ${seasonFromHref})`
+      : base;
+    const alt = slugToTitle(parentHref);
+    const altTitle = alt && alt.toLowerCase() !== base.toLowerCase() ? alt : "";
+    return { title, season: seasonFromTitle || seasonFromHref || 0, altTitle };
+  }, [animeParam, resolvedAnimeHref, titleParam, meta.animeTitle, animeTitleFromDetail, slugTitle, episodeUrl]);
+
+  /* ── Silent next-episode prefetch (gated by Settings) ── */
+  const prefetchTitle = meta.animeTitle || animeTitleFromDetail || slugTitle || titleParam;
+  useEffect(() => {
+    if (!isPlaying || !next?.href || !prefetchNextRef.current || !prefetchTitle) return;
+    const nextEpNum = next.number ?? (currentEpNumber != null ? currentEpNumber + 1 : null);
+    if (nextEpNum == null) return;
+    const guard = `${prefetchTitle}#${nextEpNum}`;
+    if (a3rbPrefetchGuardRef.current === guard) return;
+    const timer = window.setTimeout(() => {
+      a3rbPrefetchGuardRef.current = guard;
+      prefetchAnime3rbServers(prefetchTitle, nextEpNum);
+    }, 20_000);
+    return () => window.clearTimeout(timer);
+  }, [isPlaying, next, currentEpNumber, prefetchTitle]);
+
+  // Per-episode reset for the player extras (the component stays mounted on
+  // watch→watch hops).
+  useEffect(() => {
+    skippedIntervalsRef.current.clear();
+    setActiveSkip(null);
+    setSkipTimes(null);
+    setNextCountdown(null);
+    autoAdvancedRef.current = false;
+    a3rbPrefetchGuardRef.current = null;
+    setCompanionOpen(false);
+  }, [episodeUrl]);
 
   // ── Offline download of the current episode ──
   const [dlStatus, setDlStatus] = useState<DownloadStatus | null>(null);
@@ -2303,8 +2559,11 @@ export function WatchPage() {
   // the opening window (wide enough to catch cold-open/late openings), and only
   // for episodes long enough that an 85s jump won't overshoot the whole thing.
   // Actual visibility is gated by the auto-fade timer (skipIntroVisible).
+  // When AniSkip supplied real OP/ED markers, the smart pill below takes over;
+  // the heuristic only covers episodes AniSkip doesn't know.
   const showSkipIntroEligible =
     !!resolved && resolved.type !== "iframe" && resolved.type !== "dailymotion" &&
+    !skipTimes?.found &&
     duration > INTRO_WINDOW_END_SECONDS && currentTime > 1 && currentTime < INTRO_WINDOW_END_SECONDS;
   // Pop the pill up when the eligible window opens (and tuck it away when it
   // closes) without waiting for a mouse move.
@@ -2400,18 +2659,37 @@ export function WatchPage() {
                    <p className="text-sm">Loading embed player…</p>
                  </div>
                )}
-               {/* Fullscreen overlay button for iframe embeds — cross-origin
-                   fullscreen requests from inside the iframe can't be detected
-                   by the parent document, so we provide our own fullscreen
-                   toggle that reliably fills the entire screen. */}
+               {/* Overlay controls for iframe embeds — cross-origin fullscreen
+                   requests from inside the iframe can't be detected by the
+                   parent document, so we provide our own fullscreen toggle that
+                   reliably fills the entire screen. Sleep timer + companion
+                   live here too (embeds have no custom control bar). */}
                {iframeLoaded && !isFullscreen && (
-                 <button
-                   onClick={(e) => { e.stopPropagation(); toggleFs(); }}
-                   className="absolute bottom-3 right-3 z-30 rounded-lg bg-black/70 p-2 text-white/80 backdrop-blur-sm transition hover:bg-black/90 hover:text-white border border-white/10"
-                   title="Fullscreen"
-                 >
-                   <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" /></svg>
-                 </button>
+                 <div className="absolute bottom-3 right-3 z-30 flex items-center gap-2">
+                   <button
+                     onClick={(e) => { e.stopPropagation(); cycleSleepTimer(); }}
+                     className={`rounded-lg border border-white/10 bg-black/70 p-2 backdrop-blur-sm transition hover:bg-black/90 ${sleepEndsAt != null ? "text-accent" : "text-white/80 hover:text-white"}`}
+                     title={t.sleepTimerShort(sleepEndsAt != null ? sleepMinutes : 15)}
+                   >
+                     <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3a9 9 0 109 9 7 7 0 01-9-9z" /></svg>
+                   </button>
+                   {currentEpNumber != null && (
+                     <button
+                       onClick={(e) => { e.stopPropagation(); setCompanionOpen((o) => !o); }}
+                       className={`rounded-lg border border-white/10 bg-black/70 p-2 backdrop-blur-sm transition hover:bg-black/90 ${companionOpen ? "text-accent" : "text-white/80 hover:text-white"}`}
+                       title={t.companion}
+                     >
+                       <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.9 5.7L19.6 9.6l-5.7 1.9L12 17.2l-1.9-5.7L4.4 9.6l5.7-1.9L12 2zm6.5 12l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6z" /></svg>
+                     </button>
+                   )}
+                   <button
+                     onClick={(e) => { e.stopPropagation(); toggleFs(); }}
+                     className="rounded-lg border border-white/10 bg-black/70 p-2 text-white/80 backdrop-blur-sm transition hover:bg-black/90 hover:text-white"
+                     title="Fullscreen"
+                   >
+                     <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" /></svg>
+                   </button>
+                 </div>
                )}
              </>
           ) : (
@@ -2461,8 +2739,9 @@ export function WatchPage() {
             />
             {/* Sidecar subtitles — plain text, no caption box, sits just above
                 the control bar. Size + vertical position are user-adjustable
-                from the CC menu in the control bar. */}
-            {subtitleText && (
+                from the CC menu in the control bar; the CC menu also toggles
+                them off entirely (mobile parity). */}
+            {subtitlesOn && subtitleText && (
               <div
                 className="pointer-events-none absolute inset-x-6 z-20 flex justify-center"
                 style={{ bottom: `${subtitlePrefs.bottom}%` }}
@@ -2586,6 +2865,50 @@ export function WatchPage() {
               </button>
             )}
 
+            {/* AniSkip pill — shown while a real OP/ED interval is active
+                (manual mode; auto-skip seeks without ever setting activeSkip).
+                Hidden for party clients — the host drives the stream. */}
+            {activeSkip && !isPartyClient && (
+              <button
+                onClick={(e) => { e.stopPropagation(); skipActiveInterval(activeSkip); }}
+                className="group/skip absolute bottom-20 right-5 z-30 flex items-center gap-2 rounded-lg border border-accent/60 bg-black/70 px-4 py-2.5 text-sm font-bold text-white shadow-card backdrop-blur-md transition-all duration-300 hover:-translate-y-0.5 hover:bg-accent hover:text-black"
+              >
+                {activeSkip.type === "op" ? t.skipIntro : t.skipOutro}
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" className="transition group-hover/skip:translate-x-0.5"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" /></svg>
+              </button>
+            )}
+
+            {/* Next-episode countdown card — appears at ~10s left instead of
+                hopping instantly. "Watch now" / ✕ clear it; the auto-advance
+                is already burned for this episode either way. */}
+            {nextCountdown != null && next?.href && !isPartyClient && (
+              <div
+                dir="rtl"
+                className="absolute bottom-20 left-1/2 z-40 flex -translate-x-1/2 items-center gap-3 rounded-xl border border-white/15 bg-black/85 px-4 py-3 shadow-card backdrop-blur-md"
+              >
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border-2 border-accent text-sm font-extrabold tabular-nums text-white">
+                  {nextCountdown}
+                </div>
+                <div className="text-right">
+                  <p className="text-sm font-bold text-white">{t.nextEpisode}</p>
+                  <p className="text-[11px] text-text-muted">{t.autoplayNextIn(nextCountdown)}</p>
+                </div>
+                <button
+                  onClick={() => { setNextCountdown(null); if (next) navTo(next, true); }}
+                  className="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs font-bold text-black transition hover:bg-accent-bright"
+                >
+                  {t.watchNow}
+                </button>
+                <button
+                  onClick={() => setNextCountdown(null)}
+                  title={t.cancel}
+                  className="shrink-0 rounded-full p-1.5 text-white/70 transition hover:bg-white/10 hover:text-white"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
+                </button>
+              </div>
+            )}
+
             {/* Controls overlay */}
             <div
               className={`absolute inset-x-0 bottom-0 flex flex-col gap-1.5 bg-gradient-to-t from-black/90 via-black/45 to-transparent px-4 pb-3 pt-16 transition-opacity duration-300 ${
@@ -2699,6 +3022,17 @@ export function WatchPage() {
                             {t.subtitleReset}
                           </button>
                         </div>
+                        {/* On/off — mobile's cycle ends at "off"; size and
+                            position below are untouched while off. */}
+                        <button
+                          onClick={() => setSubtitlesOn((v) => !v)}
+                          className="mt-3 flex w-full items-center justify-between gap-2 rounded-md bg-white/5 px-2 py-1.5 transition hover:bg-white/10"
+                        >
+                          <span className="text-white/75">{t.subtitlesLabel}</span>
+                          <span className={subtitlesOn ? "font-bold text-accent" : "text-text-muted"}>
+                            {subtitlesOn ? t.subtitleOn(subtitleTrackLabel) : t.subtitleOff}
+                          </span>
+                        </button>
                         <div className="mt-3 flex items-center justify-between gap-2">
                           <span className="shrink-0 text-white/75">{t.subtitleSize}</span>
                           {/* dir=ltr: steppers read − value + in both locales */}
@@ -2767,6 +3101,40 @@ export function WatchPage() {
                   )}
                 </div>
 
+                {/* Sleep timer — cycles off → 15 → 30 → 45 → 60 → off */}
+                <button
+                  onClick={cycleSleepTimer}
+                  title={t.sleepTimerShort(sleepEndsAt != null ? sleepMinutes : 15)}
+                  className={`flex items-center gap-1 rounded-lg p-2 transition hover:bg-white/15 ${sleepEndsAt != null ? "text-accent" : ""}`}
+                >
+                  <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3a9 9 0 109 9 7 7 0 01-9-9z" /></svg>
+                  {sleepEndsAt != null && (
+                    <span className="text-[10px] font-bold tabular-nums">{sleepMinutes}</span>
+                  )}
+                </button>
+
+                {/* Picture-in-Picture — custom player only (direct streams) */}
+                {typeof document !== "undefined" && document.pictureInPictureEnabled && (
+                  <button
+                    onClick={togglePip}
+                    title={t.pip}
+                    className={`rounded-lg p-2 transition hover:bg-white/15 ${isPip ? "text-accent" : ""}`}
+                  >
+                    <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M19 7h-8v6h8V7zm4-4H1v18h22V3zm-2 16H3V5h18v14z" /></svg>
+                  </button>
+                )}
+
+                {/* رفيق الأنمي — spoiler-safe AI companion */}
+                {currentEpNumber != null && (
+                  <button
+                    onClick={() => setCompanionOpen((o) => !o)}
+                    title={t.companion}
+                    className={`rounded-lg p-2 transition hover:bg-white/15 ${companionOpen ? "text-accent" : ""}`}
+                  >
+                    <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.9 5.7L19.6 9.6l-5.7 1.9L12 17.2l-1.9-5.7L4.4 9.6l5.7-1.9L12 2zm6.5 12l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6z" /></svg>
+                  </button>
+                )}
+
                 {/* Watch Party — create a room (host) or open the room panel */}
                 <button
                   onClick={() => (party.role ? setPartyPanelOpen((o) => !o) : startParty())}
@@ -2833,6 +3201,13 @@ export function WatchPage() {
                 )}
               </>
             )}
+          </div>
+        )}
+        {/* HUD pill — skip / sleep-timer feedback (mobile's toast), shown over
+            both the custom player and iframe embeds. */}
+        {hudToast && (
+          <div className="pointer-events-none absolute bottom-24 left-1/2 z-40 -translate-x-1/2 rounded-full border border-white/10 bg-black/80 px-4 py-2 text-xs font-semibold text-white shadow-card backdrop-blur-md">
+            {hudToast}
           </div>
         )}
       </div>
@@ -2981,6 +3356,19 @@ export function WatchPage() {
         meta={downloadMeta}
         onClose={() => setDownloadMeta(null)}
       />
+      {/* رفيق الأنمي — spoiler-safe AI companion drawer. keyed by episode so
+          its chat state resets per episode. */}
+      {companionOpen && currentEpNumber != null && (
+        <CompanionPanel
+          key={episodeUrl}
+          title={companionCtx.title || meta.episodeTitle || t.companion}
+          spoilerBound={currentEpNumber}
+          episodeTitle={meta.episodeTitle || undefined}
+          seasonNumber={companionCtx.season || undefined}
+          altTitle={companionCtx.altTitle || undefined}
+          onClose={() => setCompanionOpen(false)}
+        />
+      )}
     </div>
   );
 }

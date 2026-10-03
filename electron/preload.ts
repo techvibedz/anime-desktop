@@ -23,6 +23,15 @@ contextBridge.exposeInMainWorld("pantoufa", {
   setVideoReferer: (embedUrl: string | null) =>
     ipcRenderer.invoke("pantoufa:set-video-referer", embedUrl),
   installUpdate: () => ipcRenderer.invoke("pantoufa:install-update"),
+  notify: (opts: { title: string; body: string; data?: unknown }) =>
+    ipcRenderer.invoke("pantoufa:notify", opts) as Promise<boolean>,
+  onNotificationClick: (handler: (data: unknown) => void) => {
+    const listener = (_evt: unknown, data: unknown) => handler(data);
+    ipcRenderer.on("pantoufa:notification-click", listener);
+    return () => ipcRenderer.removeListener("pantoufa:notification-click", listener);
+  },
+  checkForUpdates: () =>
+    ipcRenderer.invoke("pantoufa:check-updates") as Promise<{ ok: boolean; error?: string }>,
   onAuthCallback: (handler: (url: string) => void) => {
     const listener = (_evt: unknown, url: string) => handler(url);
     ipcRenderer.on("pantoufa:auth-callback", listener);

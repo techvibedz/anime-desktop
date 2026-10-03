@@ -3,7 +3,7 @@
 // Renderer (React) talks to us via IPC: `window.pantoufa.scrape(...)` is
 // exposed in preload.ts, which forwards to the IPC handler here.
 
-import { app, BrowserWindow, ipcMain, net, powerMonitor, protocol, session, shell } from "electron";
+import { app, BrowserWindow, ipcMain, net, Notification, powerMonitor, protocol, session, shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -94,6 +94,9 @@ let pendingAuthCallback: string | null = null;
 // In-flight offline downloads, keyed by item id, so a delete can abort one.
 const activeDownloads = new Map<string, AbortController>();
 let updateCheckInterval: ReturnType<typeof setInterval> | null = null;
+// Assigned in the packaged-only updater block below; the manual
+// `pantoufa:check-updates` IPC handler calls it. null in dev.
+let runUpdateCheck: (() => Promise<{ ok: boolean; error?: string }>) | null = null;
 
 // File-backed logger for electron-updater. Writes to <userData>/updater.log so
 // auto-update failures are diagnosable on the user's machine (packaged builds
@@ -3946,6 +3949,37 @@ app.whenReady().then(() => {
     try { autoUpdater.quitAndInstall(); return true; } catch { return false; }
   });
 
+  // Manual "check for updates" trigger (Settings). Reuses the same function
+  // the periodic check calls (assigned below in the packaged-only block).
+  ipcMain.handle("pantoufa:check-updates", async (): Promise<{ ok: boolean; error?: string }> => {
+    if (!runUpdateCheck) return { ok: false, error: "update checks are only available in packaged builds" };
+    try {
+      return await runUpdateCheck();
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  // Renderer-requested OS notification (no server push — fires while the app
+  // runs). A click focuses the app and forwards its payload to the renderer.
+  ipcMain.handle("pantoufa:notify", (_evt, opts: { title: string; body: string; data?: unknown }) => {
+    if (!Notification.isSupported()) return false;
+    try {
+      const n = new Notification({ title: String(opts?.title ?? ""), body: String(opts?.body ?? "") });
+      n.on("click", () => {
+        if (!mainWindow) return;
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+        mainWindow.webContents.send("pantoufa:notification-click", opts?.data ?? null);
+      });
+      n.show();
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
   createMainWindow();
 
   // Auto-updater: check GitHub releases on launch + every hour. Notifies the
@@ -3994,8 +4028,16 @@ app.whenReady().then(() => {
       });
     });
 
-    const check = () =>
-      autoUpdater.checkForUpdates().catch((e) => log.error("checkForUpdates threw:", e));
+    const check = async (): Promise<{ ok: boolean; error?: string }> => {
+      try {
+        await autoUpdater.checkForUpdates();
+        return { ok: true };
+      } catch (e) {
+        log.error("checkForUpdates threw:", e);
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    };
+    runUpdateCheck = check;
     setTimeout(check, 5000);
     updateCheckInterval = setInterval(check, 60 * 60 * 1000);
   }

@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import type { AnimeItem, SearchResult, EpisodeItem } from "../lib/api";
 import { extractEpisodeNumber } from "../lib/episode-utils";
 import { CompletionBadge } from "./CompletionBadge";
+import { MalCardBadge } from "./MalRating";
 import { t } from "../lib/i18n";
 
 type Item = AnimeItem | SearchResult;
@@ -33,8 +34,11 @@ export const AnimeCard = memo(function AnimeCard({ item }: { item: Item }) {
             {t.newBadge}
           </span>
         )}
+        {/* MAL score, top-start corner (mobile's PosterCard topRight slot).
+            The badge itself is anchored end/top, so the corner is set inline. */}
+        <MalCardBadge title={item.title} style={{ left: "auto", right: "0.5rem" }} />
         {item.type && (
-          <span className="absolute start-2 top-2 rounded-md bg-black/70 px-1.5 py-0.5 text-[10px] font-semibold text-white/90">
+          <span className="absolute bottom-2 start-2 rounded-md bg-black/70 px-1.5 py-0.5 text-[10px] font-semibold text-white/90">
             {item.type}
           </span>
         )}

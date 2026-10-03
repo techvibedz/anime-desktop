@@ -9,11 +9,22 @@ import { useNavigate } from "react-router-dom";
 import { fetchUpcomingAnime, type CatalogAnime } from "../lib/seasons";
 import { arFormat } from "../lib/anilistLabels";
 import { CatalogCard } from "../components/CatalogCard";
+import { CompletionBadge } from "../components/CompletionBadge";
+import { CardLayoutControl } from "../components/CardLayoutControl";
+import { useCardLayout, type CardLayout } from "../lib/cardLayout";
 import { Shimmer } from "../components/Shimmer";
 import { t } from "../lib/i18n";
 
 type SortMode = "popular" | "soon";
 const DAY = 24 * 60 * 60;
+
+// comfortable = the grid as it always was; compact packs one step denser;
+// list renders one row per item (poster thumb + text).
+const GRID: Record<CardLayout, string> = {
+  comfortable: "grid grid-cols-6 gap-4",
+  compact: "grid grid-cols-8 gap-3",
+  list: "flex flex-col gap-2",
+};
 
 function badgeFor(it: CatalogAnime): string | null {
   if (it.startAt) {
@@ -25,6 +36,7 @@ function badgeFor(it: CatalogAnime): string | null {
 }
 
 export function UpcomingPage() {
+  const { layout, setLayout } = useCardLayout("upcoming");
   const navigate = useNavigate();
   const [items, setItems] = useState<CatalogAnime[] | null>(null);
   const [sort, setSort] = useState<SortMode>("popular");
@@ -52,9 +64,12 @@ export function UpcomingPage() {
 
   return (
     <div className="space-y-5">
-      <div>
-        <h1 className="text-2xl font-bold text-white">{t.upcomingTitle}</h1>
-        <p className="mt-1 text-sm text-text-muted">{t.upcomingSub}</p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-white">{t.upcomingTitle}</h1>
+          <p className="mt-1 text-sm text-text-muted">{t.upcomingSub}</p>
+        </div>
+        <CardLayoutControl layout={layout} onChange={setLayout} />
       </div>
 
       <div className="flex gap-2">
@@ -74,13 +89,49 @@ export function UpcomingPage() {
       </div>
 
       {sorted === null ? (
-        <div className="grid grid-cols-6 gap-4">
-          {Array.from({ length: 18 }).map((_, i) => <Shimmer key={i} className="aspect-[2/3]" />)}
+        <div className={GRID[layout]}>
+          {Array.from({ length: layout === "list" ? 6 : 18 }).map((_, i) => (
+            <Shimmer key={i} className={layout === "list" ? "h-28" : "aspect-[2/3]"} />
+          ))}
         </div>
       ) : sorted.length === 0 ? (
         <p className="text-text-muted">{t.noResults}</p>
+      ) : layout === "list" ? (
+        <div className="flex flex-col gap-2">
+          {sorted.map((it) => {
+            const badge = badgeFor(it);
+            return (
+              <button
+                key={it.id}
+                type="button"
+                onClick={() => navigate(`/title/${it.id}`)}
+                className="group flex items-center gap-3 rounded-xl bg-surface p-2 text-start ring-1 ring-white/5 transition hover:ring-accent/50"
+              >
+                <div className="relative aspect-[2/3] w-16 shrink-0 overflow-hidden rounded-lg bg-bg">
+                  {it.image ? (
+                    <img src={it.image} alt={it.title} className="h-full w-full object-cover" loading="lazy" decoding="async" />
+                  ) : (
+                    <div className="h-full w-full shimmer" />
+                  )}
+                  <CompletionBadge titles={[it.title]} className="absolute bottom-1 end-1" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <h3 className="line-clamp-2 text-sm font-semibold text-text-secondary transition-colors group-hover:text-white">
+                    {it.title}
+                  </h3>
+                  <div className="mt-1 flex flex-wrap items-center gap-2">
+                    {it.score != null && it.score > 0 && (
+                      <span className="text-xs font-bold text-gold">★ {(it.score / 10).toFixed(1)}</span>
+                    )}
+                    {badge && <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-bold text-black">{badge}</span>}
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
       ) : (
-        <div className="grid grid-cols-6 gap-4">
+        <div className={GRID[layout]}>
           {sorted.map((it) => (
             <CatalogCard
               key={it.id}

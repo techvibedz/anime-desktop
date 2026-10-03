@@ -34,6 +34,8 @@ import { getAltTitles, clearAltTitlesCache } from "./altTitles";
 import { getAnimeYearType, clearAnimeYearTypeCache } from "./airing";
 import { animeTitleKey } from "./history";
 import { createRequestCache, withTimeout } from "./requestCache";
+import { writeCloudHome, readCloudHome } from "./homeCloudCache";
+import { readCloudMetadata, writeCloudMetadata } from "./metadataCache";
 import {
   anime4upEpisodeUrl,
   episodeNumberFromUrl,
@@ -169,6 +171,9 @@ async function fetchHomeFresh(): Promise<HomePayload> {
   if (anime4upRecent?.episodes.length) wit = { ...wit, episodes: anime4upRecent.episodes };
   const result = buildHomePayload(wit);
   void writeCache(HOME_CACHE_KEY, result);
+  // Scout upload: successful live scrapes seed the crowdsourced cloud cache so
+  // devices whose ISP blocks every source still get a home feed.
+  void writeCloudHome(result);
   return result;
 }
 
@@ -206,7 +211,14 @@ export async function fetchHome(onUpdated?: (p: HomePayload) => void): Promise<H
     }
     return cached;
   }
-  return fetchHomeFreshShared();
+  try {
+    return await fetchHomeFreshShared();
+  } catch (e) {
+    // Last-resort failover: a crowdsourced home feed uploaded by another device.
+    const cloud = await readCloudHome<HomePayload>().catch(() => null);
+    if (cloud) return cloud;
+    throw e;
+  }
 }
 
 // Drop the home cache so the next fetchHome() re-scrapes from scratch instead
@@ -353,7 +365,11 @@ async function fetchEpisodesFresh(animeUrl: string): Promise<EpisodesPayload> {
         episodes: a?.episodes || [], episodes4up: [], merged: null, up4Hint: null,
       },
     };
-    if (a) void writeCache(DETAIL_CACHE_PREFIX + animeUrl, payload);
+    if (a) {
+      void writeCache(DETAIL_CACHE_PREFIX + animeUrl, payload);
+      if (payload.data.episodes.length > 0)
+        void writeCloudMetadata(animeUrl, payload, payload.data.episodes.length, payload.data.title);
+    }
     return payload;
   }
   const d = /anime4up/i.test(animeUrl)
@@ -376,6 +392,8 @@ async function fetchEpisodesFresh(animeUrl: string): Promise<EpisodesPayload> {
     data: { title: cleanAnimeTitle(d.title) || titleFromSlug(animeUrl), poster: d.poster, banner: d.poster, synopsis: cleanSynopsis(d.synopsis), genres: d.genres, rating: null, metadata: {}, externalLinks: [], totalEpisodes: d.episodes.length, episodes: d.episodes, episodes4up: [], merged: null, up4Hint: d.up4Url ?? null },
   };
   void writeCache(DETAIL_CACHE_PREFIX + animeUrl, payload);
+  if (payload.data.episodes.length > 0)
+    void writeCloudMetadata(animeUrl, payload, payload.data.episodes.length, payload.data.title);
   return payload;
 }
 
@@ -406,6 +424,18 @@ export async function fetchEpisodes(animeUrl: string, onUpdated?: (p: EpisodesPa
       })
       .catch(() => {});
     return clean(cached);
+  }
+  // Second tier: crowdsourced cloud metadata (community-verified entries served
+  // instantly, then silently revalidated) before paying for a live scrape.
+  const cloud = await readCloudMetadata<EpisodesPayload>(animeUrl).catch(() => null);
+  if (cloud?.payload) {
+    void fetchEpisodesFresh(animeUrl)
+      .then((fresh) => {
+        if (onUpdated && fresh?.data && detailSignature(fresh) !== detailSignature(cloud.payload))
+          onUpdated(clean(fresh));
+      })
+      .catch(() => {});
+    return clean(cloud.payload);
   }
   return clean(await fetchEpisodesFresh(animeUrl));
 }

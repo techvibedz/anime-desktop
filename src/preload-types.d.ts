@@ -22,6 +22,9 @@ declare global {
       openExternal: (url: string) => Promise<boolean>;
       setVideoReferer: (embedUrl: string | null) => Promise<boolean>;
       installUpdate: () => Promise<boolean>;
+      notify: (opts: { title: string; body: string; data?: unknown }) => Promise<boolean>;
+      onNotificationClick: (handler: (data: unknown) => void) => () => void;
+      checkForUpdates: () => Promise<{ ok: boolean; error?: string }>;
       onAuthCallback: (handler: (url: string) => void) => () => void;
       onUpdateAvailable: (handler: (info: UpdateInfo) => void) => () => void;
       onUpdateDownloaded: (handler: (info: UpdateInfo) => void) => () => void;
