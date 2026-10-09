@@ -87,7 +87,8 @@ const VIDEO_UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, lik
 // if we extract the URL under a different UA than the one the <video> element
 // (mainWindow) plays it with, mp4upload's CDN rejects the token with 403 and
 // the player goes black. So mp4upload's server-side extraction fetch uses this.
-const PLAYBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const PLAYBACK_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Safari/537.36`;
+const witGateRedirects = new Map<string, string>();
 
 let mainWindow: BrowserWindow | null = null;
 let pendingAuthCallback: string | null = null;
@@ -169,9 +170,9 @@ protocol.registerSchemesAsPrivileged([
       supportFetchAPI: true,
       stream: true,
       bypassCSP: true,
-      // NOTE: corsEnabled triggers preflight handling that fights with the
-      // CORS headers we set manually on the response. Leaving it off and
-      // adding ACAO:* ourselves is more reliable across providers.
+      // Current Chromium requires the scheme to opt into CORS for hls.js
+      // XHR. The handler below answers OPTIONS without an upstream request.
+      corsEnabled: true,
     },
   },
   {
@@ -223,7 +224,7 @@ function isAdHost(host: string): boolean {
   // witanime rotates through free TLDs that AD_HOST_RE blocks wholesale
   // (.life is in that list, and .site/.net are one rotation away from it).
   // Its own domains and its image CDN (images.witanime.*) are never ads.
-  return !/(^|\.)witanime\.[a-z]{2,}$/i.test(host) && AD_HOST_RE.test(host);
+  return !/(^|\.)(?:witanime\.[a-z]{2,}|vik(?:i|1)ngfile\.(?:com|site))$/i.test(host) && AD_HOST_RE.test(host);
 }
 
 // Canonical Referer/Origin a provider's embed expects, keyed by hostname.
@@ -278,9 +279,7 @@ function createMainWindow() {
   // particular) refuse to play in user agents they don't recognize as
   // a real browser; presenting a plain desktop Chrome string sidesteps
   // those detection rules.
-  mainWindow.webContents.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-  );
+  mainWindow.webContents.setUserAgent(PLAYBACK_UA);
 
   mainWindow.webContents.setWindowOpenHandler(({ url, referrer }) => {
     // Only open external browser for links originating from our own
@@ -827,7 +826,7 @@ async function extractViaCapture(
   try {
     const result = await enqueue({
       url: iframeUrl,
-      injectBefore: VIDEO_HOOK_INSTALL,
+      injectBefore: /vik(?:i|1)ngfile\.(?:com|site)/i.test(iframeUrl) ? undefined : VIDEO_HOOK_INSTALL,
       injectAfter: EXTRACT_VIDEO_URL,
       timeoutMs,
       isVideoJob: true,
@@ -1352,13 +1351,52 @@ async function extractDood(
   }
 }
 
-// vk: the video_ext.php embed HTML inlines a player JSON with progressive
-// MP4s keyed "url240"…"url1080" plus an optional "hls" manifest.
+async function extractShare4max(iframeUrl: string): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+  try {
+    const response = await session.defaultSession.fetch(iframeUrl, { signal: AbortSignal.timeout(8000), headers: { "User-Agent": PLAYBACK_UA } });
+    if (!response.ok) { console.info('[share4max] page status', response.status); return null; }
+    const html = await response.text();
+    const data = html.match(/<script\b[^>]*data-page=["']app["'][^>]*>([\s\S]*?)<\/script>/i)?.[1];
+    if (!data) { console.info('[share4max] missing manifest'); return null; }
+    const page = JSON.parse(data);
+    const pageUrl = response.url || iframeUrl;
+    const manifest = await session.defaultSession.fetch(pageUrl, {
+      signal: AbortSignal.timeout(10000),
+      headers: { "User-Agent": PLAYBACK_UA, "X-Inertia": "true", "X-Inertia-Version": page.version,
+        "X-Inertia-Partial-Component": page.component, "X-Inertia-Partial-Data": "streams", "X-Requested-With": "XMLHttpRequest", "X-Pantoufa-Proxy": "1" },
+    });
+    if (!manifest.ok) { console.info('[share4max] streams status', manifest.status); return null; }
+    const streams = (await manifest.json())?.props?.streams?.data;
+    if (!Array.isArray(streams)) return null;
+    for (const stream of streams.sort((a, b) => parseInt(b.label) - parseInt(a.label))) {
+      for (const mirror of stream.mirrors || []) {
+        if (mirror.driver !== "mp4upload" || typeof mirror.link !== "string") continue;
+        let url: string;
+        try { url = new URL(mirror.link, pageUrl).toString(); } catch { continue; }
+        if (!/(^|\.)mp4upload\.com$/i.test(new URL(url).hostname)) continue;
+        const resolved = await extractMp4upload(url);
+        if (resolved) {
+          try {
+            const probe = await fetch(resolved.url, { headers: { "User-Agent": PLAYBACK_UA, Referer: "https://www.mp4upload.com/", Range: "bytes=0-1" }, signal: AbortSignal.timeout(4000) });
+            await probe.body?.cancel();
+            if (probe.ok) return resolved;
+          } catch {}
+        }
+      }
+    }
+  } catch (error) { console.info('[share4max] request failed', String(error)); }
+  return null;
+}
+
+// VK embeds publish progressive quality keys and an optional HLS manifest.
 async function extractVk(
   iframeUrl: string,
+  background = false,
 ): Promise<{ url: string; type: "hls" | "mp4" } | null> {
   try {
-    const resp = await session.defaultSession.fetch(iframeUrl, {
+    const canonical = new URL(iframeUrl);
+    if (canonical.hostname === "vkvideo.ru") canonical.hostname = "vk.com";
+    const resp = await session.defaultSession.fetch(canonical.toString(), {
       method: "GET",
       signal: AbortSignal.timeout(8000),
       headers: {
@@ -1374,20 +1412,37 @@ async function extractVk(
     if (!resp.ok) return null;
     const html = await resp.text();
     const unesc = (s: string) => s.replace(/\\\//g, "/").replace(/\\u0026/g, "&").replace(/&amp;/g, "&");
-    let best: { q: number; url: string } | null = null;
-    const re = /"url(\d{3,4})"\s*:\s*"([^"]+)"/g;
+    const candidates: { q: number; url: string }[] = [];
+    const re = /"(?:url|mp4_)(\d{3,4})"\s*:\s*"([^"]+)"/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(html))) {
       const q = parseInt(m[1], 10);
       const url = unesc(m[2]);
-      if (!/^https?:\/\//.test(url)) continue;
-      if (!best || q > best.q) best = { q, url };
+      if (!/^https?:\/\//.test(url) || DECOY_RE.test(url)) continue;
+      candidates.push({ q, url });
     }
-    if (best) {
-      console.info(`[extractVk] mp4 ${best.q}p → ${best.url}`);
-      return { url: best.url, type: "mp4" };
+    const failover = html.match(/"failover_host"\s*:\s*"([^"]+)"/)?.[1];
+    if (failover && /(^|\.)(?:vkuser\.net|okcdn\.ru)$/i.test(failover)) {
+      for (const candidate of [...candidates]) {
+        const alternate = new URL(candidate.url);
+        if (!/(^|\.)(?:vkuser\.net|okcdn\.ru)$/i.test(alternate.hostname)) continue;
+        alternate.hostname = failover;
+        candidates.push({ q: candidate.q, url: alternate.toString() });
+      }
     }
-    const hls = html.match(/"hls"\s*:\s*"([^"]+)"/);
+    const unreachable = new Set<string>();
+    for (const candidate of candidates.sort((a, b) => b.q - a.q)) {
+      const host = new URL(candidate.url).hostname;
+      if (unreachable.has(host)) continue;
+      try {
+        const probe = await fetch(candidate.url, { headers: { "User-Agent": PLAYBACK_UA, Referer: "https://vk.com/", Range: "bytes=0-1" }, signal: AbortSignal.timeout(4000) });
+        await probe.body?.cancel();
+        if (!probe.ok) continue;
+        return { url: candidate.url, type: "mp4" };
+      } catch { unreachable.add(host); }
+    }
+    if (candidates.length) return extractViaCapture(iframeUrl, "extractVk", 30000, background);
+    const hls = html.match(/"hls(?:_fmp4)?"\s*:\s*"([^"]+)"/);
     if (hls) {
       const url = unesc(hls[1]);
       if (/^https?:\/\//.test(url)) {
@@ -2258,47 +2313,24 @@ async function extractVid3rb(
   return { url: fallback, type: /\.m3u8(\?|$)/i.test(fallback) ? "hls" : "mp4" };
 }
 
-// Open-ended Range requests must be chunked so the proxy never buffers a
-// whole 100MB+ progressive file before responding. HLS segments are the one
-// exception: they are the player's own unit of meaning (2-10MB) and capping
-// them at the 1MB first-chunk silently truncated everything bigger — hls.js's
-// xhr-loader counts the truncated window as the complete segment
-// (stats.loaded = stats.total), so the tail was dropped without an error and
-// playback stalled or garbled. Segments get one wide 32MB window (never
-// truncates a real segment, still bounds a pathological whole-file ".ts");
-// progressive media keeps the small first chunk (fast moov/first frames) then
-// 4MB steady chunks
-// (a 1MB cap on every chunk forced a fresh CDN round-trip every few seconds
-// and WAS the mid-playback stutter the tiny-cap comment warned about).
-function mediaChunkRange(
-  isLargeMedia: boolean,
-  isHlsSegment: boolean,
-  range: string | null,
-): string | null {
+// Progressive bodies stream with the original Range; only buffered HLS
+// segments get a wide window so their tails cannot be truncated.
+function mediaChunkRange(isLargeMedia: boolean, isHlsSegment: boolean, range: string | null): string | null {
   if (!isLargeMedia) return range;
-  const FIRST_CHUNK = 1 * 1024 * 1024;
-  const STEADY_CHUNK = 4 * 1024 * 1024;
-  // Real segments are a few MB — a 32MB window never truncates one, while a
-  // pathological whole-file ".ts" still gets bounded instead of buffering the
-  // entire body in the main process. A client-sent segment range is already
-  // bounded by hls.js (byte-range playlists), so leave it alone.
-  const SEGMENT_MAX = 32 * 1024 * 1024;
-  if (isHlsSegment) {
-    if (!range) return `bytes=0-${SEGMENT_MAX - 1}`;
-    return range;
+  if (!isHlsSegment) return range || "bytes=0-";
+  return range || "bytes=0-33554431";
+}
+
+async function fetchVideoUpstream(target: string, init: Parameters<typeof session.defaultSession.fetch>[1], progressive = false) {
+  // System fetch avoids Chromium transport failures when streaming progressive bodies.
+  if (progressive) return fetch(target, init as RequestInit);
+  try { return await session.defaultSession.fetch(target, init); }
+  catch (error) {
+    // Signed CDN URLs can be reachable through system DNS while Chromium's
+    // resolver is reset or blocked. Keep the same headers, Range and abort.
+    if (!/net::ERR_(?:CONNECTION_|NAME_NOT_RESOLVED|DNS_|TIMED_OUT|INVALID_ARGUMENT|FAILED)/.test(String(error))) throw error;
+    return fetch(target, init as RequestInit);
   }
-  if (!range) return `bytes=0-${FIRST_CHUNK - 1}`;
-  // bytes=START- (open-ended) → bytes=START-(START+CHUNK-1)
-  const m = range.match(/^bytes=(\d+)-(\d*)$/);
-  if (m) {
-    const start = parseInt(m[1], 10);
-    const end = m[2] ? parseInt(m[2], 10) : NaN;
-    const cap = start === 0 ? FIRST_CHUNK : STEADY_CHUNK;
-    if (!isFinite(end) || end - start > cap - 1) {
-      return `bytes=${start}-${start + cap - 1}`;
-    }
-  }
-  return range;
 }
 
 function registerVideoProxy() {
@@ -2436,7 +2468,7 @@ function registerVideoProxy() {
     // Chrome desktop UA if we're called before the window is up.
     const iframeUa =
       mainWindow?.webContents.getUserAgent() ||
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+      PLAYBACK_UA;
 
     const baseHeaders: Record<string, string> = {
       "User-Agent": iframeUa,
@@ -2479,7 +2511,9 @@ function registerVideoProxy() {
     inFlightProxyTargets.add(cachebusted);
     if (cachebusted !== target) inFlightProxyTargets.add(target);
     try {
-      const upstream = await session.defaultSession.fetch(cachebusted, {
+      const filename = new URL(target).pathname.split("/").pop() || "";
+      const progressive = /\.(?:mp4|mkv|webm|ogg)$/i.test(filename) || !/\.[a-z0-9]{2,5}$/i.test(filename);
+      const upstream = await fetchVideoUpstream(cachebusted, {
         method,
         headers: {
           ...baseHeaders,
@@ -2491,7 +2525,7 @@ function registerVideoProxy() {
         cache: "no-store",
         bypassCustomProtocolHandlers: true,
         signal,
-      });
+      }, progressive);
 
       if (!upstream.ok) throw new Error(`${strat.name} → ${upstream.status}`);
       return { upstream, strategy: strat.name };
@@ -2658,7 +2692,7 @@ function registerVideoProxy() {
       // causing the renderer to time out → black screen. For direct .mp4
       // playback we use a small first-chunk so the moov atom + first
       // frames arrive fast.
-      const isMp4 = /\.mp4(\?|$)/i.test(target);
+      const isProgressive = /\.(?:mp4|mkv|webm|ogg)(\?|$)/i.test(target);
       const isHlsSegment = /\.(m4s|ts)(\?|$)/i.test(target);
       const isManifest = /\.(m3u8|mpd)(\?|$)/i.test(target);
       // Extension-less CDN media (ok.ru/mycdn.me progressive mp4, doodstream
@@ -2669,7 +2703,7 @@ function registerVideoProxy() {
       // detected by content-type below, so chunking them is harmless.
       const lastSeg = target.split("?")[0].split("#")[0].split("/").pop() || "";
       const hasExtension = /\.[a-z0-9]{2,5}$/i.test(lastSeg);
-      const isLargeMedia = isMp4 || isHlsSegment || (!isManifest && !hasExtension);
+      const isLargeMedia = isProgressive || isHlsSegment || (!isManifest && !hasExtension);
       const range = mediaChunkRange(isLargeMedia, isHlsSegment, request.headers.get("range"));
 
       // Progressive media is chunked, so a single transient chunk failure (a CDN
@@ -2734,11 +2768,20 @@ function registerVideoProxy() {
         });
       }
 
-      // NOTE: I tried streaming upstream.body straight through but Electron
-      // 33's protocol.handle doesn't reliably pipe Session.fetch ReadableStreams
-      // for large bodies — mp4upload + videa came back broken. Buffering via
-      // arrayBuffer is slower at first byte but actually plays. Acceptable
-      // tradeoff for now; revisit if the streaming bug is fixed upstream.
+      // Current Electron streams progressive media with the browser's real
+      // Range; artificial chunks prevented WebM/MP4 from seeking past them.
+      if (isLargeMedia && !isHlsSegment) {
+        const headers = new Headers();
+        for (const name of ["content-type", "content-length", "content-range", "etag", "last-modified"]) {
+          const value = upstream.headers.get(name);
+          if (value) headers.set(name, value);
+        }
+        headers.set("Accept-Ranges", "bytes");
+        headers.set("Access-Control-Allow-Origin", "*");
+        headers.set("Cache-Control", "no-store");
+        console.info(`[pantoufa-video] stream ${upstream.status} (${strategy}) ${target} ${range}`);
+        return new Response(request.method === "HEAD" ? null : upstream.body, { status: upstream.status, headers });
+      }
       let buf = await upstream.arrayBuffer();
 
       const outHeaders = new Headers();
@@ -3128,6 +3171,12 @@ app.whenReady().then(() => {
     } catch {}
     callback({});
   });
+  session.defaultSession.webRequest.onBeforeRedirect((details) => {
+    const token = details.url.match(/^https:\/\/witanime\.site\/watch\/stream-gate\/([a-f0-9]{64})$/i)?.[1];
+    if (!token || !/^https?:\/\//i.test(details.redirectURL)) return;
+    if (witGateRedirects.size >= 256) witGateRedirects.delete(witGateRedirects.keys().next().value!);
+    witGateRedirects.set(token, details.redirectURL);
+  });
 
   // The provider's embed iframe makes its own fetches to its CDN for
   // playlists and segments. Some CDNs (mp4upload, streamwish family)
@@ -3147,6 +3196,17 @@ app.whenReady().then(() => {
       // media). Never touch mainFrame/subFrame navigations — the iframe
       // needs to load the embed page with its native Referer chain.
       const rt = (details as any).resourceType;
+      // Verification requests need the browser's own Origin and Referer.
+      if (new URL(details.url).hostname === "challenges.cloudflare.com") {
+        callback({ requestHeaders: details.requestHeaders });
+        return;
+      }
+      if (new URL(details.url).hostname === "witanime.site") {
+        const headers = details.requestHeaders;
+        headers["Sec-CH-UA"] = `"Chromium";v="${process.versions.chrome.split(".")[0]}", "Not_A Brand";v="99"`;
+        headers["Sec-CH-UA-Mobile"] = "?0";
+        headers["Sec-CH-UA-Platform"] = JSON.stringify(process.platform === "win32" ? "Windows" : "Linux");
+      }
       // Our own app frame — never touch.
       if (rt === "mainFrame") {
         callback({ requestHeaders: details.requestHeaders });
@@ -3274,6 +3334,10 @@ app.whenReady().then(() => {
         } else if (/videa|vidvaita|vidit/.test(host)) {
           ref = "https://videa.hu/";
           ori = "https://videa.hu";
+        } else if (/(^|\.)(?:vkuser\.net|okcdn\.ru)$/.test(host) && /^https:\/\/(?:vk\.com|vkvideo\.ru)$/.test(currentDirectEmbedOrigin || "")) {
+          ref = "https://vk.com/";
+          ori = "https://vk.com";
+          force = true;
         } else if (/dailymotion|dmcdn/.test(host)) {
           ref = "https://www.dailymotion.com/";
           ori = "https://www.dailymotion.com";
@@ -3401,7 +3465,11 @@ app.whenReady().then(() => {
         return await extractDood(opts.iframeUrl);
       }
       if (opts.provider === "vk") {
-        return await extractVk(opts.iframeUrl);
+        return await extractVk(opts.iframeUrl, opts.background);
+      }
+      if (opts.provider === "share4max") {
+        const resolved = await extractShare4max(opts.iframeUrl);
+        if (resolved) return resolved;
       }
       if (opts.provider === "vid3rb") {
         return await extractVid3rb(opts.iframeUrl);
@@ -3420,7 +3488,7 @@ app.whenReady().then(() => {
         opts.provider === "videas" ||
         // luluvdo/lulustream serve plain .m3u8/.mp4 player requests the
         // generic pass captures — keeps them on the native player.
-        opts.provider === "luluvdo"
+        opts.provider === "luluvdo" || opts.provider === "vikingfile"
       ) {
         const viaHtml = await extractViaHtml(opts.iframeUrl, `extract:${opts.provider}`);
         if (viaHtml) return viaHtml;
@@ -3551,19 +3619,9 @@ app.whenReady().then(() => {
     try {
       const episode = new URL(rawUrl);
       if (episode.protocol !== "https:" || episode.hostname !== "witanime.site" || !episode.pathname.startsWith("/watch/")) return null;
-      const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-      // Episode-page fetch only (titles + the page HTML). The player handshake
-      // itself runs inside a hidden window — see the in-page script below.
-      const request = async (url: string, init: RequestInit) => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 12000);
-        try {
-          return await session.defaultSession.fetch(url, { ...init, credentials: "include", signal: controller.signal });
-        } finally { clearTimeout(timer); }
-      };
-      const page = await request(episode.toString(), { headers: { "User-Agent": ua, Accept: "text/html", Referer: "https://witanime.site/" } });
-      if (!page.ok) return null;
-      const html = await page.text();
+      // Read metadata in the same browser visit as the manifest. A separate
+      // native GET adds an unnecessary request to the site's rate limiter.
+      const html = "";
       // Provider from the manifest LABEL — the same mapping the in-page
       // extractor uses. The gate URL carries no provider pattern, so host
       // classification would call every entry generic and the watch screen
@@ -3571,7 +3629,9 @@ app.whenReady().then(() => {
       const providerForLabel = (label: string) => {
         if (label.includes("mp4upload")) return "mp4upload";
         if (label.includes("hgcloud")) return "streamwish";
+        if (label.includes("videas")) return "videas";
         if (label.includes("videa")) return "videa";
+        if (/vik(?:i|1)ngfile/.test(label)) return "vikingfile";
         if (label.includes("mega")) return "mega";
         return "generic";
       };
@@ -3585,12 +3645,7 @@ app.whenReady().then(() => {
       // The gate's 302 target is captured network-side via onBeforeRedirect
       // (a cross-origin redirect is unreadable from the page's fetch), and is
       // the REAL provider embed the native extractors can play.
-      const gateRedirects = new Map<string, string>();
-      const onGateRedirect = (details: Electron.OnBeforeRedirectListenerDetails) => {
-        const token = details.url.match(/witanime\.site\/watch\/stream-gate\/([a-f0-9]{64})/i)?.[1];
-        if (token && details.redirectURL) gateRedirects.set(token, details.redirectURL);
-      };
-      session.defaultSession.webRequest.onBeforeRedirect(onGateRedirect);
+      const gateRedirects = witGateRedirects;
       let handshake: unknown = null;
       try {
         handshake = await enqueue({
@@ -3610,7 +3665,7 @@ app.whenReady().then(() => {
                 }
                 const csrfMeta = document.querySelector('meta[name="csrf-token"]');
                 const csrf = (csrfMeta && csrfMeta.content) || "";
-                const headers = { "X-CSRF-TOKEN": csrf, "X-Requested-With": "XMLHttpRequest", "Accept": "application/json" };
+                const headers = { "X-CSRF-TOKEN": csrf, "Accept": "application/json" };
                 const player = document.querySelector('[x-data*="watchPlayer"]');
                 const cfg = (player && player.getAttribute("x-data")) || "";
                 const m = cfg.match(/sourcesUrl:\\s*'([^']+)'/);
@@ -3619,15 +3674,20 @@ app.whenReady().then(() => {
                 // (\u005c/) — unescape without regex-escaping games (same trick
                 // the in-page scraper script uses).
                 const sourcesUrl = m[1].split(String.fromCharCode(92) + "/").join("/");
-                let manifestResp;
-                try {
-                  manifestResp = await fetch(sourcesUrl, { method: "POST", headers });
-                } catch (err) {
-                  resolve([{ debug: "manifest-fetch: " + String(err), href: location.href, sourcesUrl: sourcesUrl.slice(0, 100), csrfLen: csrf.length }]);
-                  return;
+                let manifest = null;
+                for (let wait = 0; wait < 32; wait++) {
+                  const state = window.Alpine && window.Alpine.$data && window.Alpine.$data(player);
+                  if (state && state.sourcesLoaded) {
+                    if (!state.sourcesError) manifest = { players: state.players };
+                    break;
+                  }
+                  await new Promise((r) => setTimeout(r, 250));
                 }
-                if (!manifestResp.ok) { resolve([{ debug: "manifest-" + manifestResp.status, sourcesUrl: sourcesUrl.slice(0, 80) }]); return; }
-                const manifest = await manifestResp.json();
+                if (!manifest) {
+                  const manifestResp = await fetch(sourcesUrl, { method: "POST", headers });
+                  if (!manifestResp.ok) { resolve([{ debug: "manifest-" + manifestResp.status }]); return; }
+                  manifest = await manifestResp.json();
+                }
                 const entries = [];
                 const seen = {};
                 Object.keys(manifest.players || {}).forEach((q) => {
@@ -3640,7 +3700,7 @@ app.whenReady().then(() => {
                 });
                 const rank = (l) => l.includes("hgcloud") ? 0 : l.includes("videa") ? 1 : l.includes("mp4upload") ? 2 : 3;
                 entries.sort((a, b) => rank(a.label) - rank(b.label));
-                const out = [];
+                const out = [{ animeTitle: document.querySelector('main h1')?.textContent?.trim() || "", pageTitle: document.title }];
                 for (const e of entries) {
                   try {
                     let ready = await fetch("/watch/stream-source/" + e.token, { method: "POST", headers });
@@ -3649,45 +3709,63 @@ app.whenReady().then(() => {
                       ready = await fetch("/watch/stream-source/" + e.token, { method: "POST", headers });
                     }
                     if (!ready.ok) continue;
-                    out.push({ label: e.label, quality: e.quality, token: e.token });
+                    const settings = await ready.json();
+                    const frame = document.createElement("iframe");
+                    frame.style.width = "360px";
+                    frame.style.height = "200px";
+                    frame.referrerPolicy = settings.referrerPolicy === "origin" ? "origin" : "no-referrer";
+                    if (settings.sandbox !== false) frame.setAttribute("sandbox", typeof settings.sandbox === "string" ? settings.sandbox : "allow-scripts allow-same-origin allow-presentation allow-forms allow-orientation-lock");
+                    frame.src = "/watch/stream-gate/" + e.token;
+                    document.body.appendChild(frame);
+                    out.push({ label: e.label, quality: e.quality, token: e.token, sandbox: settings.sandbox, referrerPolicy: settings.referrerPolicy });
                   } catch (err) {}
-                  await new Promise((r) => setTimeout(r, 150));
+                  await new Promise((r) => setTimeout(r, 1200));
                 }
                 // The gate's anti-bot layer rejects fetch (Sec-Fetch-Mode:
                 // cors) and top-level navigations, but accepts IFRAME
                 // navigations (measured live: fetch → 404, iframe → 302).
                 // Attach a hidden iframe per gate; main captures each
                 // redirectURL via onBeforeRedirect.
-                for (const e of out) {
-                  const frame = document.createElement("iframe");
-                  frame.style.display = "none";
-                  frame.src = "/watch/stream-gate/" + e.token;
-                  document.body.appendChild(frame);
+                await new Promise((r) => setTimeout(r, 10000));
+                // Retry only gates the Windows browser saw fail; no second manifest.
+                if (window.__pantoufaGateRedirects) {
+                  for (const item of out) if (item.token && !window.__pantoufaGateRedirects[item.token]) {
+                    await new Promise((r) => setTimeout(r, 1200));
+                    const ready = await fetch("/watch/stream-source/" + item.token, { method: "POST", headers });
+                    if (!ready.ok) continue;
+                    const frame = document.createElement("iframe");
+                    frame.referrerPolicy = item.referrerPolicy === "origin" ? "origin" : "no-referrer";
+                    if (item.sandbox !== false) frame.setAttribute("sandbox", typeof item.sandbox === "string" ? item.sandbox : "allow-scripts allow-same-origin allow-presentation allow-forms allow-orientation-lock");
+                    frame.src = "/watch/stream-gate/" + item.token;
+                    document.body.appendChild(frame);
+                  }
+                  await new Promise((r) => setTimeout(r, 4000));
                 }
-                await new Promise((r) => setTimeout(r, 1500));
+                for (const item of out) if (item.token) item.iframeUrl = window.__pantoufaGateRedirects?.[item.token];
                 resolve(out);
               } catch (err) { resolve([{ debug: "catch: " + String(err).slice(0, 160), href: location.href }]); }
             })();
           })`,
-          timeoutMs: 30000,
+          timeoutMs: 60000,
           priority: true,
           stopAfter: true,
         });
         // Give the gate redirects a beat to land after the job resolves.
         await new Promise((resolve) => setTimeout(resolve, 800));
       } finally {
-        session.defaultSession.webRequest.onBeforeRedirect(null);
+        // Redirect capture is shared across jobs; finishing one visit must not
+        // remove the listener while another episode's frames are loading.
       }
-      const servers: { id: string; name: string; iframeUrl: string; provider: string }[] = [];
+      const servers: { id: string; name: string; iframeUrl: string; provider: string; sandbox?: string | false; referrerPolicy?: string }[] = [];
       if (Array.isArray(handshake) && handshake.length && (handshake[0] as any)?.debug) {
         console.info(`[wit-servers] handshake detail: ${JSON.stringify(handshake).slice(0, 400)}`);
       }
       if (Array.isArray(handshake)) {
-        for (const item of handshake as { label?: string; quality?: string; token?: string }[]) {
+        for (const item of handshake as { label?: string; quality?: string; token?: string; iframeUrl?: string; sandbox?: string | false; referrerPolicy?: string }[]) {
           const token = String(item?.token || "");
           // Debug/diagnostic rows carry no token — never surface them.
           if (!/^[a-f0-9]{64}$/i.test(token)) continue;
-          let target = gateRedirects.get(token) || "";
+          let target = item.iframeUrl || gateRedirects.get(token) || "";
           if (!/^https?:\/\//i.test(target)) target = `${episode.origin}/watch/stream-gate/${token}`;
           if (servers.some((s) => s.iframeUrl === target)) continue;
           servers.push({
@@ -3695,6 +3773,8 @@ app.whenReady().then(() => {
             name: `${item.label || "witanime"} ${item.quality || ""}`.trim(),
             iframeUrl: target,
             provider: providerForLabel(String(item.label || "")),
+            sandbox: item.sandbox,
+            referrerPolicy: item.referrerPolicy,
           });
         }
       }
@@ -3719,12 +3799,13 @@ app.whenReady().then(() => {
           if (num) episodeTitle = (path.includes("/movie/") ? "\u0641\u064a\u0644\u0645 " : "\u0627\u0644\u062d\u0644\u0642\u0629 ") + num;
         } catch {}
       }
+      const pageInfo = Array.isArray(handshake) ? handshake.find((item: any) => item?.animeTitle) as { animeTitle?: string } | undefined : undefined;
       const animeLink = html.match(/anime-page-link[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i);
       const h1 = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
       return {
         servers,
         episodeTitle,
-        animeTitle: animeLink ? deent(animeLink[1]) : (h1 ? deent(h1[1]) : ""),
+        animeTitle: pageInfo?.animeTitle || (animeLink ? deent(animeLink[1]) : (h1 ? deent(h1[1]) : "")),
       };
     } catch (e) {
       console.warn("[wit-servers] failed:", e);

@@ -1195,7 +1195,7 @@ export function fetchCompleteVideoServers(
   ]);
 
   return completeVideoServerRequests.run(key, async () => {
-    const deadline = Date.now() + 30_000;
+    const deadline = Date.now() + 90_000;
     // Mobile parity: mobile validates every warmed direct URL with a Range
     // probe before marking it playable (probeMediaUrl). Desktop did not, so a
     // dead token surfaced as "server broken" only after the user clicked. A
@@ -1302,7 +1302,6 @@ export function fetchCompleteVideoServers(
     const warming = new Set<string>();
     const metadata = () => primaryResult;
     const emitCandidates = (fallback?: CompleteVideoServersPayload | null) => {
-      if (Date.now() > deadline) return;
       const servers = mergeVideoServers([...discovered.values()]);
       if (!servers.length) return;
       const signature = serverCandidateSignature(servers);
@@ -1396,6 +1395,7 @@ export function fetchCompleteVideoServers(
       withTimeout(witPromise, remaining, null),
     ]);
     const candidates = mergeVideoServers([
+      ...discovered.values(),
       primary?.data.servers || [],
       wit?.data.servers || [],
       up4?.data.servers || [],
@@ -1416,7 +1416,6 @@ export function fetchCompleteVideoServers(
         return;
       }
       playable.set(server.iframeUrl, { ...server, videoUrl: result.data.videoUrl });
-      if (Date.now() > deadline) return;
       const ready = selectServerCandidates(candidates).flatMap((candidate) => {
         const hit = playable.get(candidate.iframeUrl);
         return hit ? [hit] : [];
@@ -1453,7 +1452,7 @@ export function fetchCompleteVideoServers(
       const hit = playable.get(candidate.iframeUrl);
       return hit ? [hit] : [];
     });
-    const servers = mergePlayableServers(candidates, directServers);
+    const servers = mergePlayableServers(mergeVideoServers([candidates, ...discovered.values()]), directServers);
     return completePayload(servers, {
       episodeTitle: primary?.data.episodeTitle || up4?.data.episodeTitle || (episodeNumber != null ? `الحلقة ${episodeNumber}` : ""),
       animeTitle: resolvedTitle,
@@ -1591,7 +1590,7 @@ const CUSTOM_PLAYER_PROVIDERS = new Set([
   // pass + capture engine can resolve; without this the policy said
   // directThenIframe but the resolver never even tried and always painted the
   // embed.
-  "luluvdo",
+  "luluvdo", "vikingfile",
   // anime3rb's first-party host: one static GET on the player page yields
   // direct tokenized .mp4 qualities, so extraction is near-instant and the
   // custom player is the normal path (iframe only as a last resort).

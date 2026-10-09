@@ -1,6 +1,6 @@
 {
   "name": "pantoufa-desktop",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Pantoufa anime desktop app — both witanime + anime4up, no backend needed.",
   "author": "techvibedz <contact@techvibedz.com>",
   "main": "dist-electron/electron/main.js",
@@ -12,7 +12,7 @@
     "electron:dev": "npm run electron:build && concurrently -k -n VITE,ELECTRON -c green,blue \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
     "build:renderer": "vite build",
     "build:electron": "tsc -p electron/tsconfig.json",
-    "build": "npm run icons && npm run build:renderer && npm run build:electron",
+    "build": "npm run provider-browser && npm run icons && npm run build:renderer && npm run build:electron",
     "start": "npm run build && electron .",
     "dist": "npm run build && electron-builder",
     "dist:win": "npm run build && electron-builder --win",
@@ -22,7 +22,8 @@
     "ship": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1",
     "ship:dry": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1 -DryRun",
     "typecheck": "tsc --noEmit && tsc --noEmit -p electron/tsconfig.json",
-    "test": "node scripts/check-host-queue.cjs && node scripts/check-provider-parity.cjs && node scripts/check-mega-stream.cjs && node scripts/test-network-fallback.cjs && node scripts/test-network-recovery.cjs && node scripts/check-player-stability.cjs && node scripts/check-player-autoswitch.cjs && node scripts/check-host-throttle.cjs && node scripts/check-playback-hardening.cjs && node scripts/check-parity-features.cjs"
+    "test": "node scripts/check-host-queue.cjs && node scripts/check-provider-parity.cjs && node scripts/check-vk-extract.cjs && node scripts/check-share4max-extract.cjs && node scripts/check-mega-stream.cjs && node scripts/test-network-fallback.cjs && node scripts/test-network-recovery.cjs && node scripts/check-player-stability.cjs && node scripts/check-player-autoswitch.cjs && node scripts/check-host-throttle.cjs && node scripts/check-playback-hardening.cjs && node scripts/check-parity-features.cjs",
+    "provider-browser": "node scripts/build-provider-browser.cjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.105.4",
@@ -40,7 +41,7 @@
     "autoprefixer": "^10.4.20",
     "concurrently": "^9.1.0",
     "cross-env": "^7.0.3",
-    "electron": "^33.2.1",
+    "electron": "^44.7.0",
     "electron-builder": "^25.1.8",
     "png-to-ico": "^3.0.1",
     "postcss": "^8.4.49",
@@ -71,6 +72,15 @@
       {
         "from": "build/icon.png",
         "to": "build/icon.png"
+      },
+      {
+        "from": "build/provider-browser",
+        "to": "provider-browser",
+        "filter": [
+          "*.exe",
+          "*.dll",
+          "*.txt"
+        ]
       }
     ],
     "win": {

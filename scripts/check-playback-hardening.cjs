@@ -12,11 +12,41 @@ function run(source, context) {
 }
 
 (async () => {
-  const main = fs.readFileSync('electron/main.ts', 'utf8');
+  const main = fs.readFileSync('electron/main.ts', 'utf8').replace(/\r\n/g, '\n');
   const providers = fs.readFileSync('src/lib/videoProviders.ts', 'utf8');
   const watch = fs.readFileSync('src/pages/Watch.tsx', 'utf8');
+  const adExpr=main.match(/const AD_HOST_RE = (.*);/)?.[1];
+  const adFn=main.match(/function isAdHost[\s\S]*?(?=\n\n\/\/ Canonical)/)?.[0];
+  assert.ok(adExpr && adFn, 'ad classifier found');
+  const adCtx={dynamicAllowedHosts:new Set()};run(`const AD_HOST_RE=${adExpr};\n${adFn}\nglobalThis.isAdHost=isAdHost;`,adCtx);
+  assert.equal(adCtx.isAdHost('vik1ngfile.site'),false);
+  assert.equal(adCtx.isAdHost('vikingfile.com'),false);
+  assert.equal(adCtx.isAdHost('ads.vik1ngfile.site.evil.site'),true);
+  assert.equal(adCtx.isAdHost('popads.net'),true);
 
-  // ── 1. mediaChunkRange: segments whole, progressive chunked ──
+  const upstreamSrc = main.match(/async function fetchVideoUpstream[\s\S]*?(?=\nfunction registerVideoProxy)/)?.[0];
+  assert.ok(upstreamSrc);
+  let nativeCalls=0, systemCalls=0;
+  const request={headers:{Range:'bytes=10-20',Referer:'https://player.example/'},signal:new AbortController().signal};
+  const upstreamCtx={RequestInit:undefined,console,session:{defaultSession:{fetch:async()=>{nativeCalls++;throw Error('net::ERR_CONNECTION_RESET');}}},fetch:async(url,options)=>{systemCalls++;assert.equal(url,'https://cdn.example/video');assert.equal(options,request);return {ok:true};}};
+  run(`${upstreamSrc}\nglobalThis.fetchVideoUpstream=fetchVideoUpstream;`,upstreamCtx);
+  assert.equal((await upstreamCtx.fetchVideoUpstream('https://cdn.example/video',request)).ok,true);
+  assert.equal(nativeCalls,1);assert.equal(systemCalls,1);
+  upstreamCtx.session.defaultSession.fetch=async()=>{throw Error('net::ERR_FAILED');};
+  assert.equal((await upstreamCtx.fetchVideoUpstream('https://cdn.example/video',request)).ok,true);
+  assert.equal(systemCalls,2,'Chromium failed transport also uses the same bounded system request');
+  upstreamCtx.session.defaultSession.fetch=async()=>({ok:false,status:403});
+  assert.equal((await upstreamCtx.fetchVideoUpstream('https://cdn.example/video',request)).status,403);
+  assert.equal(systemCalls,2,'HTTP failures must not change networking or retry credentials');
+  upstreamCtx.session.defaultSession.fetch=async()=>{throw Error('aborted');};
+  await assert.rejects(()=>upstreamCtx.fetchVideoUpstream('https://cdn.example/video',request),/aborted/);
+  assert.equal(systemCalls,2);
+
+  assert.equal((await upstreamCtx.fetchVideoUpstream('https://cdn.example/video',request,true)).ok,true);
+  assert.equal(systemCalls,3,'progressive streams use the system transport with the original Range and cancellation');
+  assert.equal(nativeCalls,1,'progressive streams skip Chromium transport');
+
+  // ── 1. Range: segments whole, progressive streamed with real seek offsets ──
   const chunkSrc = main.match(/function mediaChunkRange[\s\S]*?(?=\nfunction registerVideoProxy)/)?.[0];
   assert.ok(chunkSrc, 'mediaChunkRange found');
   const chunkCtx = {};
@@ -24,9 +54,9 @@ function run(source, context) {
   const chunk = chunkCtx.mediaChunkRange;
   assert.equal(chunk(true, true, null), 'bytes=0-33554431', 'HLS segment gets a wide 32MB window, never the 1MB truncation');
   assert.equal(chunk(true, true, 'bytes=0-'), 'bytes=0-', 'client byte-range segment Range left untouched');
-  assert.equal(chunk(true, false, null), 'bytes=0-1048575', 'progressive first chunk stays 1MB');
-  assert.equal(chunk(true, false, 'bytes=0-'), 'bytes=0-1048575', 'progressive open Range capped at first chunk');
-  assert.equal(chunk(true, false, 'bytes=1048576-'), 'bytes=1048576-5242879', 'progressive steady chunk capped at 4MB');
+  assert.equal(chunk(true, false, null), 'bytes=0-', 'progressive response is streamed without buffering the whole file');
+  assert.equal(chunk(true, false, 'bytes=0-'), 'bytes=0-', 'progressive Range stays open');
+  assert.equal(chunk(true, false, 'bytes=1048576-'), 'bytes=1048576-', 'seek offset is forwarded intact');
   assert.equal(chunk(true, false, 'bytes=100-999'), 'bytes=100-999', 'bounded progressive Range untouched');
   assert.equal(chunk(false, false, 'bytes=0-'), 'bytes=0-', 'non-media Range untouched');
 

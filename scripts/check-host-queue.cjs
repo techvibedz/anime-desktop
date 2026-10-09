@@ -34,7 +34,7 @@ class FakeWebContents {
   constructor() {
     this.id = nextWebContentsId++;
     this.emitter = makeEmitter();
-    this.debugger = { isAttached: () => false, attach() {}, sendCommand: async () => ({ identifier: 'x' }) };
+    this.debugger = { isAttached: () => false, attach() {}, sendCommand: async (method, params) => method === 'Runtime.evaluate' ? {result:{value:await this.executeJavaScript(params.expression)}} : ({ identifier: 'x' }) };
   }
   on(ev, fn) { this.emitter.on(ev, fn); return this; }
   once(ev, fn) { this.emitter.once(ev, fn); return this; }
@@ -43,6 +43,7 @@ class FakeWebContents {
   setAudioMuted() {}
   setWindowOpenHandler() {}
   stop() {}
+  getURL() { return this.url || ''; }
   executeJavaScript(script) {
     execScripts.push(script);
     if (script === 'NEVER') return new Promise(() => {});
@@ -68,6 +69,7 @@ class FakeBrowserWindow {
   hide() {}
   setOpacity() {}
   loadURL(url) {
+    this.wc.url = url;
     loadUrls.push(url);
     this.urls.push(url);
     if (url !== 'about:blank') setImmediate(() => this.wc.emit('dom-ready'));
@@ -75,7 +77,8 @@ class FakeBrowserWindow {
   }
 }
 
-const electronStub = { BrowserWindow: FakeBrowserWindow };
+const electronStub = { BrowserWindow: FakeBrowserWindow, session: {defaultSession:{getUserAgent:()=> 'Mozilla/5.0 Chrome/152.0.0.0 Electron/44.7.0'}} };
+let nativeJobStart = () => null;
 
 function loadHost() {
   const file = path.join(__dirname, '..', 'electron', 'scraper', 'host.ts');
@@ -86,11 +89,12 @@ function loadHost() {
   const module = { exports: {} };
   const require = (name) => {
     if (name === 'electron') return electronStub;
+    if (name === './windowsBrowser') return { startWindowsBrowserJob: (...args) => nativeJobStart(...args) };
     throw new Error(`unexpected require(${name})`);
   };
   const context = vm.createContext({
     module, exports: module.exports, require, console,
-    setTimeout, clearTimeout, setInterval, clearInterval, setImmediate, Date, Promise, Error, URL, Symbol,
+    setTimeout, clearTimeout, setInterval, clearInterval, setImmediate, Date, Promise, Error, URL, Symbol, process,
   });
   vm.runInContext(js, context);
   return module.exports;
@@ -165,6 +169,20 @@ const expectReject = (promise, label) => promise.then(
   assert.equal(fastPathResult && fastPathResult.url, 'https://cdn.example/master.m3u8', 'video job resolved by fast path');
   assert.equal(host.tryFastPathRequest({ webContentsId: 999999, url: 'https://cdn.example/master.m3u8' }, () => {}), false, 'non-slot requests pass through');
   console.log('PASS fast-path intercept settles video jobs');
+
+  let stopped = 0;
+  nativeJobStart = () => ({ promise: Promise.resolve({ url: 'https://cdn.example/video.mp4' }), cancel: () => stopped++ });
+  const nativeResult = await host.enqueue({ url:'https://vikingfile.com/f/example', injectAfter:'OK', timeoutMs:2000, isVideoJob:true });
+  assert.equal(nativeResult.url, 'https://cdn.example/video.mp4');
+  assert.equal(stopped, 1, 'native browser closes after resolution');
+  nativeJobStart = () => ({ promise: new Promise(() => {}), cancel: () => stopped++ });
+  const nativeTimeout = await expectReject(host.enqueue({ url:'https://vikingfile.com/f/example', injectAfter:'NEVER', timeoutMs:200, isVideoJob:true }), 'native timeout');
+  assert.match(nativeTimeout.message, /scrape timeout/);
+  await sleep(20);
+  assert.equal(stopped, 2, 'timed-out native browser is stopped');
+  nativeJobStart = () => ({ promise: Promise.reject(Error('runtime unavailable')), cancel: () => stopped++ });
+  assert.equal(await host.enqueue({ url:'https://vikingfile.com/f/fallback', injectAfter:'OK', timeoutMs:2000, isVideoJob:true }), 'OK', 'unavailable Windows browser falls back to Electron');
+  console.log('PASS Windows browser resolution, cleanup, timeout and Electron fallback');
 
   console.log('ALL host queue checks passed');
   process.exit(0);

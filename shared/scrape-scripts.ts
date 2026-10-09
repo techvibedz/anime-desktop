@@ -683,7 +683,8 @@ function provider(url, name) {
   if (/ok\\.ru|odnoklassniki/.test(url)) return 'okru';
   if (/app\\.videas\\.fr/.test(url)) return 'videas';
   if (/videa\\.|vidvaita|vidit|videakid/.test(url)) return 'videa';
-  if (/vk\\.com/.test(url)) return 'vk';
+  if (/vk\\.com|vkvideo\\.ru/.test(url)) return 'vk';
+  if (/vik(?:i|1)ngfile/.test(url)) return 'vikingfile';
   if (/mega\\.(?:nz|co\\.nz)/.test(url)) return 'mega';
   if (/vid3rb|anime3rb/.test(url)) return 'vid3rb';
   if (/luluvdo|lulustream|luluvid/.test(url)) return 'luluvdo';
@@ -736,9 +737,17 @@ if (currentPlayer) {
     try {
       var sourcesUrl = sourceMatch[1].split(String.fromCharCode(92) + '/').join('/');
       var headers = { Accept: 'application/json', 'X-CSRF-TOKEN': csrf.getAttribute('content') || '' };
-      var response = await fetch(sourcesUrl, { method: 'POST', headers: headers });
-      if (!response.ok) throw new Error('sources-' + response.status);
-      var manifest = await response.json();
+      var manifest = null;
+      for (var wait = 0; wait < 32; wait++) {
+        var state = window.Alpine && window.Alpine.$data && window.Alpine.$data(currentPlayer);
+        if (state && state.sourcesLoaded) { if (!state.sourcesError) manifest = {players:state.players}; break; }
+        await new Promise(function(r){setTimeout(r,250);});
+      }
+      if (!manifest) {
+        var response = await fetch(sourcesUrl, { method: 'POST', headers: headers });
+        if (!response.ok) throw new Error('sources-' + response.status);
+        manifest = await response.json();
+      }
       var entries = [];
       var seenLabels = {};
       Object.keys(manifest.players || {}).forEach(function (quality) {
@@ -752,6 +761,7 @@ if (currentPlayer) {
       function witProvider(label) {
         if (label.indexOf('mp4upload') >= 0) return 'mp4upload';
         if (label.indexOf('hgcloud') >= 0) return 'streamwish';
+        if (label.indexOf('videas') >= 0) return 'videas';
         if (label.indexOf('videa') >= 0) return 'videa';
         if (label.indexOf('mega') >= 0) return 'mega';
         return 'generic';
@@ -774,11 +784,14 @@ if (currentPlayer) {
             ready = await fetch('/watch/stream-source/' + entry.token, { method: 'POST', headers: headers });
           }
           if (!ready.ok) continue;
+          var settings = await ready.json();
           resolved.push({
           id: entry.token,
           name: ((entry.label || 'WitAnime') + ' ' + entry.quality).trim(),
           iframeUrl: location.origin + '/watch/stream-gate/' + entry.token,
           provider: witProvider(entry.label),
+          sandbox: settings.sandbox,
+          referrerPolicy: settings.referrerPolicy,
           });
         } catch (e) {}
         if (i + 1 < entries.length) await new Promise(function (r) { setTimeout(r, 300); });
@@ -920,7 +933,7 @@ export const VIDEO_HOOK_INSTALL = `(function () {
     if (window.__vidHookInstalled) return;
     window.__vidHookInstalled = true;
     window.__vidHooked = [];
-    function isVideo(u) { return typeof u === 'string' && /\\.(m3u8|mp4)(\\?|$|#)/i.test(u); }
+    function isVideo(u) { return typeof u === 'string' && /\\.(m3u8|mp4|mkv|webm|ogg)(\\?|$|#)/i.test(u); }
     function isDecoy(u) {
       var lu = (u || '').toLowerCase();
       return /test-videos\\.co\\.uk|bigbuckbunny|sample[-_.]|placeholder|tos\\.mp4|googleapis\\.com\\/.*oggtheora|\\/lol\\/file\\.mp4/.test(lu);
@@ -957,7 +970,9 @@ export const VIDEO_HOOK_INSTALL = `(function () {
 export const EXTRACT_VIDEO_URL = `(async function(){
 // Defensive: install hooks here too in case injectBefore didn't fire
 // (e.g. cached page navigation that skipped did-start-navigation).
+if (!/vik(?:i|1)ngfile\\.(?:com|site)/i.test(location.hostname)) {
 ${VIDEO_HOOK_INSTALL}
+}
 
 function isBadHost(h) {
   h = (h || '').toLowerCase();
@@ -985,7 +1000,7 @@ function pickFromHooked() {
   var m3 = us.find(function (u) { return /(master|playlist|index)\\.m3u8/i.test(u) && isSafeUrl(u); }) ||
            us.find(function (u) { return /\\.m3u8/i.test(u) && isSafeUrl(u); });
   if (m3) return m3;
-  return us.find(function (u) { return /\\.mp4/i.test(u) && isSafeUrl(u); }) || null;
+  return us.find(function (u) { return /\\.(?:mp4|mkv|webm|ogg)(?:[?#]|$)/i.test(u) && isSafeUrl(u); }) || null;
 }
 
 // Wait until Cloudflare's "Just a moment" challenge has cleared. Some
@@ -1013,10 +1028,10 @@ function scanInlineSources() {
     var html = document.documentElement ? document.documentElement.outerHTML : '';
     // Try packed-player keys first, in priority order. master/index/playlist m3u8 is the strongest signal.
     var patterns = [
-      /file\\s*:\\s*["']([^"']+\\.(?:m3u8|mp4)[^"']*)["']/i,
-      /source\\s*:\\s*["']([^"']+\\.(?:m3u8|mp4)[^"']*)["']/i,
-      /src\\s*:\\s*["']([^"']+\\.(?:m3u8|mp4)[^"']*)["']/i,
-      /sources\\s*:\\s*\\[\\s*\\{\\s*[^}]*?(?:file|src)\\s*:\\s*["']([^"']+\\.(?:m3u8|mp4)[^"']*)["']/i,
+      /file\\s*:\\s*["']([^"']+\\.(?:m3u8|mp4|mkv|webm|ogg)[^"']*)["']/i,
+      /source\\s*:\\s*["']([^"']+\\.(?:m3u8|mp4|mkv|webm|ogg)[^"']*)["']/i,
+      /src\\s*:\\s*["']([^"']+\\.(?:m3u8|mp4|mkv|webm|ogg)[^"']*)["']/i,
+      /sources\\s*:\\s*\\[\\s*\\{\\s*[^}]*?(?:file|src)\\s*:\\s*["']([^"']+\\.(?:m3u8|mp4|mkv|webm|ogg)[^"']*)["']/i,
     ];
     for (var i = 0; i < patterns.length; i++) {
       var m = html.match(patterns[i]);
@@ -1024,7 +1039,7 @@ function scanInlineSources() {
     }
     // Generic URL scan as a last resort — pick the first URL whose
     // host looks like a real video CDN.
-    var rx = /https?:\\/\\/[^"'\\s<>\\\\]+\\.(?:m3u8|mp4)[^"'\\s<>\\\\]*/g;
+    var rx = /https?:\\/\\/[^"'\\s<>\\\\]+\\.(?:m3u8|mp4|mkv|webm|ogg)[^"'\\s<>\\\\]*/g;
     var any;
     while ((any = rx.exec(html))) {
       if (isSafeUrl(any[0])) return any[0];
@@ -1051,6 +1066,7 @@ function dismissOverlays() {
 }
 
 function trigger() {
+  if (/vik(?:i|1)ngfile\\.(?:com|site)/i.test(location.hostname)) return;
   dismissOverlays();
   var sels = [
     '.jw-icon-display', '.jw-display-icon-container',
@@ -1100,7 +1116,7 @@ async function tryVidea() {
         var text = await r.text();
         var src = text.match(/<video_source[^>]*>\\s*<!\\[CDATA\\[([^\\]]+)\\]\\]>/i) ||
                   text.match(/<video_source[^>]*>([^<]+)</i) ||
-                  text.match(/https?:\\/\\/[^"<\\s]+\\.(?:m3u8|mp4)[^"<\\s]*/i);
+                  text.match(/https?:\\/\\/[^"<\\s]+\\.(?:m3u8|mp4|mkv|webm|ogg)[^"<\\s]*/i);
         if (src) return src[1] || src[0];
       } catch (e) {}
     }
@@ -1131,7 +1147,8 @@ if (early) return { url: early };
 trigger();
 await new Promise(function (r) { setTimeout(r, 150); });
 trigger();
-for (var i = 0; i < 140; i++) {
+var pollCount = /vik(?:i|1)ngfile\\.(?:com|site)/i.test(location.hostname) ? 280 : 140;
+for (var i = 0; i < pollCount; i++) {
   var h = pickFromHooked();
   if (h) return { url: h };
   // Re-trigger every 800 ms; some embeds bind their click handler late.

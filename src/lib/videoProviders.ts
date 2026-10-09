@@ -83,7 +83,8 @@ export const PROVIDER_POLICIES: Record<string, ProviderPolicy> = {
   okru: { patterns: ["ok\\.ru", "odnoklassniki"], rank: 6, resolution: "directThenIframe", failureMode: "failed", supported: true, adaptive: true },
   videas: { patterns: ["app\\.videas\\.fr"], rank: 3, resolution: "directThenIframe", failureMode: "failed", supported: true },
   videa: { patterns: ["videa\\.", "vidvaita", "vidit", "videakid"], rank: 3, resolution: "directThenIframe", failureMode: "failed", supported: true },
-  vk: { patterns: ["vk\\.com"], rank: 11, resolution: "iframe", failureMode: "iframe", supported: true },
+  vk: { patterns: ["vk\\.com", "vkvideo\\.ru"], rank: 11, resolution: "directThenIframe", failureMode: "failed", supported: true },
+  vikingfile: { patterns: ["vik(?:i|1)ngfile"], rank: 8, resolution: "directThenIframe", failureMode: "failed", supported: true },
   mega: { patterns: ["mega\\.(?:nz|co\\.nz)"], rank: 12, resolution: "direct", failureMode: "failed", supported: true },
   vid3rb: { patterns: ["vid3rb", "anime3rb"], rank: -1, resolution: "direct", failureMode: "failed", supported: true, downloadable: true },
   luluvdo: { patterns: ["luluvdo", "lulustream", "luluvid"], rank: 9, resolution: "directThenIframe", failureMode: "failed", supported: true },
@@ -355,6 +356,8 @@ export function validateMediaUrl(raw: string, provider = "generic"): boolean {
       return /\.(?:m3u8|mp4)$/i.test(url.pathname) || /^\/video\//i.test(url.pathname);
     }
     if (provider === "doodstream" && url.searchParams.has("token") && url.searchParams.has("expiry")) return true;
+    if (provider === "vikingfile") return /\.(?:mp4|mkv|webm|ogg)$/i.test(url.pathname);
+    if (provider === "vk" && /(^|\.)(?:vkuser\.net|okcdn\.ru)$/i.test(url.hostname)) return url.searchParams.has("sig") && url.searchParams.has("expires");
     if (provider === "dailymotion" && /(^|\.)(?:dailymotion\.com|dmcdn\.net)$/i.test(url.hostname)) return true;
     if (provider === "okru" && /(^|\.)(?:ok\.ru|mycdn\.me|okcdn\.)/i.test(url.hostname)) return true;
     if (/videa\.hu$/i.test(url.hostname) && /\/static\//i.test(url.pathname) && url.searchParams.has("md5")) return true;

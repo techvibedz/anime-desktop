@@ -182,7 +182,8 @@ function classifyProvider(url: string, name = ""): string {
   if (/ok\.ru|odnoklassniki/.test(u)) return "okru";
   if (/app\.videas\.fr/.test(u)) return "videas";
   if (/videa\.|vidvaita|vidit|videakid/.test(u)) return "videa";
-  if (/vk\.com/.test(u)) return "vk";
+  if (/vk\.com|vkvideo\.ru/.test(u)) return "vk";
+  if (/vik(?:i|1)ngfile/.test(u)) return "vikingfile";
   if (/mega\.(?:nz|co\.nz)/.test(u)) return "mega";
   if (/vid3rb|anime3rb/.test(u)) return "vid3rb";
   // witanime's current default hosts. Give them their own ids so they aren't

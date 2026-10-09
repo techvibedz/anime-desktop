@@ -1,4 +1,5 @@
-import { BrowserWindow } from "electron";
+import { BrowserWindow, session } from "electron";
+import { startWindowsBrowserJob } from "./windowsBrowser";
 
 const SLOT_COUNT = 3;
 // Rapid-navigation backlog guard (mobile bus.ts parity). Each detail/watch
@@ -209,7 +210,7 @@ function initSlots(): Slot[] {
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: false,
-          // No partition → uses default session, same as the iframe.
+        // No partition → uses default session, same as the iframe.
         backgroundThrottling: false,
         webSecurity: true,
         autoplayPolicy: "no-user-gesture-required",
@@ -222,10 +223,8 @@ function initSlots(): Slot[] {
     // not <audio>/WebAudio, so hard-mute the whole webContents.
     try { win.webContents.setAudioMuted(true); } catch {}
     try { win.hide(); } catch {}
-    try { win.setOpacity(0); } catch {}
     win.on("show", () => {
       try { win.hide(); } catch {}
-      try { win.setOpacity(0); } catch {}
     });
     // Periodic sledgehammer — some embed pages (streamwish) call
     // win.focus() / win.moveTop() / requestFullscreen() which Electron
@@ -368,8 +367,23 @@ async function runJob(slotIdx: number, p: Pending) {
     signalSettled = () => resolve(SETTLED);
   });
   p.onSettle = signalSettled;
+  let nativeBrowser: ReturnType<typeof startWindowsBrowserJob> = null;
 
   try {
+    if (p.job.isVideoJob || /^https:\/\/(?:[^/]+\.)?(?:witanime|anime4up)\.[a-z]+\//i.test(p.job.url)) {
+      nativeBrowser = startWindowsBrowserJob(p.job, slotIdx);
+      if (nativeBrowser) {
+        const result = await Promise.race([nativeBrowser.promise.catch(() => null), timeoutPromise, settledPromise]);
+        if (p.settled || p.cancelled || result === SETTLED) return;
+        if (result != null) { settleResolve(p, result); return; }
+        nativeBrowser.cancel();
+        nativeBrowser = null;
+      }
+    }
+    // Every CDP setup command needs a renderer in a brand-new slot. Race
+    // initialization as well as extraction against cancellation and timeout.
+    if (!win.webContents.getURL()) await Promise.race([win.loadURL("about:blank"), timeoutPromise, settledPromise]);
+    if (p.settled || p.cancelled) return;
     if (win.isDestroyed()) {
       settleReject(p, new Error("scrape window destroyed"));
       return;
@@ -380,7 +394,7 @@ async function runJob(slotIdx: number, p: Pending) {
     // cross-job state pollution but actually break network connectivity
     // for subsequent loads (stale DNS, corrupted session state).
 
-    if (p.job.injectBefore) {
+    {
       try {
         if (win.webContents.debugger.isAttached()) {
           if (slot.cdpScriptId) {
@@ -390,11 +404,13 @@ async function runJob(slotIdx: number, p: Pending) {
             );
             slot.cdpScriptId = null;
           }
+          if (p.job.injectBefore) {
           const resp = await win.webContents.debugger.sendCommand(
             "Page.addScriptToEvaluateOnNewDocument",
             { source: p.job.injectBefore },
           ) as { identifier: string };
           slot.cdpScriptId = resp.identifier;
+          }
         }
       } catch {}
     }
@@ -408,9 +424,21 @@ async function runJob(slotIdx: number, p: Pending) {
       },
     });
 
-    const loadPromise = win.loadURL(p.job.url, {
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    }).catch(() => {});
+    const browserUa = session.defaultSession.getUserAgent().replace(/\s(?:Electron|Pantoufa|pantoufa-desktop)\/[^\s]+/gi, "");
+    const chromeVersion = browserUa.match(/Chrome\/([\d.]+)/)?.[1] || process.versions.chrome;
+    // Emulation commands need a renderer. Initialize only a brand-new slot;
+    // subsequent jobs keep the warm window and navigate directly.
+    // A UA-only override suppresses Chromium's client hints. WitAnime binds
+    // its stream gates to those hints, so every iframe otherwise returns 404.
+    await Promise.race([win.webContents.debugger.sendCommand("Emulation.setUserAgentOverride", {
+      userAgent: browserUa,
+      userAgentMetadata: {
+        brands: [{ brand: "Chromium", version: chromeVersion.split(".")[0] }, { brand: "Not_A Brand", version: "99" }],
+        fullVersion: chromeVersion, platform: process.platform === "win32" ? "Windows" : "Linux",
+        platformVersion: process.platform === "win32" ? "10.0.0" : "", architecture: "x86", model: "", mobile: false,
+      },
+    }), timeoutPromise, settledPromise]);
+    const loadPromise = win.loadURL(p.job.url).catch(() => {});
 
     // Inject as soon as the DOM exists — never wait for full load.
     await Promise.race([waitForDomReady(win, Math.min(8000, p.job.timeoutMs)), loadPromise, settledPromise]);
@@ -435,7 +463,12 @@ async function runJob(slotIdx: number, p: Pending) {
       }
       let exec: Promise<any>;
       try {
-        exec = win.webContents.executeJavaScript(p.job.injectAfter, true);
+        exec = win.webContents.debugger.sendCommand("Runtime.evaluate", {
+          expression: p.job.injectAfter, awaitPromise: true, returnByValue: true, userGesture: true,
+        }).then((result: { result?: { value?: unknown }; exceptionDetails?: { text: string } }) => {
+          if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
+          return result.result?.value;
+        });
       } catch (e: any) {
         settleReject(p, e instanceof Error ? e : new Error(String(e)));
         return;
@@ -466,6 +499,7 @@ async function runJob(slotIdx: number, p: Pending) {
   } catch (e: any) {
     settleReject(p, e instanceof Error ? e : new Error(String(e)));
   } finally {
+    nativeBrowser?.cancel();
     p.onSettle = undefined;
     try { activeJobs.delete(win.webContents.id); } catch {}
     if (timeoutTimer) clearTimeout(timeoutTimer);
