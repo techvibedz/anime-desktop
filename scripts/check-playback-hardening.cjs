@@ -28,7 +28,7 @@ function run(source, context) {
   assert.ok(upstreamSrc);
   let nativeCalls=0, systemCalls=0;
   const request={headers:{Range:'bytes=10-20',Referer:'https://player.example/'},signal:new AbortController().signal};
-  const upstreamCtx={RequestInit:undefined,console,session:{defaultSession:{fetch:async()=>{nativeCalls++;throw Error('net::ERR_CONNECTION_RESET');}}},fetch:async(url,options)=>{systemCalls++;assert.equal(url,'https://cdn.example/video');assert.equal(options,request);return {ok:true};}};
+  const upstreamCtx={AbortController,AbortSignal,setTimeout,clearTimeout,RequestInit:undefined,console,session:{defaultSession:{fetch:async()=>{nativeCalls++;throw Error('net::ERR_CONNECTION_RESET');}}},fetch:async(url,options)=>{systemCalls++;assert.equal(url,'https://cdn.example/video');assert.equal(options.headers,request.headers);return {ok:true};}};
   run(`${upstreamSrc}\nglobalThis.fetchVideoUpstream=fetchVideoUpstream;`,upstreamCtx);
   assert.equal((await upstreamCtx.fetchVideoUpstream('https://cdn.example/video',request)).ok,true);
   assert.equal(nativeCalls,1);assert.equal(systemCalls,1);

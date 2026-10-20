@@ -23,5 +23,18 @@ vm.runInNewContext(ts.transpileModule(declaration.getText(ast)+'\nglobalThis.ext
 (async()=>{
   assert.equal((await context.extractShare4max('https://share4max.com/iframe/example')).url,'https://s99.mp4upload.com/low.mp4');
   assert.deepEqual(calls,['https://s99.mp4upload.com/high.mp4','https://s99.mp4upload.com/low.mp4']);
+  context.session.defaultSession.fetch=async(_url,init)=>init.headers['X-Inertia']==='true'
+    ? Response.json({props:{streams:{data:[{label:'720p',mirrors:[{driver:'mp4upload',link:'https://www.mp4upload.com/deleted'}]}]}}})
+    : new Response('<script data-page="app">{"version":"live","component":"Iframe"}</script>');
+  context.extractMp4upload=async()=>({url:'',type:'mp4',denied:true});
+  assert.equal((await context.extractShare4max('https://share4max.com/iframe/example')).denied,true,'all removed mirrors are a definitive failure, not another capture');
+  assert.equal(calls.length,2,'removed files are not probed');
+  context.session.defaultSession.fetch=async(_url,init)=>init.headers['X-Inertia']==='true'
+    ? Response.json({props:{streams:{data:[{label:'1080p',mirrors:[{driver:'mp4upload',link:'//mp4upload.com/deleted'},{driver:'mixdrop',link:'//mixdrop.ag/e/x'},{driver:'voe',link:'//voe.sx/e/alive'}]}]}}})
+    : new Response('<script data-page="app">{"version":"live","component":"Iframe"}</script>');
+  context.extractViaHtml=async(url)=>({url:'https://cdn.voe.example/master.m3u8',type:'hls',from:url});
+  assert.equal((await context.extractShare4max('https://share4max.com/iframe/example')).from,'https://voe.sx/e/alive','voe mirror plays when mp4upload files are gone');
+  context.extractViaHtml=async()=>({url:'',type:'mp4',denied:true});
+  assert.equal((await context.extractShare4max('https://share4max.com/iframe/example')).denied,true,'unplayable drivers do not mask an all-removed manifest');
   console.log('PASS Megamax quality fallback, partial manifest and malformed mirror rejection');
 })().catch(error=>{console.error(error);process.exitCode=1;});

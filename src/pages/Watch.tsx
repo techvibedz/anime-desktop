@@ -19,7 +19,6 @@ import {
   recoveryDelayMs,
   serverFailureKey,
   sortVideoServers,
-  videoContentType,
   type AudioIntent,
 } from "../lib/videoProviders";
 import { saveProgress, getProgress } from "../lib/history";
@@ -113,13 +112,6 @@ const FAST_REEXTRACT_PROVIDERS = new Set([
   // deserves one automatic retry before the server is marked broken.
   "anime4upcdn",
 ]);
-
-// Capture-based providers rotate CDN edges per extraction; some tokens land on
-// a hung edge that stalls the manifest until the 22s initial-load watchdog.
-// For these (all cheap to re-extract) a click-path Range probe turns that
-// stall into an immediate re-extract — the mobile pipeline probes warmed URLs
-// before play; this is the click-path equivalent.
-const PROBE_BEFORE_PLAY = new Set(["streamwish", "streamruby", "doodstream", "vid3rb"]);
 
 function displayName(s: VideoServer): string {
   const n = (s.name || "").trim();
@@ -310,6 +302,7 @@ export function WatchPage() {
   const [skipIntroVisible, setSkipIntroVisible] = useState(false);
   const skipHideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reextractUsedRef = useRef(false);
+  const transportFallbackRef = useRef<(() => boolean) | null>(null);
   // True once the CURRENT stream actually played a frame. Distinguishes a
   // never-started server (iframe fallback is acceptable) from a mid-watch
   // failure (keep the custom player and re-extract in place instead).
@@ -436,12 +429,6 @@ export function WatchPage() {
   const autoSwitchCountRef = useRef(0);
   const recoveryRoundRef = useRef(0);
   const recoveryTimerRef = useRef<number | null>(null);
-  useEffect(() => {
-    if (status === "playing") {
-      autoSwitchCountRef.current = 0;
-      recoveryRoundRef.current = 0;
-    }
-  }, [status]);
 
   // Mobile-parity discovery: WitAnime, Anime4up, and Anime3rb start together,
   // candidates appear as each source answers, and direct streams are warmed in
@@ -465,6 +452,9 @@ export function WatchPage() {
     autoAdvanceTargetRef.current = null;
     setResolved(null);
     setStatus("idle");
+    hasPlayedRef.current = false;
+    userPausedRef.current = false;
+    stepDownSeekRef.current = 0;
     setUserActivated(false);
     setHarvestedUp4(null);
     setDirectUp4(null);
@@ -1044,6 +1034,7 @@ export function WatchPage() {
     if (recoveryTimerRef.current) { clearTimeout(recoveryTimerRef.current); recoveryTimerRef.current = null; }
     if (autoAdvanceTimer.current !== null) { clearTimeout(autoAdvanceTimer.current); autoAdvanceTimer.current = null; }
     autoAdvanceTargetRef.current = null;
+    if (hasPlayedRef.current && videoRef.current) stepDownSeekRef.current = videoRef.current.currentTime;
     activeServerUrlRef.current = sortedServersRef.current[idx]?.iframeUrl || null;
     setActiveIdx(idx);
     setUserActivated(true);
@@ -1051,6 +1042,8 @@ export function WatchPage() {
     setStatus("resolving");
     setRetryNonce((n) => n + 1);
     reextractCount.current = 0;
+    hasPlayedRef.current = false;
+    userPausedRef.current = false;
     iframeFailedRef.current = false;
     setIframeLoaded(false);
   }, []);
@@ -1216,10 +1209,12 @@ export function WatchPage() {
   // anime3rb's player URL is tokenized (?token=…&expires=…). When the token
   // dies, re-extracting the SAME URL 403s forever — re-scrape the episode page
   // for a fresh one at the same quality before the retry.
-  const refreshA3rbPlayerUrl = useCallback(async (name: string): Promise<string | null> => {
+  const refreshA3rbPlayerUrl = useCallback(async (name: string, title: string, number: number | null): Promise<string | null> => {
     const ep = a3rbParam || (/anime3rb\.com\/episode\//i.test(episodeUrl) ? episodeUrl : "");
-    if (!ep) return null;
-    const fresh = await fetchAnime3rbServersByUrl(ep).catch(() => [] as { name: string; iframeUrl: string }[]);
+    const fresh = await (ep
+      ? fetchAnime3rbServersByUrl(ep)
+      : title && number != null ? fetchAnime3rbServers(title, number, true) : Promise.resolve([]))
+      .catch(() => [] as { name: string; iframeUrl: string }[]);
     if (!fresh.length) return null;
     const want = resOf(name);
     const match = (want > 0 ? fresh.find((s) => resOf(s.name) === want) : null) || fresh[0];
@@ -1245,33 +1240,15 @@ export function WatchPage() {
     setResolved(null);
     setStatus("resolving");
 
-    // The complete mobile pipeline pre-resolves its best direct candidates.
-    // Reuse that URL immediately; the normal resolver remains the fallback for
-    // a candidate that arrived before its warm-up completed.
-    // vid3rb is excluded: its signed CDN URLs expire in ~40 min and the
-    // warm-up used to pin one at discovery time, so a later Play click (or a
-    // mid-watch re-extract) replayed a dead URL and "never ran". It extracts
-    // at play time by design (one cheap player-page GET, cached 90s).
-    if (srv.videoUrl && srv.provider !== "vid3rb") {
-      const contentType = videoContentType(srv.videoUrl, srv.provider);
+    // Only local files bypass the resolver. Warm network URLs must go through
+    // its TTL so an idle page cannot pin an expired token indefinitely.
+    if (srv.videoUrl && srv.provider === "local") {
       setResolved({
         url: srv.videoUrl,
-        type: contentType === "hls" ? "hls" : "mp4",
+        type: "mp4",
         embed: srv.iframeUrl,
       });
       setStatus("playing");
-      // The warm pipeline resolved this URL without sidecar metadata; a cached
-      // re-resolve (90s TTL) attaches the subtitle tracks instantly.
-      if (srv.provider === "anime4upcdn") {
-        resolveVideo(srv.iframeUrl, srv.provider)
-          .then((r) => {
-            if (cancelled || !r.success || !r.data?.subtitles) return;
-            setResolved((prev) => (prev && prev.url === srv.videoUrl
-              ? { ...prev, subtitles: r.data!.subtitles }
-              : prev));
-          })
-          .catch(() => {});
-      }
       return () => { cancelled = true; };
     }
 
@@ -1292,7 +1269,7 @@ export function WatchPage() {
         // stored one's token may be what's dead, and retrying it 403s forever.
         if (attempt > 1 && srv.provider === "vid3rb" && !refreshedA3rb) {
           refreshedA3rb = true;
-          const fresh = await refreshA3rbPlayerUrl(srv.name).catch(() => null);
+          const fresh = await refreshA3rbPlayerUrl(srv.name, titleParam || meta.animeTitle || animeTitleFromDetail || slugTitle, currentEpNumber).catch(() => null);
           if (cancelled) return;
           if (fresh && fresh !== resolveUrl) {
             console.info(`[player] vid3rb player URL stale — refreshed from episode page`);
@@ -1317,20 +1294,6 @@ export function WatchPage() {
               invalidateResolveCache(resolveUrl);
               await new Promise((res) => setTimeout(res, 800));
               continue;
-            }
-            // Prove the token answers before handing it to the player; a hung
-            // edge otherwise burns the full initial-load watchdog. Only
-            // re-extracts while attempts remain — the last attempt is always
-            // accepted so a probe quirk can never block playback entirely.
-            if (gotDirect && PROBE_BEFORE_PLAY.has(srv.provider) && attempt < MAX_ATTEMPTS) {
-              const probe = await window.pantoufa.probeMedia?.(r.data.videoUrl, resolveUrl).catch(() => null);
-              if (cancelled) return;
-              if (probe && !probe.ok) {
-                console.warn(`[player] ${srv.provider}: extracted URL failed the liveness probe, re-extracting (attempt ${attempt}/${MAX_ATTEMPTS})`);
-                invalidateResolveCache(resolveUrl);
-                await new Promise((res) => setTimeout(res, 800));
-                continue;
-              }
             }
             console.info(`[player] ${srv.provider}: ${r.data.type} → ${r.data.videoUrl}`);
             setResolved({
@@ -1487,10 +1450,8 @@ export function WatchPage() {
     // min — the discovery warm-up used to pin that dead URL for the whole
     // session and every "never runs" click replayed it).
     setServers((prev) => prev.map((s) => (s.videoUrl ? { ...s, videoUrl: undefined } : s)));
-    import("../lib/api").then(({ invalidateResolveCache }) => {
-      if (embed) invalidateResolveCache?.(embed);
-      setRetryNonce((n) => n + 1);
-    });
+    if (embed) invalidateResolveCache(embed);
+    setRetryNonce((n) => n + 1);
   }, [advanceToNext]);
 
   // Primitive views of the resolved stream for the wiring effect. Depending
@@ -1508,6 +1469,8 @@ export function WatchPage() {
     if (!resolvedUrl || !resolvedType || !videoRef.current) return;
     if (resolvedType === "dailymotion" || resolvedType === "iframe") return;
     const v = videoRef.current;
+    transportFallbackRef.current = null;
+    const recoveryController = new AbortController();
     // A remounted element starts unmuted at volume 1 — carry the user's audio
     // intent over (a deliberate mute must survive a server swap).
     applyAudioIntent(v, userAudioIntentRef.current);
@@ -1516,22 +1479,25 @@ export function WatchPage() {
     // Reset re-extract gate for the new stream — covers both HLS and
     // mp4 paths so the second error path also has a recovery shot.
     reextractUsedRef.current = false;
-    hasPlayedRef.current = false;
-    // A fresh stream starts un-paused-by-user; clear any stale pause intent so
-    // stall recovery works on the new source.
-    userPausedRef.current = false;
 
-    // Match mobile's minBufferForPlayback=4: preload immediately, but release
-    // autoplay only after a useful cushion exists. This also applies after a
-    // source handoff because every resolved URL creates a fresh effect run.
+    // HLS can fill a four-second cushion while paused. Chromium can suspend
+    // progressive preload sooner, so use its native can-play readiness there.
     let startupReleased = false;
     const maybeStartPlayback = () => {
       if (startupReleased || userPausedRef.current || partyHoldPlaybackRef.current) return;
       let end = 0;
-      try { end = v.buffered.length ? v.buffered.end(v.buffered.length - 1) : 0; } catch {}
+      try {
+        for (let i = 0; i < v.buffered.length; i++) {
+          if (v.buffered.start(i) <= v.currentTime + 0.1 && v.buffered.end(i) > v.currentTime) {
+            end = v.buffered.end(i);
+            break;
+          }
+        }
+      } catch {}
       const ahead = bufferAheadSeconds(v.currentTime, end) || 0;
       const fullyBuffered = Number.isFinite(v.duration) && v.duration > 0 && end >= v.duration - 0.1;
-      if (ahead < STREAM_BUFFER_POLICY.minBufferForPlaybackSeconds && !fullyBuffered) return;
+      const nativeReady = resolvedType !== "hls" && v.readyState >= 3 && ahead > 0;
+      if (!nativeReady && ahead < STREAM_BUFFER_POLICY.minBufferForPlaybackSeconds && !fullyBuffered) return;
       startupReleased = true;
       v.play().catch(() => { startupReleased = false; });
     };
@@ -1610,9 +1576,10 @@ export function WatchPage() {
       const dataIdleMs = now - lastTimeUpdate;
       const streamDead = dataIdleMs > noDataLimitMs && now - lastBufferGrowthAt > noDataLimitMs;
       const metadataHardOut = now - loadStartedAt > metadataDeadlineMs;
-      if (neverStarted && !userPausedRef.current && now - loadStartedAt > startDeadlineMs
+      if (neverStarted && !userPausedRef.current && !partyHoldPlaybackRef.current && now - loadStartedAt > startDeadlineMs
           && (streamDead || metadataHardOut)) {
         advanced = true;
+        if (transportFallbackRef.current?.()) { advanced = false; return; }
         // A vid3rb quality that produced ZERO bytes is the CDN throttling THAT
         // file — measured on Re:Zero S2 ep11: the 1080p source never answered
         // while 720p streamed in 0.6s. Re-extracting or reloading the same dead
@@ -1630,6 +1597,7 @@ export function WatchPage() {
         healthyTicks = 0;
         const elapsed = now - lastTimeUpdate;
         if (elapsed > STALL_THRESHOLD_MS) {
+          if (isBufferingMidStream && transportFallbackRef.current?.()) return;
           // Mid-stream stall on a progressive direct stream (vid3rb /
           // mp4upload / videa): these CDNs throttle throughput to ~2.5× the
           // file bitrate and intermittently drop connections, and Chromium
@@ -1679,11 +1647,11 @@ export function WatchPage() {
                     // so the reload restarted the episode from 0 — literally
                     // "refreshing completely". The browser clamps if needed.
                     if (pos > 0) v.currentTime = pos;
-                    v.play().catch(() => {});
+                    if (!userPausedRef.current && !partyHoldPlaybackRef.current) v.play().catch(() => {});
                   } catch {}
                 };
-                v.addEventListener("loadedmetadata", resume, { once: true });
-                v.addEventListener("loadeddata", resume, { once: true });
+                v.addEventListener("loadedmetadata", resume, { once: true, signal: recoveryController.signal });
+                v.addEventListener("loadeddata", resume, { once: true, signal: recoveryController.signal });
               } catch {}
             }
             lastTimeUpdate = Date.now();
@@ -1708,6 +1676,8 @@ export function WatchPage() {
       startupReleased = true;
       played = true;
       hasPlayedRef.current = true;
+      autoSwitchCountRef.current = 0;
+      recoveryRoundRef.current = 0;
       lastTime = v.currentTime;
       lastTimeUpdate = Date.now();
       // Heal a mute/drift the element picked up mid-stream (anything other
@@ -1741,10 +1711,10 @@ export function WatchPage() {
       // Only auto-resume a stall the user didn't cause. A deliberate pause also
       // aborts the in-flight media fetch → fires `stalled`; without this guard
       // the recovery re-plays the video the instant the user pauses it.
-      if (v.paused && !userPausedRef.current) {
+      if (!played) maybeStartPlayback();
+      else if (v.paused && !userPausedRef.current && !partyHoldPlaybackRef.current) {
         v.play().catch(() => {});
       }
-      lastTimeUpdate = Date.now();
     };
 
     v.addEventListener("playing", onPlaying);
@@ -1815,32 +1785,33 @@ export function WatchPage() {
       });
       let recoveryUsed = false;
       let mediaRecoveryCount = 0;
-      let networkRecoveryCount = 0;
       // Tell main which embed mirror minted this stream's token — streamwish
       // rotates mirrors and its CDN whitelists that mirror's Referer.
       window.pantoufa?.setVideoReferer?.(resolvedEmbed || null);
-      // Direct first (mobile parity); fall back to the main-process proxy ONCE
-      // if the raw CDN rejects us before a single frame plays (wrong-mirror
-      // Referer / CORS). The proxy's strategy-race + cookie sharing is the
-      // safety net for the handful of providers a bare header can't satisfy.
+      // Switch transport once before re-extracting, keeping the playhead when
+      // a direct CDN request fails during playback (DNS / Referer / CORS).
       let usingDirect = true;
       let directFallbackUsed = false;
       const fallbackToProxy = (): boolean => {
         if (directFallbackUsed || !usingDirect) return false;
         directFallbackUsed = true;
         usingDirect = false;
-        console.warn("[player] direct HLS rejected — retrying via proxy");
+        const position = v.currentTime;
+        console.warn("[player] direct HLS failed — retrying via proxy");
+        played = false;
+        startupReleased = false;
+        lastBufferedEnd = 0;
         loadStartedAt = Date.now();
         lastBufferGrowthAt = Date.now();
         lastTimeUpdate = Date.now();
-        networkRecoveryCount = 0;
         try { hls.stopLoad(); } catch {}
-        try { hls.detachMedia(); } catch {}
+        // Manifest parsing autostarts from config; an early startLoad alone loses the seek.
+        hls.config.startPosition = position > 0 ? position : -1;
         try { hls.loadSource(proxied); } catch {}
-        try { hls.attachMedia(v); } catch {}
-        try { hls.startLoad(); } catch {}
+        try { hls.startLoad(hls.config.startPosition); } catch {}
         return true;
       };
+      transportFallbackRef.current = fallbackToProxy;
       hls.loadSource(resolvedUrl);
       hls.attachMedia(v);
       hls.on(Hls.Events.FRAG_LOADED, () => {
@@ -1851,40 +1822,21 @@ export function WatchPage() {
       hls.on(Hls.Events.LEVEL_LOADED, () => { if (!played) lastTimeUpdate = Date.now(); });
       hls.on(Hls.Events.MANIFEST_PARSED, () => { if (!played) lastTimeUpdate = Date.now(); maybeStartPlayback(); });
       hls.on(Hls.Events.ERROR, (_e, data) => {
-        // Non-fatal network errors — chunk drop, buffer stall, slow CDN.
-        // Auto-run startLoad() to kick the stream back to life. When the
-        // 8x limit is reached, do a hard reset: detach media, bust the URL
-        // cache with a fresh timestamp, and re-attach. This forces
-        // Chromium and hls.js to treat it as a completely new stream.
+        // hls.js owns non-fatal retries and their backoff. Restarting its
+        // loader here cancels that recovery and can hammer a throttled CDN.
         if (!data.fatal) {
           // If the response carries a 401/403/410 status, the token is
           // expired regardless of whether hls.js considers it fatal.
           // Skip the recovery loop — retrying a dead URL wastes ~22s.
           const nfStatus = (data.response as any)?.code;
           if (nfStatus === 410 || nfStatus === 403 || nfStatus === 401) {
-            if (!played && fallbackToProxy()) return;
+            if (fallbackToProxy()) return;
             triggerReextract(`HLS auth error ${nfStatus} (non-fatal)`);
             return;
           }
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            networkRecoveryCount++;
-            if (!played && data.details === Hls.ErrorDetails.FRAG_LOAD_TIMEOUT && fallbackToProxy()) return;
-            if (networkRecoveryCount <= 8) {
-              console.warn(`[player] non-fatal network ${data.details}, startLoad #${networkRecoveryCount}`);
-              try { hls.startLoad(); } catch {}
-            } else if (networkRecoveryCount <= 11) {
-              console.warn(`[player] hard-resetting HLS engine (retry #${networkRecoveryCount})`);
-              try { hls.detachMedia(); } catch {}
-              const fresh = proxied.replace(
-                /([?&])_p=\d+_[a-z0-9]+/,
-                `$1_p=${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
-              );
-              const freshUrl = fresh.includes("?") ? fresh : `${fresh}?_p=${Date.now()}`;
-              try { hls.loadSource(freshUrl); } catch {}
-              try { hls.attachMedia(v); } catch {}
-            } else {
-              triggerReextract("hard recovery exhausted");
-            }
+            const status = data.response?.code || 0;
+            if (!played && status === 0 && fallbackToProxy()) return;
           }
           return;
         }
@@ -1894,7 +1846,7 @@ export function WatchPage() {
         // Proxy returned 410/403/401 → signed URL expired or rejected.
         const status = (data.response as any)?.code;
         if (status === 410 || status === 403 || status === 401) {
-          if (!played && fallbackToProxy()) return;
+          if (fallbackToProxy()) return;
           triggerReextract(`HLS auth error ${status}`);
           return;
         }
@@ -1923,7 +1875,7 @@ export function WatchPage() {
 
         // Network errors — manifest/level load timeouts. Recover up to 2x.
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          if (!played && fallbackToProxy()) return;
+          if (fallbackToProxy()) return;
           if (!recoveryUsed) {
             recoveryUsed = true;
             console.warn("[player] HLS fatal network, startLoad attempt", data.details);
@@ -1941,36 +1893,37 @@ export function WatchPage() {
       });
       hlsRef.current = hls;
     } else {
-      // Progressive MP4. mp4upload serves a single large file over a slow,
-      // non-standard port (:183). Routing it through the proxy means the
-      // proxy buffers the WHOLE file via arrayBuffer() before returning a
-      // byte, which blows past its 15-20s watchdog → all strategies abort →
-      // 502 Bad Gateway → DEMUXER_ERROR_COULD_NOT_OPEN. Load it directly
-      // instead: Chromium's native networking streams it with Range/partial
-      // content, and the onBeforeSendHeaders interceptor still forces the
-      // canonical www.mp4upload.com Referer on the <video> media request.
-      //
-      // videa also plays direct, for a different reason: pantoufa-video://
-      // subresources are BLOCKED by Chromium from web (http://localhost dev)
-      // origins with ERR_UNKNOWN_URL_SCHEME — the <video> dies instantly
-      // with "Format error" (code 4) and we advance past a perfectly good
-      // stream. (Packaged builds load from file://, where the custom scheme
-      // works — which is why this only ever bit in dev.) videa's signed
-      // static URL needs no cookies and accepts any/no Referer (verified:
-      // 302 → videoN.videa.hu edge → 206 even with a localhost Referer),
-      // so native streaming works in BOTH dev and packaged builds — and
-      // skips the proxy's 4MB arrayBuffer chunking for a ~100MB file.
-      // Other MP4 providers keep the proxy (they need its Referer/Origin
-      // strategy racing and cookie sharing).
-      // vid3rb also plays direct: its signed CDN URLs answer Range requests,
-      // need no Referer/cookies and aren't IP-locked (noip=yes) — while the
-      // proxy would buffer the whole ~300MB file before the first byte.
+      // Known progressive providers start with native Range streaming. The
+      // proxy now streams too, and is the fallback for blocked DNS/transport;
+      // other providers start there for its Referer strategies and cookies.
       const playsDirect = resolvedUrl.startsWith("pantoufa-file:") || /mp4upload|videa\.hu|vidvaita|vidit|vid3rb\.com/i.test(resolvedUrl);
       v.src = playsDirect ? resolvedUrl : proxied;
+      if (playsDirect && !resolvedUrl.startsWith("pantoufa-file:")) {
+        let used = false;
+        transportFallbackRef.current = () => {
+          if (used) return false;
+          used = true;
+          const position = v.currentTime || stepDownSeekRef.current;
+          console.warn("[player] direct MP4 failed — retrying via proxy");
+          played = false;
+          startupReleased = false;
+          lastBufferedEnd = 0;
+          loadStartedAt = lastTimeUpdate = lastBufferGrowthAt = Date.now();
+          const resume = () => {
+            if (position > 0) v.currentTime = position;
+            if (!userPausedRef.current && !partyHoldPlaybackRef.current) v.play().catch(() => {});
+          };
+          v.addEventListener("loadedmetadata", resume, { once: true, signal: recoveryController.signal });
+          v.src = proxied;
+          return true;
+        };
+      }
     }
 
     return () => {
       clearInterval(interval);
+      recoveryController.abort();
+      transportFallbackRef.current = null;
       window.pantoufa?.setVideoReferer?.(null);
       v.removeEventListener("playing", onPlaying);
       v.removeEventListener("timeupdate", onTimeUpdate);
@@ -2722,6 +2675,7 @@ export function WatchPage() {
                 // the direct-mp4 path (no hls engine) should re-extract here.
                 // (Element code 4 also can't occur while MSE is attached.)
                 if (hlsRef.current) return;
+                if ((code === 2 || code === 3 || code === 4) && transportFallbackRef.current?.()) return;
                 // Code 2 (MEDIA_ERR_NETWORK): proxy returned 410/403 → signed URL expired.
                 // Code 3 (MEDIA_ERR_DECODE): a transient mid-stream proxy 502 / dropped chunk
                 // often surfaces here, NOT as a true decode failure — so try one re-extract

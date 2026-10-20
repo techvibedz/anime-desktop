@@ -1046,10 +1046,11 @@ export function prefetchAnime3rbServers(animeTitle: string, epNumber: number): v
   void fetchAnime3rbServers(animeTitle, epNumber).catch(() => {});
 }
 
-export async function fetchAnime3rbServers(animeTitle: string, epNumber: number): Promise<RawServer[]> {
+export async function fetchAnime3rbServers(animeTitle: string, epNumber: number, force = false): Promise<RawServer[]> {
   if (!animeTitle || epNumber == null) return [];
   const epUrlFor = (slug: string) => `https://anime3rb.com/episode/${slug}/${epNumber}`;
   const memKey = a3rbServersKey(animeTitle, epNumber);
+  if (force) a3rbServersMem.delete(memKey);
 
   // 0) Already built (re-open or prefetch hit) — instant, no network.
   const mem = a3rbServersMem.get(memKey);
@@ -1608,7 +1609,7 @@ const EXPECT_DIRECT_PROVIDERS = new Set([...CUSTOM_PLAYER_PROVIDERS, "mp4upload"
 
 type ResolvePayload = { success: true; data: { videoUrl: string; type: "hls" | "mp4" | "iframe"; subtitles?: { url: string; label?: string; lang?: string }[] } } | { success: false; error: string };
 export type ResolveVideoOptions = { fresh?: boolean; priority?: boolean; background?: boolean };
-const resolveCache = new Map<string, { ts: number; background: boolean; promise: Promise<ResolvePayload> }>();
+const resolveCache = new Map<string, { ts: number; background: boolean; settled: boolean; promise: Promise<ResolvePayload> }>();
 // 90s (was 15s): long enough that the prefetch fired when the server list
 // loads still serves the user's Play click, and that a click during a slow
 // in-flight extraction reuses that promise instead of starting a second
@@ -1623,11 +1624,9 @@ export function resolveVideo(
 ): Promise<ResolvePayload> {
   if (options.fresh) resolveCache.delete(iframeUrl);
   const hit = resolveCache.get(iframeUrl);
-  // A foreground (user-click) resolve never reuses a background warm-up
-  // promise: cancelBackgroundScrapes may be settling that exact job, and the
-  // click must start its own priority extraction (mobile's pickServer
-  // resolves with fresh:true + priority:true). Warm-vs-warm reuse still works.
-  const reusable = hit && Date.now() - hit.ts < RESOLVE_TTL && !(hit.background && !options.background);
+  // Completed warm-ups are safe to reuse; in-flight background jobs can be
+  // cancelled by a Play click and must not hold its foreground extraction.
+  const reusable = hit && Date.now() - hit.ts < RESOLVE_TTL && !(hit.background && !hit.settled && !options.background);
   if (reusable && hit) return hit.promise;
   // Only evict the cache when this promise is still the one stored: a stale
   // background resolve can settle AFTER a foreground click replaced the entry
@@ -1642,10 +1641,14 @@ export function resolveVideo(
     const isFallback = r.success && r.data?.type === "iframe";
     if (!r.success || (isFallback && EXPECT_DIRECT_PROVIDERS.has(provider))) {
       if (stillOwner()) resolveCache.delete(iframeUrl);
+    } else if (stillOwner()) {
+      const entry = resolveCache.get(iframeUrl)!;
+      entry.settled = true;
+      entry.ts = Date.now();
     }
     return r;
   }).catch((e) => { if (stillOwner()) resolveCache.delete(iframeUrl); throw e; });
-  resolveCache.set(iframeUrl, { ts: Date.now(), background: !!options.background, promise });
+  resolveCache.set(iframeUrl, { ts: Date.now(), background: !!options.background, settled: false, promise });
   return promise;
 }
 
@@ -1695,6 +1698,7 @@ async function doResolveVideo(iframeUrl: string, provider: string, background = 
     try {
       const direct = await window.pantoufa.directExtract?.(provider, iframeUrl, { background });
       if (direct?.url) return { success: true as const, data: { videoUrl: direct.url, type: direct.type } };
+      if (direct?.denied) return { success: false as const, error: "MP4Upload file was removed" };
     } catch {}
     return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
   }
@@ -1730,6 +1734,7 @@ async function doResolveVideo(iframeUrl: string, provider: string, background = 
     try {
       const direct = await window.pantoufa.directExtract?.(provider, iframeUrl, { background });
       if (direct?.url) return { success: true as const, data: { videoUrl: direct.url, type: direct.type } };
+      if (direct?.denied) return { success: false as const, error: "Video file is no longer available" };
     } catch {}
     return { success: true as const, data: { videoUrl: iframeUrl, type: "iframe" as const } };
   }

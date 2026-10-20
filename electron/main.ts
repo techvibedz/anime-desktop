@@ -41,6 +41,7 @@ process.on("warning", (warning: { name?: string; message?: string }) => {
 
 import { autoUpdater } from "electron-updater";
 import { enqueue, tryFastPathRequest, cancelBackgroundJobs, type ScrapeJob } from "./scraper/host";
+import { resetEdgeTunnel, startEdgeTunnel } from "./edgeTunnel";
 import { EXTRACT_VIDEO_URL, VIDEO_HOOK_INSTALL } from "../shared/scrape-scripts";
 
 const isDev = !app.isPackaged;
@@ -1191,12 +1192,12 @@ function unpackAllPacked(html: string): string[] {
  *
  * Handles two provider quirks:
  *  - voe-style tiny redirect pages (`window.location.href = '…'`) — followed once.
- *  - voe's base64 `'hls': '…'` source field.
+ *  - voe's base64 `'hls': '…'` source field and its newer obfuscated JSON.
  */
 async function extractViaHtml(
   iframeUrl: string,
   label: string,
-): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+): Promise<{ url: string; type: "hls" | "mp4"; denied?: boolean } | null> {
   try {
     let pageUrl = iframeUrl;
     let html = "";
@@ -1236,7 +1237,8 @@ async function extractViaHtml(
       });
       if (!resp.ok) {
         console.info(`[${label}] static GET ${pageUrl} → ${resp.status}`);
-        return null;
+        // Removed file: a definitive failure, not a reason for a 30s capture.
+        return resp.status === 404 || resp.status === 410 ? { url: "", type: "mp4", denied: true } : null;
       }
       html = await resp.text();
       // voe serves a tiny stub that client-side-redirects to a mirror domain.
@@ -1278,6 +1280,26 @@ async function extractViaHtml(
         if (/^https?:\/\//.test(dec)) {
           console.info(`[${label}] base64 hls hit → ${dec}`);
           return { url: dec, type: "hls" };
+        }
+      } catch {}
+    }
+    // voe (2026): ROT13 → strip junk markers → base64 → shift −3 → reverse →
+    // base64 → JSON { source: HLS master, direct_access_url: mp4 }.
+    const voeJson = html.match(/<script type="application\/json">\s*(\[\s*"[^"]+"\s*\])\s*<\/script>/)?.[1];
+    if (voeJson) {
+      try {
+        let t = String(JSON.parse(voeJson)[0]).replace(/[a-z]/gi, (c) => {
+          const base = c <= "Z" ? 65 : 97;
+          return String.fromCharCode(((c.charCodeAt(0) - base + 13) % 26) + base);
+        });
+        for (const junk of ["@$", "^^", "~@", "%?", "*~", "!!", "#&"]) t = t.split(junk).join("");
+        t = Buffer.from(t, "base64").toString("utf8");
+        t = Array.from(t, (c) => String.fromCharCode(c.charCodeAt(0) - 3)).reverse().join("");
+        const cfg = JSON.parse(Buffer.from(t, "base64").toString("utf8")) as { source?: string; direct_access_url?: string };
+        const src = [cfg.source, cfg.direct_access_url].find((u) => typeof u === "string" && /^https?:\/\//.test(u));
+        if (src) {
+          console.info(`[${label}] voe config hit → ${src}`);
+          return { url: src, type: /\.m3u8(\?|#|$)/i.test(src) ? "hls" : "mp4" };
         }
       } catch {}
     }
@@ -1351,7 +1373,7 @@ async function extractDood(
   }
 }
 
-async function extractShare4max(iframeUrl: string): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+async function extractShare4max(iframeUrl: string): Promise<{ url: string; type: "hls" | "mp4"; denied?: boolean } | null> {
   try {
     const response = await session.defaultSession.fetch(iframeUrl, { signal: AbortSignal.timeout(8000), headers: { "User-Agent": PLAYBACK_UA } });
     if (!response.ok) { console.info('[share4max] page status', response.status); return null; }
@@ -1368,14 +1390,25 @@ async function extractShare4max(iframeUrl: string): Promise<{ url: string; type:
     if (!manifest.ok) { console.info('[share4max] streams status', manifest.status); return null; }
     const streams = (await manifest.json())?.props?.streams?.data;
     if (!Array.isArray(streams)) return null;
+    let mirrors = 0, removed = 0;
     for (const stream of streams.sort((a, b) => parseInt(b.label) - parseInt(a.label))) {
       for (const mirror of stream.mirrors || []) {
-        if (mirror.driver !== "mp4upload" || typeof mirror.link !== "string") continue;
+        // mp4upload plays direct; voe is the fallback when its files are gone.
+        const driver = String(mirror.driver || "").toLowerCase();
+        if ((driver !== "mp4upload" && driver !== "voe") || typeof mirror.link !== "string") continue;
         let url: string;
         try { url = new URL(mirror.link, pageUrl).toString(); } catch { continue; }
-        if (!/(^|\.)mp4upload\.com$/i.test(new URL(url).hostname)) continue;
+        if (!(driver === "voe" ? /(^|\.)voe\.sx$/i : /(^|\.)mp4upload\.com$/i).test(new URL(url).hostname)) continue;
+        mirrors++;
+        if (driver === "voe") {
+          const viaVoe = await extractViaHtml(url, "share4max:voe");
+          if (viaVoe?.denied) removed++;
+          if (viaVoe?.url) return viaVoe;
+          continue;
+        }
         const resolved = await extractMp4upload(url);
-        if (resolved) {
+        if (resolved?.denied) removed++;
+        if (resolved?.url) {
           try {
             const probe = await fetch(resolved.url, { headers: { "User-Agent": PLAYBACK_UA, Referer: "https://www.mp4upload.com/", Range: "bytes=0-1" }, signal: AbortSignal.timeout(4000) });
             await probe.body?.cancel();
@@ -1384,6 +1417,7 @@ async function extractShare4max(iframeUrl: string): Promise<{ url: string; type:
         }
       }
     }
+    if (mirrors > 0 && removed === mirrors) return { url: "", type: "mp4", denied: true };
   } catch (error) { console.info('[share4max] request failed', String(error)); }
   return null;
 }
@@ -2002,6 +2036,7 @@ async function resetNetworkState(reason: string): Promise<void> {
   console.info(`[net] network change detected (${reason}) — resetting network state`);
   // Reachable-edge IPs were resolved on the old network; re-resolve them.
   sourceEdgeIpsPromise = null;
+  resetEdgeTunnel();
   try {
     // Close the dead sockets and flush the stale resolver before the DoH mode
     // is re-decided — and only then tell the renderer, so its re-discovery
@@ -2064,7 +2099,7 @@ function watchNetworkChanges(): void {
 async function extractMp4upload(
   iframeUrl: string,
   background = false,
-): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+): Promise<{ url: string; type: "hls" | "mp4"; denied?: boolean } | null> {
   // Force the canonical www host + embed form (matches normalizeEmbedUrl in
   // the renderer) so the page returns the player, not the download page.
   let embedUrl = iframeUrl;
@@ -2107,8 +2142,15 @@ async function extractMp4upload(
         cache: "no-store",
       });
       console.info(`[extractMp4upload] GET ${embedUrl} (try ${attempt + 1}) → ${resp.status}`);
+      if (resp.status === 404 || resp.status === 410) {
+        void resp.body?.cancel().catch(() => {});
+        return { url: "", type: "mp4", denied: true };
+      }
       if (resp.ok) {
         const text = (await resp.text()).replace(/\\\//g, "/").replace(/&amp;/g, "&");
+        if (/^\s*File (?:was deleted|not found)\s*[.!]?\s*$/i.test(text)) {
+          return { url: "", type: "mp4", denied: true };
+        }
         // A Cloudflare interstitial / placeholder returns 200 but carries no
         // player config — only accept a body that actually has a source.
         if (/player\.src|sources?\s*[:=]|\.mp4/i.test(text)) html = text;
@@ -2322,13 +2364,32 @@ function mediaChunkRange(isLargeMedia: boolean, isHlsSegment: boolean, range: st
 }
 
 async function fetchVideoUpstream(target: string, init: Parameters<typeof session.defaultSession.fetch>[1], progressive = false) {
-  // System fetch avoids Chromium transport failures when streaming progressive bodies.
-  if (progressive) return fetch(target, init as RequestInit);
+  if (progressive) {
+    // Prefer Node's streaming transport, but do not pin playback to ISP DNS.
+    // The timer bounds headers only; it must never abort a healthy video body.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    try {
+      init?.signal?.throwIfAborted();
+      const response = await fetch(target, {
+        ...init,
+        signal: init?.signal ? AbortSignal.any([init.signal, controller.signal]) : controller.signal,
+      } as RequestInit);
+      if (response.status !== 401 && response.status !== 403) return response;
+      void response.body?.cancel().catch(() => {});
+      // Chromium carries the embed's cookies when Node is denied.
+    } catch (error) {
+      if (init?.signal?.aborted) throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+    return session.defaultSession.fetch(target, init);
+  }
   try { return await session.defaultSession.fetch(target, init); }
   catch (error) {
     // Signed CDN URLs can be reachable through system DNS while Chromium's
     // resolver is reset or blocked. Keep the same headers, Range and abort.
-    if (!/net::ERR_(?:CONNECTION_|NAME_NOT_RESOLVED|DNS_|TIMED_OUT|INVALID_ARGUMENT|FAILED)/.test(String(error))) throw error;
+    if (init?.signal?.aborted || !/net::ERR_(?:CONNECTION_|NAME_NOT_RESOLVED|DNS_|TIMED_OUT|INVALID_ARGUMENT|FAILED)/.test(String(error))) throw error;
     return fetch(target, init as RequestInit);
   }
 }
@@ -2484,19 +2545,8 @@ function registerVideoProxy() {
 
     if (range) baseHeaders["Range"] = range;
 
-    // CRITICAL: do NOT append `_p=` cache-buster to signed URLs. The
-    // signature is computed over the full query string by most providers
-    // (Cloudflare streamwish, voe, dailymotion, etc.). Adding any extra
-    // param invalidates the HMAC and the CDN responds 403 — which is
-    // exactly the "works briefly then fails" symptom. Instead, set
-    // cache: "no-store" on the fetch so Chromium doesn't cache responses
-    // and the strategy race can't be poisoned by a stale 403. Cache-
-    // buster is only used for fully bare URLs (no query string at all),
-    // which are rare with real provider CDNs.
-    const cachebusted =
-      target.includes("?") || target.includes("#")
-        ? target
-        : `${target}?_p=${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    // A token can be signed into the path too. Cache-Control is sufficient;
+    // never alter the URL minted by the provider.
 
     // Use defaultSession (same as the renderer iframe). The iframe
     // already passed Cloudflare challenges and stored clearance cookies
@@ -2508,12 +2558,11 @@ function registerVideoProxy() {
     // Track the URL in inFlightProxyTargets so the renderer's capture
     // listener (which also runs on defaultSession requests) doesn't
     // echo our proxy fetches back as fresh "captured" URLs.
-    inFlightProxyTargets.add(cachebusted);
-    if (cachebusted !== target) inFlightProxyTargets.add(target);
+    inFlightProxyTargets.add(target);
     try {
       const filename = new URL(target).pathname.split("/").pop() || "";
       const progressive = /\.(?:mp4|mkv|webm|ogg)$/i.test(filename) || !/\.[a-z0-9]{2,5}$/i.test(filename);
-      const upstream = await fetchVideoUpstream(cachebusted, {
+      const upstream = await fetchVideoUpstream(target, {
         method,
         headers: {
           ...baseHeaders,
@@ -2527,14 +2576,16 @@ function registerVideoProxy() {
         signal,
       }, progressive);
 
-      if (!upstream.ok) throw new Error(`${strat.name} → ${upstream.status}`);
+      if (!upstream.ok) {
+        void upstream.body?.cancel().catch(() => {});
+        throw new Error(`${strat.name} → ${upstream.status}`);
+      }
       return { upstream, strategy: strat.name };
     } finally {
       // Keep entries for a brief moment so any onBeforeRequest still
       // firing during request teardown (especially for aborted losers
       // of the strategy race) hits the skip path. 2s is plenty.
       setTimeout(() => {
-        inFlightProxyTargets.delete(cachebusted);
         inFlightProxyTargets.delete(target);
       }, 2000);
     }
@@ -2547,33 +2598,29 @@ function registerVideoProxy() {
     method: string,
     signal: AbortSignal | undefined,
   ) {
+    signal?.throwIfAborted();
     const targetUrl = new URL(target);
     const embedUrl = (() => { try { return new URL(embedHref); } catch { return targetUrl; } })();
     const list = strategies(targetUrl, embedUrl);
 
-    // Fast path: cached working strategy. Try alone with a 20s cap.
-    // The previous 8s cap matched median segment latency on slow CDN
-    // edges (MENA → EU), so legitimate fetches were being killed and
-    // flushing the strategy cache — forcing a full 4-way race on the
-    // next call and triggering CDN rate limits.
+    // A stale strategy must leave time for alternatives before the player's
+    // stall watchdog. This bounds headers, not a slow but healthy body.
     const cached = hostStrategyCache.get(targetUrl.host);
     if (cached) {
       const cachedStrat = list.find((s) => s.name === cached);
       if (cachedStrat) {
         const ctrl = new AbortController();
-        const onOuter = () => ctrl.abort();
-        if (signal) signal.addEventListener("abort", onOuter, { once: true });
-        const watchdog = setTimeout(() => ctrl.abort(), 20000);
+        const fetchSignal = signal ? AbortSignal.any([signal, ctrl.signal]) : ctrl.signal;
+        const watchdog = setTimeout(() => ctrl.abort(), 6000);
         try {
-          const r = await fetchWithStrategy(target, cachedStrat, range, method, ctrl.signal);
-          clearTimeout(watchdog);
-          if (signal) signal.removeEventListener("abort", onOuter);
+          const r = await fetchWithStrategy(target, cachedStrat, range, method, fetchSignal);
           return r;
         } catch {
-          clearTimeout(watchdog);
-          if (signal) signal.removeEventListener("abort", onOuter);
+          signal?.throwIfAborted();
           // Cached strategy stopped working — drop and race below.
           hostStrategyCache.delete(targetUrl.host);
+        } finally {
+          clearTimeout(watchdog);
         }
       }
     }
@@ -2583,15 +2630,15 @@ function registerVideoProxy() {
     // alive so upstream.text()/arrayBuffer() can still drain the body).
     const stratStates = list.map((strat) => {
       const ctrl = new AbortController();
-      if (signal) signal.addEventListener("abort", () => { try { ctrl.abort(); } catch {} }, { once: true });
-      const watchdog = setTimeout(() => { try { ctrl.abort(); } catch {} }, 15000);
-      return { strat, ctrl, watchdog };
+      const fetchSignal = signal ? AbortSignal.any([signal, ctrl.signal]) : ctrl.signal;
+      const watchdog = setTimeout(() => ctrl.abort(), 8000);
+      return { strat, ctrl, fetchSignal, watchdog };
     });
 
     // Wrap each fetch so the resolved value carries its strategy index,
     // and reject silently so unhandled-rejection warnings don't leak.
     const tasks = stratStates.map((s, i) =>
-      fetchWithStrategy(target, s.strat, range, method, s.ctrl.signal)
+      fetchWithStrategy(target, s.strat, range, method, s.fetchSignal)
         .then((r) => ({ ...r, _index: i })),
     );
     // Make sure loser rejections don't bubble out as unhandled.
@@ -2614,7 +2661,9 @@ function registerVideoProxy() {
         const msg = err?.message || err?.code || err?.name || String(err);
         // strategy errors look like "canonical → 403"; extract the number.
         const sm = String(msg).match(/→\s*(\d{3})/);
-        if (sm) statusCodes.push(parseInt(sm[1], 10));
+        // A timeout alongside one 403 is not proof that every route rejected
+        // the token. Keep unanswered strategies in the classification too.
+        statusCodes.push(sm ? parseInt(sm[1], 10) : 0);
         console.warn(`[pantoufa-video] ${list[i]?.name || "?"}: ${msg}`);
       }
       const wrap = new Error(
@@ -2646,10 +2695,11 @@ function registerVideoProxy() {
         try { origin = decodeURIComponent(originEnc); } catch { origin = ""; }
       }
       if (origin && /^https?:\/\//i.test(origin)) {
-        const cdnPath = "/" + pathParts.slice(1).join("/");
-        const cdnParams = new URLSearchParams(reqUrl.search);
-        cdnParams.delete(REF_PARAM);
-        const cdnQs = cdnParams.toString();
+        const cdnPath = reqUrl.pathname.slice(originEnc.length + 1) || "/";
+        // URLSearchParams reserializes %20, +, ~ and empty values, breaking
+        // signatures. Remove only our metadata, preserving the raw CDN query.
+        const cdnQs = reqUrl.search.slice(1).split("&")
+          .filter((part) => part.split("=", 1)[0] !== REF_PARAM).join("&");
         target = origin + cdnPath + (cdnQs ? "?" + cdnQs : "");
       } else {
         // ── v1 backwards-compat: /x/?u=<encoded>&ref=<encoded> ──
@@ -2897,11 +2947,9 @@ app.whenReady().then(() => {
   // mode Chromium stalls on that timing-out resolver instead of cleanly
   // failing over, so a video CDN's manifest may squeak through but its many
   // per-segment lookups hang → hls.js fragLoadTimeOut → the server looks dead.
-  // 'secure' skips the poisoned resolver entirely so streamwish (vibuxer/
-  // hanerix) segments actually load. Tradeoff: a network that blocks the DoH
-  // ENDPOINTS themselves (rare — captive portals) would lose all resolution;
-  // that's the correct failure for this threat model, and any user who can
-  // currently reach the anime sites at all is already reaching DoH.
+  // Start secure to avoid poisoned ISP answers. Check endpoint reachability
+  // at startup and after network changes; use the system fallback only when
+  // DoH is unavailable and the system resolver actually works.
   try {
     app.configureHostResolver({
       secureDnsMode: "secure",
@@ -2910,6 +2958,13 @@ app.whenReady().then(() => {
   } catch (e) {
     console.warn("configureHostResolver failed:", e);
   }
+  void syncSecureDnsMode("startup").catch((e) => console.warn("[net] startup DNS check failed:", e));
+  // HTTPS rides the edge tunnel so a black-holed Cloudflare edge picked by DoH
+  // can't stall a request (see electron/edgeTunnel.ts). Plain http and local
+  // traffic stay direct; if the tunnel fails to start nothing changes.
+  void startEdgeTunnel()
+    .then((port) => session.defaultSession.setProxy({ proxyRules: `https=127.0.0.1:${port}`, proxyBypassRules: "<local>" }))
+    .catch((e) => console.warn("[net] edge tunnel failed to start:", e));
 
   // Watch for connection switches (Wi-Fi → hotspot, unplug, wake from sleep)
   // and reset the shared Chromium network state when one happens — without it,
@@ -3203,6 +3258,9 @@ app.whenReady().then(() => {
       }
       if (new URL(details.url).hostname === "witanime.site") {
         const headers = details.requestHeaders;
+        // Chromium sends these lowercase; adding a cased key left the original
+        // "Microsoft Edge WebView2" brand in place, which witanime 404s.
+        for (const k of Object.keys(headers)) if (/^sec-ch-ua/i.test(k)) delete headers[k];
         headers["Sec-CH-UA"] = `"Chromium";v="${process.versions.chrome.split(".")[0]}", "Not_A Brand";v="99"`;
         headers["Sec-CH-UA-Mobile"] = "?0";
         headers["Sec-CH-UA-Platform"] = JSON.stringify(process.platform === "win32" ? "Windows" : "Linux");

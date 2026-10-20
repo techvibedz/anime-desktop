@@ -35,9 +35,13 @@ class ProviderBrowser {
         core.WebResourceRequested += (sender, request) => {
           var headers = request.Request.Headers;
           var gate = request.Request.Uri.Contains("/watch/stream-gate/");
-          foreach (var name in new[] { "Sec-CH-UA", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform" }) {
-            if (gate && !headers.Contains(name) && clientHints.ContainsKey(name)) headers.SetHeader(name, clientHints[name]);
-            else if (!gate && headers.Contains(name)) clientHints[name] = headers.GetHeader(name);
+          foreach (var name in new[] { "Sec-CH-UA", "Sec-CH-UA-Full-Version-List", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform" }) {
+            if (headers.Contains(name)) {
+              // WitAnime 404s its sources manifest and gates for the WebView2 brand.
+              var value = Regex.Replace(headers.GetHeader(name), @"""Microsoft Edge WebView2"";v=""[^""]*""\s*,?\s*", "").Trim().TrimEnd(',');
+              headers.SetHeader(name, value);
+              if (!gate) clientHints[name] = value;
+            } else if (gate && clientHints.ContainsKey(name)) headers.SetHeader(name, clientHints[name]);
           }
         };
         core.NewWindowRequested += (sender, request) => { request.Handled = true; };

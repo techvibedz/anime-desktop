@@ -48,6 +48,7 @@ const flush = () => new Promise((r) => setImmediate(r));
       interval: null,
       resume: null,
       sourceEdgeIpsPromise: Promise.resolve(['1.2.3.4']),
+      resetEdgeTunnel: () => { calls.seq.push('tunnel'); },
       networkInterfaces: () => WIFI,
       app: { configureHostResolver: (opts) => { calls.modes.push(opts); calls.seq.push('configure'); } },
       session: { defaultSession: {
@@ -90,10 +91,11 @@ const flush = () => new Promise((r) => setImmediate(r));
   load(ctx);
   assert.notEqual(ctx.sourceEdgeIpsPromise, null);
   await ctx.resetNetworkState('interface change');
+  assert.ok(ctx.calls.seq.includes('tunnel'), 'edge tunnel address memory dropped');
   assert.equal(ctx.sourceEdgeIpsPromise, null, 'stale edge-IP memo dropped');
   assert.equal(ctx.calls.resolver, 1, 'host resolver cache cleared');
   assert.equal(ctx.calls.connections, 1, 'stale connections closed');
-  assert.deepEqual(ctx.calls.seq, ['resolver', 'connections', 'configure', 'send'], 'renderer notified only after the network stack is reset');
+  assert.deepEqual(ctx.calls.seq, ['tunnel', 'resolver', 'connections', 'configure', 'send'], 'renderer notified only after the network stack is reset');
   assert.equal(ctx.calls.dohProbes, 6, 'three DoH endpoints probed twice before downgrading');
   assert.equal(ctx.calls.modes[0].secureDnsMode, 'secure', 'DoH down + system DNS down → stay secure (automatic buys nothing)');
 
