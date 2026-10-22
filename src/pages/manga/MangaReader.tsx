@@ -16,7 +16,7 @@ import { normFuzzy } from "../../lib/fuzzy";
 import { fetchMangaChapter } from "../../lib/manga/api";
 import { chapterNumberKey, fetchMergedDetail } from "../../lib/manga/aggregate";
 import { upgradeMangaPage } from "../../lib/manga/cover";
-import { decodeReaderRef, type MergedChapter, type MergedMangaDetail } from "../../lib/manga/types";
+import { decodeReaderRef, type MangaChapterRef, type MergedChapter, type MergedMangaDetail } from "../../lib/manga/types";
 import {
   flushMangaStore,
   getMangaProgress,
@@ -95,17 +95,66 @@ function rememberRatio(uri: string, ratio: number) {
   ratioCache.set(uri, ratio);
 }
 
+// ── page download gate ───────────────────────────────────────────────────────
+// Chapter pages are 0.5–2 MB each. Letting every mounted page download at once
+// splits a slow line N ways, so none finishes before the stall watchdog and the
+// retries start over from zero — the chapter never loads. The gate keeps a few
+// downloads in flight and hands the next slot to the page nearest the reader.
+
+const MAX_PAGE_DOWNLOADS = 4;
+let readerFocusPage = 0;
+let activeDownloads = 0;
+const waitingDownloads = new Set<{ page: number; start: () => void }>();
+
+function setReaderFocusPage(page: number) {
+  readerFocusPage = page;
+}
+
+function pumpDownloads() {
+  while (activeDownloads < MAX_PAGE_DOWNLOADS && waitingDownloads.size) {
+    let best: { page: number; start: () => void } | null = null;
+    for (const w of waitingDownloads) {
+      // Pages ahead of the reader win ties over pages behind it.
+      const score = (p: number) => Math.abs(p - readerFocusPage) * 2 + (p < readerFocusPage ? 1 : 0);
+      if (!best || score(w.page) < score(best.page)) best = w;
+    }
+    if (!best) break;
+    waitingDownloads.delete(best);
+    activeDownloads++;
+    best.start();
+  }
+}
+
+/** Wait for a download slot; returns a cancel/release function (idempotent). */
+function acquireDownload(page: number, start: () => void): () => void {
+  let state: "waiting" | "active" | "done" = "waiting";
+  const entry = { page, start: () => { state = "active"; start(); } };
+  waitingDownloads.add(entry);
+  pumpDownloads();
+  return () => {
+    if (state === "waiting") waitingDownloads.delete(entry);
+    else if (state === "active") { activeDownloads--; pumpDownloads(); }
+    state = "done";
+  };
+}
+
 // ── page image with recovery ─────────────────────────────────────────────────
 
 /** Shared recovery for every mode: upgraded URL first, then the original;
- * two automatic retries, then a visible retry button. */
-const PageImage = memo(function PageImage({ uri, page, style, className = "", onDisplayed, onRatio }: {
+ * two automatic retries, then a visible retry button (and, when the same
+ * chapter exists on another source, a switch to it). */
+const PageImage = memo(function PageImage({ uri, page, style, className = "", onDisplayed, onRatio, onAlternate }: {
   uri: string; page: number; style?: React.CSSProperties; className?: string;
   onDisplayed: (uri: string) => void; onRatio?: (ratio: number, naturalWidth: number) => void;
+  onAlternate?: (() => void) | null;
 }) {
   const [src, setSrc] = useState(() => upgradeMangaPage(uri));
   const [attempt, setAttempt] = useState(0);
   const [status, setStatus] = useState<"loading" | "loaded" | "error">("loading");
+  // The <img> only gets its src once the download gate grants a slot.
+  const [granted, setGranted] = useState(false);
+  const releaseRef = useRef<(() => void) | null>(null);
+  const release = useCallback(() => { releaseRef.current?.(); releaseRef.current = null; }, []);
 
   useEffect(() => {
     setSrc(upgradeMangaPage(uri));
@@ -113,15 +162,24 @@ const PageImage = memo(function PageImage({ uri, page, style, className = "", on
     setStatus("loading");
   }, [uri]);
 
-  // A download that never finishes must not leave a skeleton forever.
   useEffect(() => {
-    if (status !== "loading") return;
-    const timer = setTimeout(() => recover(), 25_000);
+    if (status !== "loading") { release(); return; }
+    setGranted(false);
+    releaseRef.current = acquireDownload(page, () => setGranted(true));
+    return release;
+  }, [status, src, attempt, page, release]);
+
+  // A download that never finishes must not leave a skeleton forever. The
+  // clock only runs while this page actually holds a download slot.
+  useEffect(() => {
+    if (status !== "loading" || !granted) return;
+    const timer = setTimeout(() => recover(), 45_000);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [src, attempt, status]);
+  }, [src, attempt, status, granted]);
 
   function recover() {
+    release();
     if (src !== uri) { setSrc(uri); setAttempt((a) => a + 1); return; }
     if (attempt < 2) { setTimeout(() => setAttempt((a) => a + 1), 800); return; }
     setStatus("error");
@@ -133,10 +191,18 @@ const PageImage = memo(function PageImage({ uri, page, style, className = "", on
         <MIcon d={ICONS.offline} size={28} className="text-m-night-accent" />
         <div className="text-base font-bold text-m-sheet">الصفحة {page + 1}</div>
         <div className="text-sm text-m-night-muted">{t.mangaPageError}</div>
-        <button type="button" onClick={() => { setAttempt((a) => a + 1); setStatus("loading"); }}
-          className="mt-2 flex min-h-[44px] items-center gap-2 rounded bg-m-accent px-5 text-sm font-bold text-m-sheet">
-          <MIcon d={ICONS.refresh} size={18} />{t.retry}
-        </button>
+        <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
+          <button type="button" onClick={(e) => { e.stopPropagation(); setAttempt((a) => a + 1); setStatus("loading"); }}
+            className="flex min-h-[44px] items-center gap-2 rounded bg-m-accent px-5 text-sm font-bold text-m-sheet">
+            <MIcon d={ICONS.refresh} size={18} />{t.retry}
+          </button>
+          {onAlternate && (
+            <button type="button" onClick={(e) => { e.stopPropagation(); onAlternate(); }}
+              className="flex min-h-[44px] items-center gap-2 rounded border border-m-night-muted px-5 text-sm font-bold text-m-sheet">
+              {t.mangaOtherSource}
+            </button>
+          )}
+        </div>
       </div>
     );
   }
@@ -146,7 +212,7 @@ const PageImage = memo(function PageImage({ uri, page, style, className = "", on
   return (
     <div className={`relative ${className}`} style={style}>
       {status === "loading" && <MangaSkeleton dark className="absolute inset-0 rounded-none" />}
-      <img key={url} src={url} alt={`الصفحة ${page + 1}`} draggable={false} decoding="async"
+      {granted && <img key={url} src={url} alt={`الصفحة ${page + 1}`} draggable={false} decoding="async"
         className={`relative block h-full w-full select-none transition-opacity duration-150 ${status === "loaded" ? "opacity-100" : "opacity-0"}`}
         style={{ objectFit: "contain" }}
         onLoad={(e) => {
@@ -159,20 +225,20 @@ const PageImage = memo(function PageImage({ uri, page, style, className = "", on
           setStatus("loaded");
           onDisplayed(uri);
         }}
-        onError={recover} />
+        onError={recover} />}
     </div>
   );
 });
 
 // ── vertical page (continuous mode) ──────────────────────────────────────────
 
-const VerticalPage = memo(function VerticalPage({ uri, page, fit, columnPx, viewportH, gap, root, onDisplayed }: {
+const VerticalPage = memo(function VerticalPage({ uri, page, fit, columnPx, viewportH, gap, root, current, onDisplayed, onAlternate }: {
   uri: string; page: number; fit: FitMode; columnPx: number; viewportH: number; gap: boolean;
-  root: HTMLDivElement | null; onDisplayed: (uri: string) => void;
+  root: HTMLDivElement | null; current: boolean; onDisplayed: (uri: string) => void; onAlternate?: (() => void) | null;
 }) {
   const [ratio, setRatio] = useState(() => ratioCache.get(uri) ?? recentRatio);
   const [natural, setNatural] = useState(0);
-  const [near, setNear] = useState(page < 3);
+  const [near, setNear] = useState(page < 3 || current);
   const boxRef = useRef<HTMLDivElement>(null);
   const onRatio = useCallback((r: number, w: number) => { setRatio(r); setNatural(w); }, []);
   // Mount the image only once it comes within ~2 screens: a 200-page webtoon
@@ -186,6 +252,9 @@ const VerticalPage = memo(function VerticalPage({ uri, page, fit, columnPx, view
     io.observe(boxRef.current);
     return () => io.disconnect();
   }, [near, root]);
+  // The reader's own page index also mounts pages: the observer is paused while
+  // the window is hidden/occluded and can miss slider/keyboard jumps.
+  useEffect(() => { if (current) setNear(true); }, [current]);
   const dims = useMemo(() => {
     switch (fit) {
       case "stretch": return { width: columnPx, height: viewportH };
@@ -204,7 +273,7 @@ const VerticalPage = memo(function VerticalPage({ uri, page, fit, columnPx, view
   return (
     <div ref={boxRef} data-page={page} className={`flex justify-center ${gap ? "pb-3" : ""}`}>
       {near
-        ? <PageImage uri={uri} page={page} style={{ width: dims.width, height: dims.height }} onDisplayed={onDisplayed} onRatio={onRatio} />
+        ? <PageImage uri={uri} page={page} style={{ width: dims.width, height: dims.height }} onDisplayed={onDisplayed} onRatio={onRatio} onAlternate={onAlternate} />
         : <div style={{ width: dims.width, height: dims.height }} className="bg-m-night-panel/40" />}
     </div>
   );
@@ -304,7 +373,7 @@ export function MangaReaderPage() {
       // reshuffle — match by native id first, then by chapter number.
       const sameChapter = progress.chapterId === chapterId
         ? (progress.chapterSource ?? source) === chapterSource
-        : !!chapterNumber && progress.chapterNumber === chapterNumber;
+        : !!chapterNumber && chapterNumberKey(progress.chapterNumber) === chapterNumberKey(chapterNumber);
       if (sameChapter) pendingPageRef.current = progress.page;
     }).catch(() => {}).finally(() => { if (alive) setProgressReady(true); });
 
@@ -417,6 +486,7 @@ export function MangaReaderPage() {
     if (idx < 0 && chapterNumber) idx = chapters.findIndex((c) => c.number === chapterNumber);
     return idx;
   }, [chapters, chapterId, chapterSource, chapterNumber]);
+  const currentChapter = currentIdx >= 0 ? chapters[currentIdx] : null;
   const newerChapter = currentIdx > 0 ? chapters[currentIdx - 1] : null;
   const olderChapter = currentIdx >= 0 && currentIdx < chapters.length - 1 ? chapters[currentIdx + 1] : null;
 
@@ -442,7 +512,45 @@ export function MangaReaderPage() {
     }), { replace: true });
   }, [navigate, source, mangaId, mangaTitle, coverParam, detail]);
 
+  // Every other source serving this chapter number, best first. Sources tried
+  // for this chapter number are skipped so a failing pair can't ping-pong.
+  const triedRef = useRef<{ number: string; keys: Set<string> }>({ number: "", keys: new Set() });
+  if (triedRef.current.number !== chapterNumber) triedRef.current = { number: chapterNumber, keys: new Set() };
+  triedRef.current.keys.add(`${chapterSource}|${chapterId}`);
+  const alternate = useMemo<MangaChapterRef | null>(() => {
+    if (!currentChapter) return null;
+    const all: MangaChapterRef[] = [
+      { source: currentChapter.source, mangaId: currentChapter.mangaId, id: currentChapter.id },
+      ...(currentChapter.alternates ?? []),
+    ];
+    return all.find((c) => !(c.source === chapterSource && c.id === chapterId) && !triedRef.current.keys.has(`${c.source}|${c.id}`)) ?? null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentChapter, chapterSource, chapterId]);
+
+  const switchSource = useCallback(() => {
+    if (!alternate || !currentChapter) return;
+    // Keep the reader's position: the restore matches by chapter number.
+    saveRef.current(indexRef.current);
+    flushMangaStore();
+    goToChapter({ ...currentChapter, source: alternate.source, mangaId: alternate.mangaId, id: alternate.id });
+  }, [alternate, currentChapter, goToChapter]);
+
+  // A chapter that fails to load on its source opens from the next source.
+  useEffect(() => {
+    if (error && alternate) switchSource();
+  }, [error, alternate, switchSource]);
+
   const total = pages?.length ?? 0;
+
+  // Download priority + eager mounting follow the page being read.
+  useEffect(() => { setReaderFocusPage(index); }, [index]);
+
+  // Paged modes show one page at a time — fetch the next two ahead so a page
+  // turn doesn't start a download from zero.
+  useEffect(() => {
+    if (prefs.mode === "vertical" || !pages) return;
+    for (const url of pages.slice(index + 1, index + 3)) { const img = new Image(); img.src = upgradeMangaPage(url); }
+  }, [prefs.mode, pages, index]);
 
   const jumpTo = useCallback((target: number) => {
     if (!total) return;
@@ -576,7 +684,8 @@ export function MangaReaderPage() {
           <div className="pb-4 pt-16">
             {pages.map((uri, i) => (
               <VerticalPage key={uri} uri={uri} page={i} fit={prefs.fit} columnPx={columnPx} viewportH={viewport.h}
-                gap={prefs.gap} root={scrollRoot} onDisplayed={onPageDisplayed} />
+                gap={prefs.gap} root={scrollRoot} current={i >= index - 1 && i <= index + 4}
+                onDisplayed={onPageDisplayed} onAlternate={alternate ? switchSource : null} />
             ))}
           </div>
           <ChapterEnd newer={newerChapter} older={olderChapter} onGo={goToChapter} onBack={exit} />
@@ -584,7 +693,8 @@ export function MangaReaderPage() {
       ) : (
         <div className="relative flex h-full items-center justify-center overflow-hidden">
           {pagedUri && (
-            <PagedView key={pagedUri} uri={pagedUri} page={index} fit={prefs.fit} viewport={viewport} onDisplayed={onPageDisplayed} />
+            <PagedView key={pagedUri} uri={pagedUri} page={index} fit={prefs.fit} viewport={viewport} onDisplayed={onPageDisplayed}
+              onAlternate={alternate ? switchSource : null} />
           )}
           {/* click zones: outer thirds turn pages, the middle toggles chrome */}
           <div className="absolute inset-0 flex" dir="ltr">
@@ -731,8 +841,9 @@ function toggleFullscreen() {
 
 // ── pieces ───────────────────────────────────────────────────────────────────
 
-function PagedView({ uri, page, fit, viewport, onDisplayed }: {
+function PagedView({ uri, page, fit, viewport, onDisplayed, onAlternate }: {
   uri: string; page: number; fit: FitMode; viewport: { w: number; h: number }; onDisplayed: (uri: string) => void;
+  onAlternate?: (() => void) | null;
 }) {
   const [ratio, setRatio] = useState(() => ratioCache.get(uri) ?? recentRatio);
   const [natural, setNatural] = useState(0);
@@ -760,7 +871,7 @@ function PagedView({ uri, page, fit, viewport, onDisplayed }: {
   return (
     <div className={`flex h-full w-full justify-center ${scrolls ? "items-start overflow-auto" : "items-center"}`}>
       <PageImage uri={uri} page={page} style={{ width: dims.width, height: dims.height, flexShrink: 0 }}
-        onDisplayed={onDisplayed} onRatio={(r, nw) => { setRatio(r); setNatural(nw); }} />
+        onDisplayed={onDisplayed} onRatio={(r, nw) => { setRatio(r); setNatural(nw); }} onAlternate={onAlternate} />
     </div>
   );
 }

@@ -493,7 +493,9 @@ function HeroBanner({ card }: { card: MangaCard }) {
 function ContinueCard({ item, onRemove }: { item: MangaProgress; onRemove: (item: MangaProgress) => void }) {
   const navigate = useNavigate();
   const progress = item.total > 0 ? Math.min(1, (item.page + 1) / item.total) : 0;
-  const open = () => navigate(mangaReaderPath({
+  // Progress pulled from the account has a chapter number but no native id —
+  // the detail page resolves it ("متابعة" there opens the right chapter).
+  const open = () => navigate(!item.chapterId ? mangaDetailPath({ source: item.source, id: item.id, title: item.title, cover: item.cover }) : mangaReaderPath({
     source: item.source,
     mangaId: item.id,
     mangaTitle: item.title,

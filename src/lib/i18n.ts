@@ -666,6 +666,7 @@ export const ar = {
   mangaRotationLocked: "عمودي فقط",
   mangaPageJump: "الانتقال إلى صفحة",
   mangaPageError: "تعذّر تحميل الصفحة",
+  mangaOtherSource: "من مصدر آخر",
   mangaChapterFilter: "ابحث عن فصل…",
   mangaMarkRead: "تحديد كمقروء",
   mangaMarkUnread: "تحديد كغير مقروء",

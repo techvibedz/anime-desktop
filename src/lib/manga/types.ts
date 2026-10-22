@@ -103,6 +103,15 @@ export interface MergedChapter extends MangaChapterInfo {
   source: MangaSourceId;
   /** Native manga id on `source` (URL/slug) — required to build chapter URLs. */
   mangaId: string;
+  /** The same chapter number on the other matched sources, best first — the
+   * reader falls back to them when this copy fails or has missing pages. */
+  alternates?: MangaChapterRef[];
+}
+
+export interface MangaChapterRef {
+  source: MangaSourceId;
+  mangaId: string;
+  id: string;
 }
 
 /** Detail with every matching source's chapters unioned by chapter number —

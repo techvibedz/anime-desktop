@@ -121,13 +121,15 @@ export function MangaDetailPage() {
 
   const onPrimary = useCallback(() => {
     if (!detail || detail.chapters.length === 0) return;
-    if (progress?.chapterId) {
+    if (progress?.chapterId || progress?.chapterNumber) {
       // The saved chapter may now be served by another source; resolve it by
-      // native id + owning source, then by chapter number.
+      // native id + owning source, then by chapter number (progress pulled from
+      // the account has no native id at all).
       const chapterSource = progress.chapterSource ?? detail.source;
+      const numberKey = chapterNumberKey(progress.chapterNumber);
       const match =
-        detail.chapters.find((c) => c.id === progress.chapterId && c.source === chapterSource) ??
-        (progress.chapterNumber ? detail.chapters.find((c) => c.number === progress.chapterNumber) : undefined);
+        (progress.chapterId ? detail.chapters.find((c) => c.id === progress.chapterId && c.source === chapterSource) : undefined) ??
+        (numberKey ? detail.chapters.find((c) => chapterNumberKey(c.number) === numberKey) : undefined);
       if (match) { openChapter(match); return; }
     }
     openChapter(detail.chapters[detail.chapters.length - 1]);
@@ -260,7 +262,9 @@ export function MangaDetailPage() {
                 const read = readSet.has(mangaChapterReadKey(chapter.source, chapter.id));
                 return (
                   <ChapterRow key={`${chapter.source}:${chapter.id}`} number={chapter.number} title={chapter.title} date={chapter.date} read={read}
-                    active={progress?.chapterId === chapter.id && (progress.chapterSource ?? source) === chapter.source}
+                    active={progress?.chapterId
+                      ? progress.chapterId === chapter.id && (progress.chapterSource ?? source) === chapter.source
+                      : !!progress?.chapterNumber && chapterNumberKey(progress.chapterNumber) === chapterNumberKey(chapter.number)}
                     onClick={() => openChapter(chapter)}
                     onToggleRead={() => void setMangaChapterRead(source, nativeId, mangaChapterReadKey(chapter.source, chapter.id), !read)} />
                 );

@@ -452,7 +452,13 @@ export function mergeDetails(entries: DetailEntry[]): MergedMangaDetail {
   for (const { source, detail } of ordered) {
     for (const chapter of detail.chapters) {
       const key = chapterNumberKey(chapter.number) || `id:${source}:${chapter.id}`;
-      if (byKey.has(key)) continue;
+      const existing = byKey.get(key);
+      if (existing) {
+        // Keep the lower-ranked copies: a source can serve a chapter whose
+        // images were never uploaded (3asq 404s), and the reader needs a way out.
+        if (existing.source !== source) (existing.alternates ??= []).push({ source, mangaId: detail.id, id: chapter.id });
+        continue;
+      }
       byKey.set(key, { ...chapter, source, mangaId: detail.id });
     }
   }

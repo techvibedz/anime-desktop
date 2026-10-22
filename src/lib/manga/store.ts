@@ -1,7 +1,7 @@
 // Manga store — library + reading progress + read marks, all local
 // (AsyncStorage), all in one listener so any screen updates when any of them
-// changes. Same module-cache + subscribe pattern as lib/favorites.ts; cloud
-// sync is deliberately deferred until a Supabase manga table exists.
+// changes. Same module-cache + subscribe pattern as lib/favorites.ts; the
+// account copy lives in public.manga_activity (see cloud.ts).
 
 import { storage as AsyncStorage } from "../storage";
 import { useEffect, useState } from "react";
@@ -212,6 +212,70 @@ export async function getContinueReading(limit = 12): Promise<MangaProgress[]> {
   return Object.values(progressCache)
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, limit);
+}
+
+// ── cloud merge ──────────────────────────────────────────────────────────────
+
+export interface CloudMangaEntry {
+  source: MangaSourceId;
+  id: string;
+  title: string;
+  cover: string | null;
+  chapterNumber: string | null;
+  page: number;
+  total: number;
+  inLibrary: boolean;
+  updatedAt: number;
+}
+
+/** Fold the account's server copy into the local store (sign-in on a new
+ * device, or progress made on the phone). Additive: library entries are
+ * added, never removed; progress is taken from the server only when it is
+ * newer than the local one. The server row has no native chapter id, so the
+ * detail/reader resolve the chapter by number (`chapterId: ""`). */
+export async function mergeCloudManga(entries: CloudMangaEntry[]): Promise<boolean> {
+  if (!libCache) libCache = await loadJson<MangaLibraryEntry[]>(LIB_KEY, []);
+  if (!progressCache) progressCache = await loadJson<Record<string, MangaProgress>>(PROGRESS_KEY, {});
+  let libChanged = false;
+  let progressChanged = false;
+  const inLib = new Set(libCache.map((entry) => mangaKey(entry.source, entry.id)));
+  for (const e of entries) {
+    if (!e.source || !e.id) continue;
+    const key = mangaKey(e.source, e.id);
+    if (e.inLibrary && !inLib.has(key)) {
+      libCache.push({
+        source: e.source, id: e.id, title: e.title, cover: e.cover,
+        type: null, status: null, rating: null, latest: null, addedAt: e.updatedAt,
+      });
+      inLib.add(key);
+      libChanged = true;
+    }
+    if (e.chapterNumber) {
+      const local = progressCache[key];
+      if (!local || local.updatedAt < e.updatedAt) {
+        const sameChapter = local && local.chapterNumber === e.chapterNumber;
+        progressCache[key] = {
+          source: e.source,
+          id: e.id,
+          title: e.title || local?.title || "",
+          cover: e.cover ?? local?.cover ?? null,
+          // Same chapter as the local copy → keep its native ids.
+          chapterId: sameChapter ? local.chapterId : "",
+          chapterSource: sameChapter ? local.chapterSource : undefined,
+          chapterMangaId: sameChapter ? local.chapterMangaId : undefined,
+          chapterNumber: e.chapterNumber,
+          page: e.page,
+          total: e.total,
+          updatedAt: e.updatedAt,
+        };
+        progressChanged = true;
+      }
+    }
+  }
+  if (libChanged) persistDebounced(LIB_KEY, libCache);
+  if (progressChanged) persistDebounced(PROGRESS_KEY, progressCache);
+  if (libChanged || progressChanged) emit();
+  return libChanged || progressChanged;
 }
 
 // ── read marks ───────────────────────────────────────────────────────────────
