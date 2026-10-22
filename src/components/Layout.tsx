@@ -1,4 +1,4 @@
-import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
+import { Link, NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef } from "react";
 import { useAuth } from "../lib/auth";
 import { clearHomeCache } from "../lib/api";
@@ -28,6 +28,7 @@ const NAV = [
   { to: "/upcoming", label: t.upcomingTitle, end: false, d: "M12 8v4l3 3|M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z" },
   { to: "/downloads", label: t.downloadsTitle, end: false, d: "M12 3v12|m7 10 5 5 5-5|M5 21h14" },
   { to: "/watch-party", label: t.wpTitle, end: false, d: "M16 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z|M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z|M2 20c0-2.8 2.7-5 6-5s6 2.2 6 5|M15.5 15.4c2.6.5 4.5 2.4 4.5 4.6" },
+  { to: "/manga", label: t.mangaTab, end: false, d: "M4 19.5A2.5 2.5 0 0 1 6.5 17H20|M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z|M9 7h7|M9 11h5" },
   { to: "/mylist", label: t.myList, end: false, d: "M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1Z" },
 ];
 
@@ -88,6 +89,8 @@ export function Layout() {
   const menuRef = useRef<HTMLDivElement>(null);
   const { online } = useOnlineStatus();
   const admin = isAdmin(user?.email);
+  // Manga pages paint their own paper canvas edge to edge.
+  const manga = useLocation().pathname.startsWith("/manga");
 
   // Unread notification badge — re-renders whenever the feed changes.
   useEffect(() => {
@@ -222,7 +225,7 @@ export function Layout() {
         </div>
       </aside>
 
-      <main className="min-h-screen ps-60">
+      <main className={`min-h-screen ps-60 ${manga ? "bg-m-paper" : ""}`}>
         <div className="mx-auto max-w-[1700px] px-8 py-7">
           {online === false && (
             <div className="mb-4 rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-2.5 text-sm text-amber-200">

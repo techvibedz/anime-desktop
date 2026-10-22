@@ -1167,3 +1167,19 @@ if (finalInline) return { url: finalInline };
 
 return null;
 })();`;
+
+/* ── RENDERED HTML (manga Cloudflare fallback) ─────────────────────────── */
+// Wait for the page to pass any challenge and contain `marker`, then hand back
+// the rendered document (or the raw body for JSON endpoints Chromium wraps in
+// <pre>). The manga fetch layer only reaches this after a direct GET failed.
+export const EXTRACT_RENDERED_HTML = (marker: string, rawText = false, timeoutMs = 20000) => `(async function(){${HELPERS}
+var MARKER = ${JSON.stringify(marker || "")};
+var ok = await window.__pWaitFor(function () {
+  if (document.readyState === 'loading') return false;
+  if (!MARKER) return true;
+  return (document.documentElement.innerHTML || '').indexOf(MARKER) >= 0;
+}, ${timeoutMs}, 400);
+if (!ok) return { html: null };
+var pre = ${rawText ? "true" : "false"} && document.querySelector('body > pre');
+return { html: pre ? pre.textContent : document.documentElement.outerHTML };
+})();`;

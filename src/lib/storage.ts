@@ -28,6 +28,10 @@ const CACHE_PREFIXES = [
   "@poster_fix_",
   "@translate_ar_",
   "@source_rail_",
+  "manga_home_cache_v1:",
+  "manga_detail_cache_v1:",
+  "manga_merged_detail_v2:",
+  "@manga_cover_fallback_v1:",
   "pantoufa_home_cache",
   "pantoufa_cache",
 ];

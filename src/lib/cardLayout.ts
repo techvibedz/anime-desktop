@@ -12,7 +12,9 @@ export type CardLayoutScope =
   | "popular"
   | "see-all"
   | "related"
-  | "title";
+  | "title"
+  | "manga-search"
+  | "manga-library";
 
 const KEY_PREFIX = "@settings_card_layout:";
 const DEFAULT_LAYOUT: CardLayout = "compact";

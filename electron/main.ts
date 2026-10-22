@@ -225,7 +225,9 @@ function isAdHost(host: string): boolean {
   // witanime rotates through free TLDs that AD_HOST_RE blocks wholesale
   // (.life is in that list, and .site/.net are one rotation away from it).
   // Its own domains and its image CDN (images.witanime.*) are never ads.
-  return !/(^|\.)(?:witanime\.[a-z]{2,}|vik(?:i|1)ngfile\.(?:com|site))$/i.test(host) && AD_HOST_RE.test(host);
+  // The manga sources sit on the same blocked TLDs (lekmanga.site) — their
+  // pages, chapter images and CDNs are content, never ads.
+  return !/(^|\.)(?:witanime\.[a-z]{2,}|vik(?:i|1)ngfile\.(?:com|site)|lekmanga\.site|mangalik\.net|3asq\.online|mangawy\.org)$/i.test(host) && AD_HOST_RE.test(host);
 }
 
 // Canonical Referer/Origin a provider's embed expects, keyed by hostname.
@@ -3364,6 +3366,17 @@ app.whenReady().then(() => {
           // Force it (the request inherits the app's file://-/localhost Referer)
           // and send NO Origin — a cross-origin Origin trips the same check.
           ref = "https://anime3rb.com/";
+          ori = "";
+          force = true;
+        } else if (rt === "image" && /(^|\.)(3asq\.online|lekmanga\.site|mangalik\.net|mangawy\.org)$/i.test(host)) {
+          // Manga covers + chapter pages: the WP-Manga hosts and mangawy's
+          // image CDN hotlink-check the Referer and 403 the app's
+          // file:///localhost origin. Stamp the owning site (the same Referer
+          // the mobile reader sends) and NO Origin.
+          const site = /3asq/.test(host) ? "https://3asq.online/"
+            : /mangawy/.test(host) ? "https://mangawy.org/"
+            : "https://lekmanga.site/";
+          ref = site;
           ori = "";
           force = true;
         } else if (/images\.anime3rb\.com/.test(host) || /^anime3rb\.com$/.test(host)) {

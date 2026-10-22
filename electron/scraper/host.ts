@@ -370,7 +370,11 @@ async function runJob(slotIdx: number, p: Pending) {
   let nativeBrowser: ReturnType<typeof startWindowsBrowserJob> = null;
 
   try {
-    if (p.job.isVideoJob || /^https:\/\/(?:[^/]+\.)?(?:witanime|anime4up)\.[a-z]+\//i.test(p.job.url)) {
+    // Cloudflare-fronted sources go through the native WebView2 browser: the
+    // CDP-attached Electron slots below never clear CF's managed challenge
+    // (lekmanga stays on "Just a moment…" forever), WebView2 passes it.
+    if (p.job.isVideoJob || /^https:\/\/(?:[^/]+\.)?(?:witanime|anime4up)\.[a-z]+\//i.test(p.job.url) ||
+        /^https:\/\/(?:[^/]+\.)?(?:lekmanga\.site|mangalik\.net|3asq\.online|mangawy\.org)\//i.test(p.job.url)) {
       nativeBrowser = startWindowsBrowserJob(p.job, slotIdx);
       if (nativeBrowser) {
         const result = await Promise.race([nativeBrowser.promise.catch(() => null), timeoutPromise, settledPromise]);

@@ -21,6 +21,26 @@ export default {
         "text-secondary": "oklch(80% 0.008 113)",
         "text-muted": "oklch(63% 0.01 113)",
         "glass-border": "rgba(255,255,255,0.08)",
+        // Manga's own ink-and-paper palette (mobile lib/manga/design parity) —
+        // deliberately independent of the anime UI.
+        m: {
+          paper: "#F5F1E8",
+          sheet: "#FFFCF6",
+          wash: "#EBE5D9",
+          ink: "#22231F",
+          muted: "#68675E",
+          line: "#D9D2C5",
+          accent: "#B83E25",
+          "accent-wash": "#F4E1D7",
+          read: "#38634F",
+          "read-wash": "#DFE9DF",
+          rating: "#8B5A14",
+          night: "#181916",
+          "night-panel": "#252621",
+          "night-muted": "#C4C0B5",
+          "night-line": "#42443B",
+          "night-accent": "#F09572",
+        },
       },
       fontFamily: {
         display: ['"IBM Plex Sans Arabic"', "system-ui", "sans-serif"],

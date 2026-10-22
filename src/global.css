@@ -30,6 +30,13 @@ h1, h2, h3 { text-wrap: balance; }
   animation: shimmer 1.4s infinite linear;
 }
 
+/* Manga paper-palette shimmer */
+.shimmer-paper {
+  background: linear-gradient(90deg, #E4DDD0 0%, #EFE9DE 50%, #E4DDD0 100%);
+  background-size: 800px 100%;
+  animation: shimmer 1.4s infinite linear;
+}
+
 .no-drag { -webkit-app-region: no-drag; }
 .drag { -webkit-app-region: drag; }
 
@@ -64,5 +71,5 @@ button { font-family: inherit; }
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
-  .shimmer { animation: none; }
+  .shimmer, .shimmer-paper { animation: none; }
 }

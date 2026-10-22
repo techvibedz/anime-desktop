@@ -3,6 +3,8 @@
 // from the users list; the numbers come from the admin-only RPCs in lib/usage.
 
 import { useCallback, useEffect, useState } from "react";
+import { fetchAdminUserManga, type AdminMangaEntry } from "../../lib/adminManga";
+import { mangaPosterUrl } from "../../lib/manga/cover";
 import { Navigate, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useAuth } from "../../lib/auth";
 import { isAdmin } from "../../lib/presence";
@@ -83,7 +85,7 @@ function HistoryPoster({ image, href }: { image: string; href: string }) {
   );
 }
 
-type ProfileTab = "usage" | "history";
+type ProfileTab = "usage" | "history" | "manga";
 
 export function AdminUserDetailPage() {
   const { user, ready } = useAuth();
@@ -102,6 +104,7 @@ export function AdminUserDetailPage() {
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [historyError, setHistoryError] = useState(false);
   const [activeTab, setActiveTab] = useState<ProfileTab>("usage");
+  const [manga, setManga] = useState<AdminMangaEntry[] | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [chatOpening, setChatOpening] = useState(false);
 
@@ -119,6 +122,7 @@ export function AdminUserDetailPage() {
     else setHistoryError(true);
     setLoaded(true);
     setHistoryLoaded(true);
+    setManga(await fetchAdminUserManga(userId));
   }, [userId]);
 
   useEffect(() => {
@@ -221,6 +225,7 @@ export function AdminUserDetailPage() {
         {([
           { key: "usage" as const, label: t.userUsageTab },
           { key: "history" as const, label: t.userHistoryTab },
+          { key: "manga" as const, label: t.mangaTab },
         ]).map((tab) => (
           <button
             key={tab.key}
@@ -260,6 +265,44 @@ export function AdminUserDetailPage() {
                       <div className="h-full rounded-full bg-accent" style={{ width: `${Math.round(pct * 100)}%` }} />
                     </div>
                     <p className="mt-2 text-end text-[11px] text-text-muted">{t.userDayOpens(d.opens)}</p>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {activeTab === "manga" && (
+        <div>
+          {manga == null ? (
+            <div className="flex justify-center py-16">
+              <div className="h-8 w-8 animate-spin rounded-full border-2 border-accent border-t-transparent" />
+            </div>
+          ) : manga.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-white/10 p-12 text-center">
+              <p className="font-semibold text-white">لا يقرأ أي مانجا بعد</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {manga.map((entry) => {
+                const pct = entry.total > 0 ? Math.round(Math.min(1, (entry.page + 1) / entry.total) * 100) : 0;
+                return (
+                  <div key={entry.key} className="flex items-center gap-3 rounded-xl border border-white/10 bg-surface p-2.5">
+                    <div className="h-16 w-11 shrink-0 overflow-hidden rounded-md bg-raised">
+                      {entry.cover && <img src={mangaPosterUrl(entry.cover, 44) ?? entry.cover} alt="" className="h-full w-full object-cover" />}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-bold text-white">{entry.title || entry.key}</p>
+                      <p className="mt-0.5 text-xs text-text-muted">
+                        {entry.chapterNumber ? `الفصل ${entry.chapterNumber} · ${Math.min(entry.page + 1, entry.total)} / ${entry.total}` : "في المكتبة"}
+                        {entry.inLibrary && entry.chapterNumber ? " · في المكتبة" : ""}
+                      </p>
+                      {entry.chapterNumber && (
+                        <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-accent" style={{ width: `${pct}%` }} /></div>
+                      )}
+                    </div>
+                    <span className="shrink-0 text-[11px] text-text-muted">{new Date(entry.updatedAt).toLocaleDateString("ar")}</span>
                   </div>
                 );
               })}

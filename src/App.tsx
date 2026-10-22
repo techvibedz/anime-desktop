@@ -13,6 +13,7 @@ import { startUsageSession, endUsageSession } from "./lib/usage";
 import { startNotificationSync, stopNotificationSync } from "./lib/notifications";
 import { setLogUser } from "./lib/remoteLog";
 import { normalizePartyCode, takePendingInvite } from "./lib/partyInvite";
+import { flushMangaCloudSync, startMangaCloudSync } from "./lib/manga/cloud";
 
 // Route-level code splitting. Home stays eager (first paint); everything else
 // loads on demand — most importantly Watch, which pulls in hls.js.
@@ -40,6 +41,10 @@ const NewsArticlePage = lazy(() => import("./pages/NewsArticle").then((m) => ({ 
 const ReportPage = lazy(() => import("./pages/Report").then((m) => ({ default: m.ReportPage })));
 const ChatPage = lazy(() => import("./pages/Chat").then((m) => ({ default: m.ChatPage })));
 const ScraperDebugPage = lazy(() => import("./pages/ScraperDebug").then((m) => ({ default: m.ScraperDebugPage })));
+const MangaHubPage = lazy(() => import("./pages/manga/MangaHub").then((m) => ({ default: m.MangaHubPage })));
+const MangaDetailPage = lazy(() => import("./pages/manga/MangaDetail").then((m) => ({ default: m.MangaDetailPage })));
+const MangaLibraryPage = lazy(() => import("./pages/manga/MangaLibrary").then((m) => ({ default: m.MangaLibraryPage })));
+const MangaReaderPage = lazy(() => import("./pages/manga/MangaReader").then((m) => ({ default: m.MangaReaderPage })));
 const AdminLivePage = lazy(() => import("./pages/admin/Live").then((m) => ({ default: m.AdminLivePage })));
 const AdminUsersPage = lazy(() => import("./pages/admin/Users").then((m) => ({ default: m.AdminUsersPage })));
 const AdminUserDetailPage = lazy(() => import("./pages/admin/UserDetail").then((m) => ({ default: m.AdminUserDetailPage })));
@@ -73,6 +78,21 @@ export default function App() {
     if (!user && !isGuestPath) navigate("/welcome", { replace: true });
     else if (user && isGuestPath) navigate("/", { replace: true });
   }, [user, ready, isConfigured, location.pathname, navigate]);
+
+  // Mirror the local manga library + reading progress to Supabase (admin view).
+  useEffect(() => {
+    if (!user) return;
+    const stop = startMangaCloudSync(user.id);
+    const onHide = () => { if (document.visibilityState === "hidden") flushMangaCloudSync(user.id); };
+    const onUnload = () => flushMangaCloudSync(user.id);
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("beforeunload", onUnload);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("beforeunload", onUnload);
+    };
+  }, [user?.id]);
 
   useEffect(() => {
     if (user) {
@@ -165,6 +185,10 @@ export default function App() {
             <Route path="upcoming" element={<UpcomingPage />} />
             <Route path="title/:id" element={<TitlePage />} />
             <Route path="schedule" element={<SchedulePage />} />
+            <Route path="manga" element={<MangaHubPage />} />
+            <Route path="manga/library" element={<MangaLibraryPage />} />
+            <Route path="manga/title/:ref" element={<MangaDetailPage />} />
+            <Route path="manga/read/:ref" element={<MangaReaderPage />} />
             <Route path="downloads" element={<DownloadsPage />} />
             <Route path="watch-party" element={<WatchPartyPage />} />
             <Route path="notifications" element={<NotificationsPage />} />
