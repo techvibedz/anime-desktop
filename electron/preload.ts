@@ -95,6 +95,12 @@ contextBridge.exposeInMainWorld("pantoufa", {
   // Privileged JSON/text fetch (AniList, translate) from the main process.
   fetchJson: (opts: { url: string; method?: string; body?: string; headers?: Record<string, string> }) =>
     ipcRenderer.invoke("pantoufa:fetch-json", opts) as Promise<string | null>,
+  // Render a Cloudflare-fronted manga page in a plain hidden window.
+  cfRender: (opts: { url: string; marker?: string; rawText?: boolean; timeoutMs?: number }) =>
+    ipcRenderer.invoke("pantoufa:cf-render", opts) as Promise<string | null>,
+  // Earn Cloudflare clearance for a challenged manga image host (hidden window).
+  clearImageChallenge: (url: string) =>
+    ipcRenderer.invoke("pantoufa:clear-image-challenge", url) as Promise<boolean>,
   resolveWitServers: (url: string) => ipcRenderer.invoke("pantoufa:wit-servers", url) as Promise<{
     servers: { id: string; name: string; iframeUrl: string }[];
     episodeTitle: string;

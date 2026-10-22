@@ -90,6 +90,10 @@ const VIDEO_UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, lik
 // the player goes black. So mp4upload's server-side extraction fetch uses this.
 const PLAYBACK_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Safari/537.36`;
 const witGateRedirects = new Map<string, string>();
+// webContents ids of the hidden Cloudflare-pass windows (pantoufa:cf-render).
+// Every session hook leaves their traffic untouched: the challenge's own
+// XHRs fail when their Referer/Origin are rewritten like provider requests.
+const cfRenderContents = new Set<number>();
 
 let mainWindow: BrowserWindow | null = null;
 let pendingAuthCallback: string | null = null;
@@ -3090,6 +3094,7 @@ app.whenReady().then(() => {
   // Also fix Supabase auth CORS — in dev mode (localhost:5173) the
   // origin doesn't match the Supabase dashboard's allowed list.
   session.defaultSession.webRequest.onHeadersReceived((details, cb) => {
+    if (details.webContentsId != null && cfRenderContents.has(details.webContentsId)) return cb({});
     const headers: Record<string, any> = { ...details.responseHeaders };
     for (const k of Object.keys(headers)) {
       const lower = k.toLowerCase();
@@ -3176,6 +3181,7 @@ app.whenReady().then(() => {
     return h.includes(".") && !/^\d+\.\d+/.test(h);
   }
   session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
+    if (details.webContentsId != null && cfRenderContents.has(details.webContentsId)) return callback({});
     try {
       // Scraper slot fast-path: even before the page's player fires, capture
       // the first real .m3u8 a hidden scraper window requests (and kill its
@@ -3253,6 +3259,10 @@ app.whenReady().then(() => {
       // media). Never touch mainFrame/subFrame navigations — the iframe
       // needs to load the embed page with its native Referer chain.
       const rt = (details as any).resourceType;
+      if (details.webContentsId != null && cfRenderContents.has(details.webContentsId)) {
+        callback({ requestHeaders: details.requestHeaders });
+        return;
+      }
       // Verification requests need the browser's own Origin and Referer.
       if (new URL(details.url).hostname === "challenges.cloudflare.com") {
         callback({ requestHeaders: details.requestHeaders });
@@ -3379,6 +3389,13 @@ app.whenReady().then(() => {
           ref = site;
           ori = "";
           force = true;
+          // cf_clearance is bound to the User-Agent that earned it, and the
+          // Cloudflare-pass window (pantoufa:cf-render) must keep Electron's
+          // own UA — the spoofed Chrome UA never clears. Send the same one.
+          for (const k of Object.keys(details.requestHeaders)) {
+            if (k.toLowerCase() === "user-agent") delete details.requestHeaders[k];
+          }
+          details.requestHeaders["User-Agent"] = session.defaultSession.getUserAgent();
         } else if (/images\.anime3rb\.com/.test(host) || /^anime3rb\.com$/.test(host)) {
           // anime3rb's poster CDN (images.anime3rb.com) hotlink-checks the
           // Referer: it 403s the app's file:///localhost Referer but serves
@@ -3483,6 +3500,113 @@ app.whenReady().then(() => {
       // handler" every time an ISP blocks anime4up or a CDN mirror.
       return null;
     }
+  });
+
+  // Cloudflare pass for the manga hosts in a plain hidden window.
+  // lekmanga.site and its s3storm image CDN sit behind CF managed challenges
+  // (pages, and the older /manga/arb3/… uploads — e.g. Fight Class 3 ch. 1–142,
+  // where a bare <img> gets 403 + cf-mitigated and the reader shows nothing).
+  // A debugger-free BrowserWindow in the app's own session clears them in ~4s
+  // even on a cold profile (verified live 2026-10-23); the CDP scraper slots
+  // never do and the WebView2 helper can sit on "Just a moment…" for 25s+.
+  // The cf_clearance it earns lives in defaultSession — bound to this UA + TLS
+  // stack — and manga image requests are sent with the same UA, so the
+  // reader's <img> requests pass afterwards too.
+  const MANGA_CF_HOST_RE = /(^|\.)(lekmanga\.site|mangalik\.net|3asq\.online|mangawy\.org)$/i;
+  const cfRenderInflight = new Map<string, Promise<string | null>>();
+  const cfImageClearedAt = new Map<string, number>();
+  let cfRenderActive = 0;
+  const cfRenderWaiters: (() => void)[] = [];
+  const CF_CHALLENGE_RE = /just a moment|cf-browser-verification|cf_chl_opt|challenge-platform\/h\/|id=["']cf-please-wait["']/i;
+
+  /** Load `url` in a hidden window until `probe` (evaluated there) returns a string. */
+  async function renderPastCloudflare(
+    url: URL,
+    probe: string,
+    timeoutMs: number,
+  ): Promise<string | null> {
+    // Few windows at a time: a detail page + chapter prefetch + page retries
+    // can all ask at once.
+    if (cfRenderActive >= 2) await new Promise<void>((r) => cfRenderWaiters.push(r));
+    cfRenderActive++;
+    const site = `https://${url.hostname.replace(/^[^.]+\.(?=[^.]+\.[^.]+$)/, "")}/`;
+    const win = new BrowserWindow({
+      show: false,
+      width: 1100,
+      height: 800,
+      webPreferences: { session: session.defaultSession, sandbox: true, contextIsolation: true, nodeIntegration: false },
+    });
+    const contentsId = win.webContents.id;
+    cfRenderContents.add(contentsId);
+    // Keep Electron's own UA: the spoofed Chrome UA (PLAYBACK_UA) disagrees
+    // with the Chromium-only client hints and never clears the challenge.
+    win.webContents.setAudioMuted(true);
+    win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    try {
+      void win.loadURL(url.toString(), { httpReferrer: site }).catch(() => {});
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 400));
+        if (win.isDestroyed()) return null;
+        const out = await win.webContents.executeJavaScript(probe, true).catch(() => null);
+        if (typeof out === "string") return out;
+      }
+      return null;
+    } finally {
+      if (!win.isDestroyed()) win.destroy();
+      cfRenderContents.delete(contentsId);
+      cfRenderActive--;
+      cfRenderWaiters.shift()?.();
+    }
+  }
+
+  // Render a manga page past Cloudflare and return its HTML once `marker` is
+  // present (or the raw body text for JSON endpoints).
+  ipcMain.handle("pantoufa:cf-render", async (
+    _evt,
+    opts: { url: string; marker?: string; rawText?: boolean; timeoutMs?: number },
+  ): Promise<string | null> => {
+    let target: URL;
+    try { target = new URL(String(opts?.url)); } catch { return null; }
+    if (target.protocol !== "https:" || !MANGA_CF_HOST_RE.test(target.hostname)) return null;
+    const marker = String(opts.marker ?? "");
+    const rawText = !!opts.rawText;
+    const key = `${rawText}|${marker}|${target}`;
+    const existing = cfRenderInflight.get(key);
+    if (existing) return existing;
+    const probe = `(() => {
+      if (document.readyState === "loading") return null;
+      const html = document.documentElement ? document.documentElement.outerHTML : "";
+      if (new RegExp(${JSON.stringify(CF_CHALLENGE_RE.source)}, "i").test(document.title + html.slice(0, 4000))) return null;
+      if (${JSON.stringify(marker)} && html.indexOf(${JSON.stringify(marker)}) < 0) return null;
+      const pre = ${rawText} && document.querySelector("body > pre");
+      return pre ? pre.textContent : html;
+    })()`;
+    const pending = renderPastCloudflare(target, probe, Math.max(5000, Math.min(opts.timeoutMs ?? 25_000, 40_000)))
+      .finally(() => cfRenderInflight.delete(key));
+    cfRenderInflight.set(key, pending);
+    return pending;
+  });
+
+  // Earn clearance for a challenged page image: navigate to the image itself
+  // until the challenge page is replaced by the bitmap. A recent success is
+  // reused so a 30-page chapter doesn't open 30 windows.
+  ipcMain.handle("pantoufa:clear-image-challenge", async (_evt, rawUrl: string): Promise<boolean> => {
+    let target: URL;
+    try { target = new URL(String(rawUrl)); } catch { return false; }
+    if (target.protocol !== "https:" || !MANGA_CF_HOST_RE.test(target.hostname)) return false;
+    const host = target.hostname.toLowerCase();
+    if (Date.now() - (cfImageClearedAt.get(host) ?? 0) < 30_000) return true;
+    const key = `image|${host}`;
+    let pending = cfRenderInflight.get(key);
+    if (!pending) {
+      pending = renderPastCloudflare(target, `document.contentType.indexOf("image/") === 0 ? "ok" : null`, 20_000)
+        .finally(() => cfRenderInflight.delete(key));
+      cfRenderInflight.set(key, pending);
+    }
+    const ok = (await pending) === "ok";
+    if (ok) cfImageClearedAt.set(host, Date.now());
+    return ok;
   });
 
   // Mute / unmute the main window's audio. The renderer calls this

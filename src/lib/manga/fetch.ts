@@ -21,6 +21,15 @@ async function fetchViaBrowser(url: string, marker: string, rawText = false): Pr
   const existing = renderInflight.get(key);
   if (existing) return existing;
   const pending = (async () => {
+    // A plain hidden Electron window clears the manga hosts' Cloudflare
+    // challenge in ~4s even cold (and earns the cookie the reader's page
+    // images need); the WebView2 scraper below is the fallback.
+    try {
+      const html = await window.pantoufa.cfRender?.({ url, marker, rawText, timeoutMs: 25_000 });
+      if (typeof html === "string" && html.length > 0 && !looksLikeCfChallenge(html) && (!marker || html.includes(marker))) return html;
+    } catch {
+      // fall through to the WebView2 scraper
+    }
     try {
       const result = (await window.pantoufa.scrape({
         url,
@@ -31,10 +40,8 @@ async function fetchViaBrowser(url: string, marker: string, rawText = false): Pr
       return typeof html === "string" && html.length > 0 && !looksLikeCfChallenge(html) && (!marker || html.includes(marker)) ? html : null;
     } catch {
       return null;
-    } finally {
-      renderInflight.delete(key);
     }
-  })();
+  })().finally(() => renderInflight.delete(key));
   renderInflight.set(key, pending);
   return pending;
 }

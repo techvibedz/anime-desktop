@@ -140,6 +140,8 @@ function acquireDownload(page: number, start: () => void): () => void {
 
 // ── page image with recovery ─────────────────────────────────────────────────
 
+const CHALLENGED_IMAGE_HOST_RE = /^https:\/\/(?:[^/]+\.)?(?:lekmanga\.site|mangalik\.net)\//i;
+
 /** Shared recovery for every mode: upgraded URL first, then the original;
  * two automatic retries, then a visible retry button (and, when the same
  * chapter exists on another source, a switch to it). */
@@ -155,11 +157,13 @@ const PageImage = memo(function PageImage({ uri, page, style, className = "", on
   const [granted, setGranted] = useState(false);
   const releaseRef = useRef<(() => void) | null>(null);
   const release = useCallback(() => { releaseRef.current?.(); releaseRef.current = null; }, []);
+  const challengeTriedRef = useRef(false);
 
   useEffect(() => {
     setSrc(upgradeMangaPage(uri));
     setAttempt(0);
     setStatus("loading");
+    challengeTriedRef.current = false;
   }, [uri]);
 
   useEffect(() => {
@@ -181,6 +185,13 @@ const PageImage = memo(function PageImage({ uri, page, style, className = "", on
   function recover() {
     release();
     if (src !== uri) { setSrc(uri); setAttempt((a) => a + 1); return; }
+    // lekmanga's image CDN Cloudflare-challenges its older uploads; earn the
+    // clearance cookie once, then retry with it.
+    if (!challengeTriedRef.current && CHALLENGED_IMAGE_HOST_RE.test(uri) && window.pantoufa?.clearImageChallenge) {
+      challengeTriedRef.current = true;
+      void window.pantoufa.clearImageChallenge(uri).catch(() => false).then(() => setAttempt((a) => a + 1));
+      return;
+    }
     if (attempt < 2) { setTimeout(() => setAttempt((a) => a + 1), 800); return; }
     setStatus("error");
   }
@@ -192,7 +203,7 @@ const PageImage = memo(function PageImage({ uri, page, style, className = "", on
         <div className="text-base font-bold text-m-sheet">الصفحة {page + 1}</div>
         <div className="text-sm text-m-night-muted">{t.mangaPageError}</div>
         <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
-          <button type="button" onClick={(e) => { e.stopPropagation(); setAttempt((a) => a + 1); setStatus("loading"); }}
+          <button type="button" onClick={(e) => { e.stopPropagation(); challengeTriedRef.current = false; setAttempt((a) => a + 1); setStatus("loading"); }}
             className="flex min-h-[44px] items-center gap-2 rounded bg-m-accent px-5 text-sm font-bold text-m-sheet">
             <MIcon d={ICONS.refresh} size={18} />{t.retry}
           </button>
