@@ -19,6 +19,39 @@ const deadUntil = new Map<string, number>();
 const lastGood = new Map<string, string>();
 const resolved = new Map<string, { at: number; sources: Promise<string[]>[] }>();
 
+// Cloudflare routes by SNI, so ANY reachable edge serves any proxied host.
+// When every resolver answers only black-holed edges (the system resolver is
+// ISP-blocked and both DoH providers rotate into the dead ones — seen for
+// img.mangawy.org and w1.anime4up.rest), the tunnel also races edges that
+// recently connected for other hosts plus a few seeds measured to work. A wrong
+// edge can't serve the wrong site: TLS is still verified in Chromium.
+const CF_RANGES = [
+  "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18",
+  "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17",
+  "162.158.0.0/15", "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+].map((cidr) => {
+  const [base, bits] = cidr.split("/");
+  return { net: ipv4ToInt(base), mask: bits === "0" ? 0 : (~0 << (32 - Number(bits))) >>> 0 };
+});
+const CF_SEEDS = ["104.16.0.1", "104.18.0.1", "162.159.128.1", "188.114.96.12", "188.114.97.12"];
+const goodCloudflare: string[] = [];
+
+function ipv4ToInt(ip: string): number {
+  return ip.split(".").reduce((n, part) => ((n << 8) | Number(part)) >>> 0, 0);
+}
+
+export function isCloudflareIp(ip: string): boolean {
+  if (net.isIPv4(ip)) {
+    const n = ipv4ToInt(ip);
+    return CF_RANGES.some((r) => ((n & r.mask) >>> 0) === r.net);
+  }
+  return /^2606:4700:|^2803:f800:|^2405:b500:|^2405:8100:|^2a06:98c1:|^2c0f:f248:/i.test(ip);
+}
+
+function cloudflareFallbacks(): string[] {
+  return [...goodCloudflare, ...CF_SEEDS];
+}
+
 const capped = (p: Promise<string[]>, ms: number) =>
   Promise.race([p, new Promise<string[]>((r) => setTimeout(() => r([]), ms))]).catch(() => [] as string[]);
 
@@ -83,13 +116,24 @@ export function connectHost(host: string, port: number, sources = sourcesFor(hos
         socket.removeListener("error", dead);
         lastGood.set(host, ip);
         deadUntil.delete(ip);
+        if (net.isIPv4(ip) && isCloudflareIp(ip)) {
+          const at = goodCloudflare.indexOf(ip);
+          if (at >= 0) goodCloudflare.splice(at, 1);
+          goodCloudflare.unshift(ip);
+          goodCloudflare.length = Math.min(goodCloudflare.length, 4);
+        }
         finish(undefined, socket);
       });
       if (queue.length) stagger = setTimeout(next, STAGGER_MS);
     };
-    const rank = (ip: string) => (ip === lastGood.get(host) ? 0 : (deadUntil.get(ip) ?? 0) > Date.now() ? 2 : 1);
+    const fallback = new Set<string>();
+    const rank = (ip: string) =>
+      ip === lastGood.get(host) ? 0 : (deadUntil.get(ip) ?? 0) > Date.now() ? 3 : fallback.has(ip) ? 2 : 1;
     const add = (ips: string[]) => {
       for (const ip of ips) if (!tried.has(ip)) { tried.add(ip); queue.push(ip); }
+      if (!fallback.size && ips.some(isCloudflareIp)) {
+        for (const ip of cloudflareFallbacks()) if (!tried.has(ip)) { tried.add(ip); fallback.add(ip); queue.push(ip); }
+      }
       queue.sort((a, b) => rank(a) - rank(b));
       if (!done && !stagger) next();
     };
@@ -103,6 +147,7 @@ export function connectHost(host: string, port: number, sources = sourcesFor(hos
 export function resetEdgeTunnel(): void {
   deadUntil.clear();
   lastGood.clear();
+  goodCloudflare.length = 0;
   resolved.clear();
 }
 

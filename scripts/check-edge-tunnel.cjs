@@ -30,6 +30,10 @@ vm.runInNewContext(ts.transpileModule(source, { compilerOptions: { target: ts.Sc
 
   await assert.rejects(tunnel.connectHost('nothing.test', port, [Promise.resolve([])]), /no reachable address/);
 
+  // Cloudflare detection drives the edge fallback.
+  for (const ip of ['188.114.96.5', '104.21.30.130', '172.67.172.239', '162.159.128.1', '2a06:98c1:3121::5']) assert.ok(tunnel.isCloudflareIp(ip), ip);
+  for (const ip of ['127.0.0.1', '8.8.8.8', '192.0.2.1', '104.15.255.255']) assert.ok(!tunnel.isCloudflareIp(ip), ip);
+
   // CONNECT through the tunnel reaches the echo server.
   const tunnelPort = await tunnel.startEdgeTunnel();
   const reply = await new Promise((resolve, reject) => {
@@ -44,6 +48,6 @@ vm.runInNewContext(ts.transpileModule(source, { compilerOptions: { target: ts.Sc
   });
   assert.match(reply, /^HTTP\/1\.1 200/);
   echo.close();
-  console.log('PASS edge tunnel: hedged connect past black-holed edge, good-edge memory, CONNECT piping');
+  console.log('PASS edge tunnel: hedged connect past black-holed edge, good-edge memory, Cloudflare detection, CONNECT piping');
   process.exit(0);
 })().catch((e) => { console.error(e); process.exit(1); });
