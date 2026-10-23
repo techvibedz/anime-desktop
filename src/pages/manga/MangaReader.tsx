@@ -359,7 +359,7 @@ export function MangaReaderPage() {
     setPages(null);
     setProgressReady(false);
     setDetail((prev) => (prev && prev.source === source && prev.id === mangaId ? prev : null));
-    setChrome(true);
+    if (!document.fullscreenElement) setChrome(true);
     setError(false);
     setIndex(0);
     displayedRef.current.clear();
@@ -591,17 +591,32 @@ export function MangaReaderPage() {
   }, [navigate, source, mangaId, mangaTitle, coverParam]);
 
   // ── chrome auto-hide ──
+  // Windowed: mouse movement reveals the chrome, which fades after 3.5s.
+  // Fullscreen: chrome hides on entry and only a click on the page toggles it —
+  // mouse movement, wheel and scrolling never bring it back.
+  const [fullscreen, setFullscreen] = useState(() => !!document.fullscreenElement);
   const chromeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    const onChange = () => {
+      const fs = !!document.fullscreenElement;
+      setFullscreen(fs);
+      if (chromeTimer.current) clearTimeout(chromeTimer.current);
+      setChrome(!fs);
+    };
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
   const pokeChrome = useCallback(() => {
+    if (fullscreen) return;
     setChrome(true);
     if (chromeTimer.current) clearTimeout(chromeTimer.current);
     chromeTimer.current = setTimeout(() => setChrome(false), 3500);
-  }, []);
+  }, [fullscreen]);
   useEffect(() => {
-    if (!pages || listOpen || settingsOpen) { if (chromeTimer.current) clearTimeout(chromeTimer.current); return; }
+    if (!pages || listOpen || settingsOpen || fullscreen) { if (chromeTimer.current) clearTimeout(chromeTimer.current); return; }
     pokeChrome();
     return () => { if (chromeTimer.current) clearTimeout(chromeTimer.current); };
-  }, [pages, listOpen, settingsOpen, pokeChrome]);
+  }, [pages, listOpen, settingsOpen, fullscreen, pokeChrome]);
 
   // ── keyboard ──
   useEffect(() => {
