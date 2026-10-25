@@ -450,6 +450,9 @@ export function tm_seasonNum(orig: string): number {
 }
 function tm_normLatin(s: string): string {
   return String(s || "").toLowerCase()
+    // Slugs drop apostrophes ("Darwin's Game" → darwins-game); a space here
+    // split it into "darwin s" and the strict anime3rb match never fired.
+    .replace(/['’`]/g, "")
     .replace(/\b(?:season|s|part|cour)\s*\d+\b/g, " ")
     .replace(/\b(?:the|a|an|of|to|wa|no|wo|ga|ni)\b/g, " ")
     .replace(/[^a-z0-9 ]+/g, " ")
@@ -483,6 +486,9 @@ function tm_score(want: string, title: string): number {
   const arabicOverlap = tm_overlap(arWant, arGot);
   let s: number;
   if (latinWant && latinGot === latinWant) s = 100;
+  // Same name, different word breaks ("Aoashi" vs anime3rb's "Ao Ashi"):
+  // word overlap scores that 0, so compare with the spaces taken out.
+  else if (latinWant.length >= 5 && latinGot.replace(/ /g, "") === latinWant.replace(/ /g, "")) s = 98;
   else if (latinWant && latinGot.indexOf(latinWant) === 0) s = 85;
   else if (arWant && arGot === arWant) s = 95;
   else s = Math.round(Math.max(latinOverlap, arabicOverlap) * 75);
@@ -997,17 +1003,58 @@ function a3rbSeasonOf(label: string): number {
   return 1;
 }
 
+// Per-slug derived forms, computed once: catalog scans touch all ~5.5k slugs
+// per lookup, and re-normalizing every label each time froze the JS thread
+// for hundreds of ms on phones.
+type A3rbSlugInfo = { toks: string[]; season: number; compact: string };
+const a3rbSlugInfo = new Map<string, A3rbSlugInfo>();
+function a3rbInfo(slug: string): A3rbSlugInfo {
+  let info = a3rbSlugInfo.get(slug);
+  if (!info) {
+    const label = slug.replace(/[-_]+/g, " ");
+    const season = a3rbSeasonOf(label);
+    info = { toks: tm_toks(tm_normLatin(label)), season, compact: a3rbCompactKey(label, season) };
+    a3rbSlugInfo.set(slug, info);
+  }
+  return info;
+}
+
+// Word-boundary-blind key: the title's words glued together, minus how the
+// season is WRITTEN ("season 2", "2nd season", "s2", a trailing "2"/"ii" for
+// season 2 — the season NUMBER is compared separately and strictly). Sites
+// split romaji differently — witanime's "Aoashi Season 2" is anime3rb's
+// "ao-ashi-season-2" — and token coverage can't see "aoashi" = "ao"+"ashi".
+// Deliberately KEEPS what tm_normLatin drops: one-letter words ("dragon-ball-z"
+// ≠ "dragon-ball", "blood-c" ≠ "blood"), "part N" (a cour is a different page
+// with different episode numbers) and a bare ordinal ("Major 2nd" is its own
+// show). The matcher still only trusts a key that is UNIQUE in the catalog.
+const A3RB_ROMAN: Record<string, number> = { ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10 };
+export function a3rbCompactKey(label: string, season: number): string {
+  return String(label || "").toLowerCase()
+    .replace(/['’`]/g, "")
+    .replace(/\b\d+(?:st|nd|rd|th)\s+season\b/g, " ")
+    .replace(/\bseason\s*\d+\b|\bs\d+\b|\bseasons?\b/g, " ")
+    .replace(/\b(?:the|a|an|of|to|wa|no|wo|ga|ni)\b/g, " ")
+    .replace(/[^a-z0-9 ]+/g, " ")
+    .split(" ")
+    .filter(Boolean)
+    // A bare season number only counts as the season when it TRAILS the title
+    // ("chihayafuru-2"); mid-title it belongs to something else ("part 2").
+    .filter((t, i, all) => !(season >= 2 && (A3RB_ROMAN[t] === season || (t === String(season) && i === all.length - 1))))
+    .join("");
+}
+
 // Conservative matcher: a wrong match plays the WRONG anime's episodes, so it
 // requires near-total coverage of the wanted title's tokens, an exact season
 // match, and (for short titles) near-total coverage of the slug's tokens too.
-function a3rbCatalogMatch(title: string, slugs: string[]): string | null {
+export function a3rbCatalogMatch(title: string, slugs: string[]): string | null {
   // Want-forms: the full title, every parenthesized alternative name, and a
   // tight-colon-joined copy of each (Str::slug turns "Re:Zero" into "rezero").
   const rawForms: string[] = [title];
   const reParen = /[\(\[]([^\)\]]+)[\)\]]/g;
   let pm: RegExpExecArray | null;
   while ((pm = reParen.exec(title))) { const p = pm[1].trim(); if (p) rawForms.push(p); }
-  type Want = { set: Record<string, true>; n: number; season: number };
+  type Want = { set: Record<string, true>; toks: string[]; pairs: Record<string, true>; n: number; season: number; compact: string };
   const wants: Want[] = [];
   for (const f of rawForms) {
     for (const v of [f, f.replace(/(\S)[:：](\S)/g, "$1$2")]) {
@@ -1015,31 +1062,45 @@ function a3rbCatalogMatch(title: string, slugs: string[]): string | null {
       if (!toks.length) continue;
       const set: Record<string, true> = {};
       toks.forEach((t) => { set[t] = true; });
-      wants.push({ set, n: toks.length, season: a3rbSeasonOf(v.toLowerCase()) });
+      // Adjacent pairs joined: sites split compound romaji differently
+      // ("Mugen-jou-hen" on witanime vs anime3rb's "mugenjou-hen").
+      const pairs: Record<string, true> = {};
+      for (let i = 0; i + 1 < toks.length; i++) pairs[toks[i] + toks[i + 1]] = true;
+      const season = a3rbSeasonOf(v.toLowerCase());
+      wants.push({ set, toks, pairs, n: toks.length, season, compact: a3rbCompactKey(v, season) });
     }
   }
   if (!wants.length) return null;
   let best: { slug: string | null; score: number } = { slug: null, score: 0 };
+  const compactHits = new Set<string>();
   for (const slug of slugs) {
-    const label = slug.replace(/[-_]+/g, " ");
-    const gotToks = tm_toks(tm_normLatin(label));
+    const { toks: gotToks, season: gotSeason, compact: gotCompact } = a3rbInfo(slug);
     if (!gotToks.length) continue;
-    const gotSeason = a3rbSeasonOf(label);
     for (const w of wants) {
       // Wrong season page = wrong episode numbering. Hard reject.
       if (gotSeason !== w.season) continue;
+      // Same name with different word breaks ("aoashi" vs "ao-ashi"). Only
+      // decisive when exactly ONE catalog entry carries the key (+season) —
+      // collected here, settled after the scan.
+      // (No `continue`: when the key turns out ambiguous, the ordinary
+      // token scoring below must still have ranked these slugs.)
+      if (w.compact.length >= 5 && gotCompact === w.compact) compactHits.add(slug);
       let gc = 0;
       const gotSet: Record<string, true> = {};
-      for (const t of gotToks) { gotSet[t] = true; if (w.set[t]) gc++; }
+      for (const t of gotToks) { gotSet[t] = true; if (w.set[t] || w.pairs[t]) gc++; }
       let wc = 0;
-      for (const t in w.set) { if (gotSet[t]) wc++; }
-      const wantCov = wc / w.n;
-      const gotCov = gc / gotToks.length;
+      for (let i = 0; i < w.toks.length; i++) {
+        const t = w.toks[i];
+        if (gotSet[t]) wc++;
+        else if (i + 1 < w.toks.length && gotSet[t + w.toks[i + 1]]) { wc += 2; i++; }
+      }
+      const wantCov = Math.min(1, wc / w.n);
+      const gotCov = Math.min(1, gc / gotToks.length);
       // Containment: the slug's ENTIRE name appears inside the wanted title
       // (with enough tokens to be non-coincidental). Catches witanime titles
       // that concatenate the English and romaji names — especially the
-      // mount-time slug-derived title, where "X (Y)" arrives flattened as
-      // "x y" and no single name covers 80% of the combined token set.
+      // slug-derived title, where "X (Y)" arrives flattened as "x y" and no
+      // single name covers 80% of the combined token set.
       const contained = gotCov === 1 && gc >= 4;
       const ok = contained || (
         w.n >= 3 ? wantCov >= 0.8 :
@@ -1050,6 +1111,7 @@ function a3rbCatalogMatch(title: string, slugs: string[]): string | null {
       if (score > best.score) best = { slug, score };
     }
   }
+  if (compactHits.size === 1) return [...compactHits][0];
   return best.slug;
 }
 

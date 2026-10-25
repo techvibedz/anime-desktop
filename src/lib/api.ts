@@ -31,7 +31,7 @@ import {
   type RawServer,
 } from "./scraper";
 import { getAltTitles, clearAltTitlesCache } from "./altTitles";
-import { getAnimeYearType, clearAnimeYearTypeCache } from "./airing";
+import { getAnimeYearType, clearAnimeYearTypeCache, getAniListAltTitles } from "./airing";
 import { animeTitleKey } from "./history";
 import { createRequestCache, withTimeout } from "./requestCache";
 import { writeCloudHome, readCloudHome } from "./homeCloudCache";
@@ -933,11 +933,13 @@ const a3rbTitleCache = new Map<string, { url: string; ts: number }>();
 // Kidoutai" 1995 vs "Koukaku Kidoutai (TV)" 2026) could be locked onto the OLD
 // entry, and the wrong slug was re-written on every hit so it never aged out.
 const A3RB_TITLE_PREFIX = "@a3rb_title_v3:";
-// Titles whose Jikan alt-name bridge has already been attempted this session.
-// The bridge hits Jikan + probes anime3rb with each alt name; a fundamental
-// name mismatch won't change between the watch screen's retries, so run it at
-// most once per title (the cheap catalog/slug probes still retry every call).
-const a3rbBridgeTried = new Set<string>();
+// Titles whose alt-name bridge has run, and when. A bridge that GOT names but
+// still found nothing won't change between the watch screen's retries, so it
+// runs once per session (value 0); a bridge whose name lookups came back empty
+// (Jikan and AniList both down/slow) may run again after A3RB_BRIDGE_RETRY_MS
+// instead of being written off for the whole session. Mobile parity.
+const a3rbBridgeTried = new Map<string, number>();
+const A3RB_BRIDGE_RETRY_MS = 10 * 60 * 1000;
 
 // Cache-only lookup of an anime's resolved anime3rb title URL — no network.
 async function peekAnime3rbTitleUrl(animeTitle: string): Promise<string | null> {
@@ -983,14 +985,15 @@ async function resolveAnime3rbTitleUrl(animeTitle: string): Promise<string | nul
     // scan of the whole family finds it. No extra fetches for ordinary anime.
     url = await searchAnime3rbFamily(animeTitle, want).catch(() => null);
   }
-  if (!url && !a3rbBridgeTried.has(key)) {
+  const bridgeAt = a3rbBridgeTried.get(key);
+  if (!url && (bridgeAt == null || (bridgeAt > 0 && Date.now() - bridgeAt > A3RB_BRIDGE_RETRY_MS))) {
     // Cross-language bridge — the main reason anime3rb "sometimes doesn't show".
     // witanime/anime4up may hand us an Arabic title, or a romanization anime3rb
     // doesn't index under (King's Game ↔ Ousama Game, Re:Zero ↔ rezero). Ask
     // Jikan for the anime's other names and retry the catalog + slug match with
     // each Latin one (anime3rb's slugs are Latin). getAltTitles caches its
     // result so retries are free.
-    a3rbBridgeTried.add(key);
+    a3rbBridgeTried.set(key, Date.now());
     // getAltTitles cleans the season off the query, so its names are the BASE
     // franchise names. Bridging them as-is for a later season would match the
     // WRONG season's page (numbering restarts), so detect the wanted season and
@@ -1000,10 +1003,24 @@ async function resolveAnime3rbTitleUrl(animeTitle: string): Promise<string | nul
     // III") are detected — the lowercased `key` would hide the uppercase-roman
     // discriminator that keeps a stray "v"/"x" from being read as a season.
     const seasonNum = tm_seasonNum(animeTitle);
-    const alts = await getAltTitles(animeTitle).catch(() => [] as string[]);
+    // Two independent name sources — Jikan and AniList — so one being slow or
+    // unreachable doesn't leave the anime without anime3rb servers.
+    const [jikanAlts, aniListAlts] = await Promise.all([
+      withTimeout(getAltTitles(animeTitle), 15_000, [] as string[]).catch(() => [] as string[]),
+      withTimeout(getAniListAltTitles(animeTitle, tm_seasonNum), 12_000, [] as string[]).catch(() => [] as string[]),
+    ]);
+    const seenAlt = new Set<string>();
+    const alts = [...jikanAlts, ...aniListAlts].filter((alt) => {
+      const k = alt.toLowerCase().trim();
+      return !seenAlt.has(k) && !!seenAlt.add(k);
+    });
+    // Names in hand → this outcome is final for the session (0 = never retry).
+    if (alts.length) a3rbBridgeTried.set(key, 0);
     for (const alt of alts) {
       if (!/[a-z]/i.test(alt)) continue;            // need Latin script for the slug
-      const altQ = seasonNum >= 2 ? `${alt} season ${seasonNum}` : alt;
+      // An alt that already names its season ("Ao Ashi 2nd Season") is used
+      // as-is — doubling the season marker would garble the slug guesses.
+      const altQ = seasonNum >= 2 && tm_seasonNum(alt) !== seasonNum ? `${alt} season ${seasonNum}` : alt;
       if (altQ.toLowerCase().trim() === key) continue; // already tried as the primary
       url =
         (await searchAnime3rbCatalog(altQ, want).catch(() => null)) ||
@@ -1020,7 +1037,9 @@ async function resolveAnime3rbTitleUrl(animeTitle: string): Promise<string | nul
     // watch loop stops retrying AND later fetchAnime3rbServers calls skip the
     // slug probes that tarpit the edge. Only after the bridge ran, so a purely
     // transient catalog fetch failure (bridge not yet attempted) still retries.
-    if (a3rbBridgeTried.has(key)) definitiveMiss.add(missKey("anime3rb", animeTitle));
+    // Definitive only when the bridge actually had names to try (value 0) —
+    // an empty Jikan/AniList answer is likely transient, so keep retrying.
+    if (a3rbBridgeTried.get(key) === 0) definitiveMiss.add(missKey("anime3rb", animeTitle));
     console.warn(`[a3rb-resolve] no anime3rb match for "${animeTitle}"`);
   }
   return url;

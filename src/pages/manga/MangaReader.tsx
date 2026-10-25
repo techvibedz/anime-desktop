@@ -9,6 +9,7 @@
 // chapter is prefetched near the end, and the saved page is restored on reopen.
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { pageColumns } from "../../lib/manga/columns";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { t } from "../../lib/i18n";
 import { storage } from "../../lib/storage";
@@ -241,6 +242,41 @@ const PageImage = memo(function PageImage({ uri, page, style, className = "", on
   );
 });
 
+/** A page entry whose image is split into side-by-side columns (hijala's
+ * `01_001` + `01_002` halves): each column is an ordinary PageImage (own
+ * retries/recovery), laid out left→right — direction:ltr so the RTL app shell
+ * never swaps the halves. Reports the COMBINED page ratio (columns are equal
+ * width in every upload seen) so the page box sizes like one image. Plain
+ * pages pass straight through to PageImage. */
+const PageView = memo(function PageView({ uri, page, style, onDisplayed, onRatio, onAlternate }: {
+  uri: string; page: number; style?: React.CSSProperties;
+  onDisplayed: (uri: string) => void; onRatio?: (ratio: number, naturalWidth: number) => void;
+  onAlternate?: (() => void) | null;
+}) {
+  const columns = useMemo(() => pageColumns(uri), [uri]);
+  const n = columns.length;
+  const shownRef = useRef(false);
+  useEffect(() => { shownRef.current = false; }, [uri]);
+  const columnDisplayed = useCallback(() => {
+    if (shownRef.current) return;
+    shownRef.current = true;
+    onDisplayed(uri);
+  }, [onDisplayed, uri]);
+  const columnRatio = useCallback((ratio: number, naturalWidth: number) => {
+    rememberRatio(uri, ratio / n);
+    onRatio?.(ratio / n, naturalWidth * n);
+  }, [onRatio, uri, n]);
+  if (n < 2) return <PageImage uri={uri} page={page} style={style} onDisplayed={onDisplayed} onRatio={onRatio} onAlternate={onAlternate} />;
+  return (
+    <div className="flex" style={{ ...style, direction: "ltr" }}>
+      {columns.map((col, i) => (
+        <PageImage key={col} uri={col} page={page} style={{ width: `${100 / n}%`, height: "100%" }}
+          onDisplayed={columnDisplayed} onRatio={i === 0 ? columnRatio : undefined} onAlternate={onAlternate} />
+      ))}
+    </div>
+  );
+});
+
 // ── vertical page (continuous mode) ──────────────────────────────────────────
 
 const VerticalPage = memo(function VerticalPage({ uri, page, fit, columnPx, viewportH, gap, root, current, onDisplayed, onAlternate }: {
@@ -284,7 +320,7 @@ const VerticalPage = memo(function VerticalPage({ uri, page, fit, columnPx, view
   return (
     <div ref={boxRef} data-page={page} className={`flex justify-center ${gap ? "pb-3" : ""}`}>
       {near
-        ? <PageImage uri={uri} page={page} style={{ width: dims.width, height: dims.height }} onDisplayed={onDisplayed} onRatio={onRatio} onAlternate={onAlternate} />
+        ? <PageView uri={uri} page={page} style={{ width: dims.width, height: dims.height }} onDisplayed={onDisplayed} onRatio={onRatio} onAlternate={onAlternate} />
         : <div style={{ width: dims.width, height: dims.height }} className="bg-m-night-panel/40" />}
     </div>
   );
@@ -508,7 +544,7 @@ export function MangaReaderPage() {
     if (prefetchRef.current === key) return;
     prefetchRef.current = key;
     void fetchMangaChapter(newerChapter.source, newerChapter.mangaId, newerChapter.id)
-      .then((data) => { for (const url of data.pages.slice(0, 3)) { const img = new Image(); img.src = upgradeMangaPage(url); } })
+      .then((data) => { for (const url of data.pages.slice(0, 3).flatMap(pageColumns)) { const img = new Image(); img.src = upgradeMangaPage(url); } })
       .catch(() => {});
   }, [index, pages, newerChapter]);
 
@@ -560,7 +596,7 @@ export function MangaReaderPage() {
   // turn doesn't start a download from zero.
   useEffect(() => {
     if (prefs.mode === "vertical" || !pages) return;
-    for (const url of pages.slice(index + 1, index + 3)) { const img = new Image(); img.src = upgradeMangaPage(url); }
+    for (const url of pages.slice(index + 1, index + 3).flatMap(pageColumns)) { const img = new Image(); img.src = upgradeMangaPage(url); }
   }, [prefs.mode, pages, index]);
 
   const jumpTo = useCallback((target: number) => {
@@ -896,7 +932,7 @@ function PagedView({ uri, page, fit, viewport, onDisplayed, onAlternate }: {
   const scrolls = dims.height > h + 1 || dims.width > w + 1;
   return (
     <div className={`flex h-full w-full justify-center ${scrolls ? "items-start overflow-auto" : "items-center"}`}>
-      <PageImage uri={uri} page={page} style={{ width: dims.width, height: dims.height, flexShrink: 0 }}
+      <PageView uri={uri} page={page} style={{ width: dims.width, height: dims.height, flexShrink: 0 }}
         onDisplayed={onDisplayed} onRatio={(r, nw) => { setRatio(r); setNatural(nw); }} onAlternate={onAlternate} />
     </div>
   );

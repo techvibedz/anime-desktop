@@ -23,6 +23,7 @@
 
 import { fetchMangaHtml } from "../fetch";
 import { hijalaGenreIds } from "../genres";
+import { joinColumnPages } from "../columns";
 import { absoluteUrl, attr, chapterImageUrl, decodeEntities, firstMatch, stripTags } from "../html";
 import type {
   MangaCard,
@@ -280,7 +281,8 @@ export function parseHijalaChapter(html: string, base: string): MangaReaderData 
   }
   if (!pages.length) return null;
   const title = stripTags(firstMatch(html, /<h1 class="entry-title"[^>]*>([\s\S]*?)<\/h1>/i) ?? "");
-  return { pages, title: title || null };
+  // Left/right halves of one page (`01_001` + `01_002`) → one page entry.
+  return { pages: joinColumnPages(pages), title: title || null };
 }
 
 // ── request builders ─────────────────────────────────────────────────────────
