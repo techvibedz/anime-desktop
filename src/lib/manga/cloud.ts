@@ -15,7 +15,7 @@ const PUSH_DELAY_MS = 8000;
 let lastPushed = new Map<string, string>(); // manga_key → row fingerprint
 let lastUser: string | null = null;
 
-const SOURCES: readonly string[] = ["asq", "mangawy", "mangalik"] satisfies MangaSourceId[];
+const SOURCES: readonly string[] = ["asq", "mangawy", "mangalik", "hijala"] satisfies MangaSourceId[];
 
 /** Pull the account's rows into the local store. Returns the server keys, or
  * null when the read failed (then nothing may be deleted on push). */

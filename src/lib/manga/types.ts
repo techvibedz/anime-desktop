@@ -3,11 +3,11 @@
 // source-specific fields, so adding a source means writing one adapter, not
 // touching any screen.
 
-export type MangaSourceId = "asq" | "mangawy" | "mangalik";
+export type MangaSourceId = "asq" | "mangawy" | "mangalik" | "hijala";
 
 export interface MangaCard {
   source: MangaSourceId;
-  /** Source-native id: 3asq absolute manga URL · mangawy/mangalik slug. */
+  /** Source-native id: 3asq absolute manga URL · mangawy/mangalik/hijala slug. */
   id: string;
   title: string;
   cover: string | null;

@@ -9,7 +9,7 @@
 // actually has it.
 //
 // Page-quality routing: when several sources carry the same chapter number the
-// highest-resolution source wins (3asq ≈2000px scans, mangalik ≈967px,
+// highest-resolution source wins (3asq ≈2000px scans, mangalik ≈967px, hijala ≈855px,
 // mangawy ≈720px — measured live). Coverage is never lost: chapters missing
 // from the best source are served by whichever source has them.
 
@@ -36,11 +36,11 @@ import type {
   MergedMangaDetail,
 } from "./types";
 
-export const COMBINED_SOURCES: MangaSourceId[] = ["asq", "mangawy", "mangalik"];
+export const COMBINED_SOURCES: MangaSourceId[] = ["asq", "mangawy", "mangalik", "hijala"];
 
 /** Widest chapter pages first (measured live). Used to pick which source's
  * copy of a duplicated chapter renders and which card wins a title tie. */
-export const SOURCE_QUALITY_ORDER: MangaSourceId[] = ["asq", "mangalik", "mangawy"];
+export const SOURCE_QUALITY_ORDER: MangaSourceId[] = ["asq", "mangalik", "hijala", "mangawy"];
 
 export function sourceRank(source: MangaSourceId): number {
   const index = SOURCE_QUALITY_ORDER.indexOf(source);
@@ -444,6 +444,38 @@ interface DetailEntry {
   detail: MangaDetail;
 }
 
+/** Split part "N.1".."N.4" (".5"+ is the conventional extra/special). */
+const SPLIT_PART = /^(\d+)\.([1-4])$/;
+
+/** Some sources (hijala) post one long chapter as "N" + "N.2" while the others
+ * carry the whole "N" — measured live: hijala TBATE 41 + 41.2 = 27 + 30 pages,
+ * mangalik 41 = 57. When another source owns the whole "N", that source's
+ * split parts would replay half the chapter, so they are dropped (or handed
+ * to an alternate that genuinely has the part). Only applied with evidence the
+ * part's source splits "N" (it has "N" itself or several parts). */
+function dropForeignSplitParts(byKey: Map<string, MergedChapter>, entries: DetailEntry[]): void {
+  const keysBySource = new Map<MangaSourceId, Set<string>>();
+  for (const { source, detail } of entries) {
+    const keys = keysBySource.get(source) ?? new Set<string>();
+    for (const chapter of detail.chapters) keys.add(chapterNumberKey(chapter.number));
+    keysBySource.set(source, keys);
+  }
+  for (const [key, chapter] of byKey) {
+    const match = SPLIT_PART.exec(key);
+    if (!match) continue;
+    const base = match[1];
+    const owner = byKey.get(base)?.source;
+    if (!owner || owner === chapter.source) continue;
+    const keys = keysBySource.get(chapter.source);
+    if (!keys) continue;
+    const parts = ["1", "2", "3", "4"].filter((part) => keys.has(`${base}.${part}`)).length;
+    if (!keys.has(base) && parts < 2) continue;
+    const [next, ...rest] = (chapter.alternates ?? []).filter((alt) => alt.source !== chapter.source);
+    if (next) byKey.set(key, { ...chapter, ...next, alternates: rest.length ? rest : undefined });
+    else byKey.delete(key);
+  }
+}
+
 export function mergeDetails(entries: DetailEntry[]): MergedMangaDetail {
   const primary = entries[0].detail;
   const ordered = [...entries].sort((a, b) => sourceRank(a.source) - sourceRank(b.source));
@@ -462,6 +494,7 @@ export function mergeDetails(entries: DetailEntry[]): MergedMangaDetail {
       byKey.set(key, { ...chapter, source, mangaId: detail.id });
     }
   }
+  dropForeignSplitParts(byKey, ordered);
   const chapters = [...byKey.values()].sort(
     (a, b) => chapterSortValue(b.number) - chapterSortValue(a.number),
   );

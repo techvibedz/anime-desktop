@@ -16,11 +16,13 @@ import type {
 import { asqSource } from "./sources/asq";
 import { mangawySource } from "./sources/mangawy";
 import { mangalikSource } from "./sources/mangalik";
+import { hijalaSource } from "./sources/hijala";
 
 export const MANGA_SOURCES: Record<MangaSourceId, MangaSource> = {
   asq: asqSource,
   mangawy: mangawySource,
   mangalik: mangalikSource,
+  hijala: hijalaSource,
 };
 
 const homeCache = createRequestCache<MangaHome>(10 * 60_000);

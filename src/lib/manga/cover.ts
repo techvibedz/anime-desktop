@@ -42,7 +42,8 @@ function isWordPressHost(host: string): boolean {
     host === "mangalik.net" ||
     host.endsWith(".mangalik.net") ||
     host === "lekmanga.site" ||
-    host.endsWith(".lekmanga.site")
+    host.endsWith(".lekmanga.site") ||
+    host === "hijala.com"
   );
 }
 
@@ -103,7 +104,7 @@ export function upgradeMangaCover(url: string | null | undefined): string | null
 // are re-served at display size through Jetpack Photon where the host allows it
 // (verified for 3asq / mangalik / lekmanga — mobile lib/img parity). Photon
 // fetches from the origin itself, so it also sidesteps hotlink checks.
-const PHOTON_OK = /(^|\.)(3asq\.online|mangalik\.net|lekmanga\.site)$/i;
+const PHOTON_OK = /(^|\.)(3asq\.online|mangalik\.net|lekmanga\.site|hijala\.com)$/i;
 const BUCKETS = [180, 240, 320, 420, 560, 800];
 
 export function mangaPosterUrl(src: string | null | undefined, cssWidth: number): string | undefined {
