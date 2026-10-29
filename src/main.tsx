@@ -3,6 +3,10 @@ import { HashRouter } from "react-router-dom";
 import App from "./App";
 import { AutoReloadErrorBoundary } from "./components/AutoReloadErrorBoundary";
 import { AuthProvider } from "./lib/auth";
+// Fonts are bundled (not Google Fonts) so an ISP DNS block can't strip the
+// Arabic typeface.
+import "@fontsource-variable/cairo";
+import "@fontsource-variable/outfit";
 import "./global.css";
 
 // NOTE: StrictMode is intentionally disabled. It double-invokes effects

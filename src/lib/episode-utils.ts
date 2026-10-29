@@ -11,6 +11,9 @@ export function extractEpisodeNumber(...sources: (string | null | undefined)[]):
     try { s = decodeURIComponent(src); } catch {}
     const m =
       s.match(/الحلقة[\s\-_]*(\d+)/i) ||
+      // witanime /watch/<slug>/<n> and anime3rb /episode/<slug>/<n>: the
+      // trailing segment is the number (a slug ending in "-2" must not win).
+      s.match(/\/(?:watch|episode)\/[^/]+\/(\d+)(?:[/?#]|$)/i) ||
       s.match(/episode[\s\-_]*(\d+)/i) ||
       s.match(/\bep[\s\-_]*(\d+)/i) ||
       s.match(/-(\d+)(?:[-/]|$)/);

@@ -1,5 +1,5 @@
 import { Routes, Route, Navigate, useLocation, useNavigate } from "react-router-dom";
-import { lazy, Suspense, useEffect } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { useAuth } from "./lib/auth";
 import { invalidateNetworkCaches } from "./lib/api";
 import { pullFavoritesFromCloud } from "./lib/favorites";
@@ -14,6 +14,7 @@ import { startNotificationSync, stopNotificationSync } from "./lib/notifications
 import { setLogUser } from "./lib/remoteLog";
 import { normalizePartyCode, takePendingInvite } from "./lib/partyInvite";
 import { flushMangaCloudSync, startMangaCloudSync } from "./lib/manga/cloud";
+import { claimLocalData } from "./lib/accountData";
 
 // Route-level code splitting. Home stays eager (first paint); everything else
 // loads on demand — most importantly Watch, which pulls in hls.js.
@@ -79,9 +80,21 @@ export default function App() {
     else if (user && isGuestPath) navigate("/", { replace: true });
   }, [user, ready, isConfigured, location.pathname, navigate]);
 
+  // Whose data sits in local storage. Every cloud sync below waits until the
+  // signed-in account has claimed it, so a previous account's history can
+  // never be merged into (and re-uploaded to) this one.
+  const [dataOwner, setDataOwner] = useState<string | null>(null);
+  useEffect(() => {
+    if (!user) { setDataOwner(null); return; }
+    let alive = true;
+    void claimLocalData(user.id).catch(() => {}).then(() => { if (alive) setDataOwner(user.id); });
+    return () => { alive = false; };
+  }, [user?.id]);
+  const syncReady = !!user && dataOwner === user.id;
+
   // Mirror the local manga library + reading progress to Supabase (admin view).
   useEffect(() => {
-    if (!user) return;
+    if (!user || !syncReady) return;
     const stop = startMangaCloudSync(user.id);
     const onHide = () => { if (document.visibilityState === "hidden") flushMangaCloudSync(user.id); };
     const onUnload = () => flushMangaCloudSync(user.id);
@@ -92,15 +105,15 @@ export default function App() {
       document.removeEventListener("visibilitychange", onHide);
       window.removeEventListener("beforeunload", onUnload);
     };
-  }, [user?.id]);
+  }, [user?.id, syncReady]);
 
   useEffect(() => {
-    if (user) {
+    if (user && syncReady) {
       pullFavoritesFromCloud().catch(() => {});
       pullHistoryFromCloud().catch(() => {});
       pullCompletionFromCloud().catch(() => {});
     }
-  }, [user?.id]);
+  }, [user?.id, syncReady]);
 
   // Presence + usage + notification sync + remote-log identity, keyed to the
   // signed-in user. Signed out, the notification feed still syncs (scope "all")

@@ -119,7 +119,7 @@ export function ChatPage() {
   }
 
   return (
-    <div dir="rtl" className="mx-auto flex h-[calc(100vh-3.5rem)] max-w-3xl flex-col">
+    <div dir="rtl" className="mx-auto flex h-[calc(100vh-9rem)] max-w-3xl flex-col">
       <h1 className="text-2xl font-bold text-white">{t.chatUserThreadTitle}</h1>
 
       <div ref={scrollRef} className="mt-4 flex-1 overflow-y-auto rounded-2xl border border-white/10 bg-surface p-4">

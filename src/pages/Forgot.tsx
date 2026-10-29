@@ -5,6 +5,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../lib/auth";
 import { authErrorKey } from "../lib/authErrors";
+import { AuthBackdrop } from "../components/AuthBackdrop";
 import { t } from "../lib/i18n";
 
 export function ForgotPage() {
@@ -33,8 +34,9 @@ export function ForgotPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-bg p-6">
-      <form onSubmit={submit} className="w-full max-w-sm space-y-5 rounded-2xl border border-white/10 bg-surface p-8 shadow-card">
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-bg p-6">
+      <AuthBackdrop />
+      <form onSubmit={submit} className="relative z-10 w-full max-w-sm space-y-5 rounded-[22px] border border-white/[0.08] bg-surface/85 p-8 shadow-lift backdrop-blur-xl">
         <div className="text-center">
           <img src="./logo.png" alt="" className="mx-auto h-14 w-14 rounded-2xl" />
           <h1 className="mt-3 text-2xl font-bold text-white">{t.forgotTitle}</h1>

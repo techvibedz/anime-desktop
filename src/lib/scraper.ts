@@ -1479,7 +1479,8 @@ export function parseWitCards(html: string): WitCard[] {
     const imageMatch = body.match(/<img[^>]*\bsrc=["']([^"']+)["'][^>]*>/i);
     const title = htmlDecodeCard((titleMatch?.[1] || "").replace(/<[^>]+>/g, ""));
     if (!title || !imageMatch) continue;
-    const badges = [...body.matchAll(/<div[^>]*\btop-2\b[^>]*>([\s\S]*?)<\/div>/gi)]
+    // Type badges sit top-3 in the current layout (top-2 in older cards).
+    const badges = [...body.matchAll(/<div[^>]*\btop-(?:2|3)\b[^>]*>([\s\S]*?)<\/div>/gi)]
       .map((m) => htmlDecodeCard(m[1].replace(/<[^>]+>/g, "")));
     const type = badges.find((value) => /^(?:TV|TV Short|OVA|ONA|Special|Music|PV|CM|فيلم)$/i.test(value)) || null;
     seen.add(href);
@@ -1576,11 +1577,52 @@ export async function fetchAnime4upSeasonListing(): Promise<
 type HomeFeatured = { title: string; href: string; image: string | null; description: string | null; genres: string[] };
 type HomeAnime = { title: string; href: string; image: string | null; type: string | null; status: string | null; description: string | null; isNew: boolean; rating: string | null };
 type HomeEpisode = { title: string; href: string; image: string | null; animeTitle: string; animeHref: string; isNew: boolean };
-export type WitHomeDirect = { featured: HomeFeatured[]; animes: HomeAnime[]; episodes: HomeEpisode[] };
+export type WitHomeDirect = {
+  featured: HomeFeatured[];
+  animes: HomeAnime[];
+  episodes: HomeEpisode[];
+  // witanime's own rails, in page order (absent from legacy/cached payloads).
+  latestMovies?: HomeAnime[];
+  topAnimes?: HomeAnime[];
+  topMovies?: HomeAnime[];
+};
 
-function parseWitFeatured(html: string): HomeFeatured[] {
+// Parse the home hero slider. The current Laravel/Tailwind home renders a
+// server-side hero carousel ([data-hero-slide]): each block carries the banner
+// image, an h2 > /anime/<slug> link, a meta row (…, genres) and a synopsis
+// paragraph. The old WordPress slider (.lucodeia-slider-slide-item) stays as
+// the fallback for cached/legacy HTML. Mirrors mobile lib/scraper/direct.ts.
+export function parseWitFeatured(html: string): HomeFeatured[] {
   const out: HomeFeatured[] = [];
   const seen = new Set<string>();
+  for (const block of html.split("data-hero-slide").slice(1)) {
+    const titleM = block.match(/<h2[^>]*>[\s\S]*?<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
+    if (!titleM) continue;
+    const href = htmlDecodeCard(titleM[1]);
+    const title = htmlDecodeCard(titleM[2].replace(/<[^>]+>/g, ""));
+    if (!href || !title || seen.has(href)) continue;
+    seen.add(href);
+    const imageM = block.match(/<img[^>]*\bsrc=["']([^"']+)["'][^>]*>/i);
+    const descM = block.match(/<p class="mb-6[^"]*">\s*([\s\S]*?)<\/p>/i);
+    // Genres are the meta row's trailing plain-text span (year/count/status
+    // are numeric or nested, so the LAST simple span is the comma list).
+    const metaM = block.match(/<div class="mb-4[^"]*">([\s\S]*?)<\/div>\s*<p class="mb-6/i);
+    const genreText = metaM
+      ? [...metaM[1].matchAll(/<span>([^<>]+)<\/span>/g)].map((g) => htmlDecodeCard(g[1])).pop() || ""
+      : "";
+    out.push({
+      title,
+      href,
+      image: upgradeCardImg(imageM?.[1] || null),
+      description: descM ? htmlDecodeCard(descM[1].replace(/<[^>]+>/g, "")).trim() || null : null,
+      genres: genreText
+        ? genreText.split(/[,،]/).map((g) => g.trim()).filter((g) =>
+            g && !/^\d+$/.test(g) && !/^(?:TV|TV Short|OVA|ONA|Special|Movie|فيلم|مستمر|مكتمل)$/.test(g))
+        : [],
+    });
+  }
+  if (out.length) return out;
+
   const re = /<a\b([^>]*\bclass=["'][^"']*lucodeia-slider-slide-item[^"']*["'][^>]*)>/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(html))) {
@@ -1602,8 +1644,8 @@ function parseWitFeatured(html: string): HomeFeatured[] {
   return out.slice(0, 5);
 }
 
-function parseWitHomeAnimes(html: string): HomeAnime[] {
-  return parseWitCards(html).map((c) => ({
+function toWitHomeAnimes(cards: WitCard[]): HomeAnime[] {
+  return cards.map((c) => ({
     title: c.title, href: c.href, image: c.image, type: c.type, status: c.status,
     description: null,
     isNew: (c.status || "").indexOf("مستمر") >= 0,
@@ -1611,12 +1653,41 @@ function parseWitHomeAnimes(html: string): HomeAnime[] {
   }));
 }
 
-function parseWitHomeEpisodes(html: string): HomeEpisode[] {
-  const out: HomeEpisode[] = [];
-  const seen = new Set<string>();
+function parseWitHomeAnimes(html: string): HomeAnime[] {
+  return toWitHomeAnimes(parseWitCards(html));
+}
+
+// Slice one server-rendered home section: from its <h2> heading to the
+// section's closing tag (or the rest of the page if it never closes).
+function witSectionHtml(html: string, heading: string): string {
+  const m = new RegExp(`<h2[^>]*>\\s*${heading}\\s*</h2>`).exec(html);
+  if (!m || m.index == null) return "";
+  const end = html.indexOf("</section>", m.index);
+  return end > m.index ? html.slice(m.index, end) : html.slice(m.index);
+}
+
+function witSectionCards(html: string, heading: string): WitCard[] {
+  const section = witSectionHtml(html, heading);
+  return section ? parseWitCards(section) : [];
+}
+
+// The three witanime home rails shown below "latest episodes": latest movies,
+// all-time most-watched animes, all-time most-watched movies. All live in the
+// same home-page GET — no extra request per rail.
+export function parseWitHomeRails(html: string): { latestMovies: HomeAnime[]; topAnimes: HomeAnime[]; topMovies: HomeAnime[] } {
+  return {
+    latestMovies: toWitHomeAnimes(witSectionCards(html, "أحدث الأفلام")),
+    topAnimes: toWitHomeAnimes(witSectionCards(html, "أكثر الأنميات مشاهدة")),
+    topMovies: toWitHomeAnimes(witSectionCards(html, "أكثر الأفلام مشاهدة")),
+  };
+}
+
+// Collect the /watch/<slug>/<n> episode-card anchors of a card grid in DOM
+// order. Shared by the home "أحدث الحلقات" rail and the /new-episodes pager.
+function collectWitWatchCards(scope: string, out: HomeEpisode[], seen: Set<string>): void {
   const currentRe = /<a\b[^>]*href=["']([^"']*\/watch\/([^"']+?)\/(\d+))["'][^>]*>([\s\S]*?)<\/a>/gi;
   let current: RegExpExecArray | null;
-  while ((current = currentRe.exec(html))) {
+  while ((current = currentRe.exec(scope))) {
     const href = htmlDecodeCard(current[1]);
     const slug = current[2];
     const number = parseInt(current[3], 10);
@@ -1625,17 +1696,31 @@ function parseWitHomeEpisodes(html: string): HomeEpisode[] {
     const title = htmlDecodeCard((body.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i)?.[1] || "").replace(/<[^>]+>/g, ""));
     const image = body.match(/<img[^>]*\bsrc=["']([^"']+)["'][^>]*>/i)?.[1] || null;
     if (!title) continue;
+    let origin = WIT_BASE;
+    try { origin = new URL(href).origin; } catch {}
     seen.add(href);
     out.push({
       title: `الحلقة ${number}`,
       href,
       image: upgradeCardImg(image),
       animeTitle: title,
-      animeHref: `${new URL(href).origin}/anime/${slug}`,
+      animeHref: `${origin}/anime/${slug}`,
       isNew: true,
     });
   }
-  const blocks = html.split("episodes-card-container");
+}
+
+// Recent-episode cards from the "أحدث الحلقات" rail only. The home page also
+// renders a "الأكثر مشاهدة" rail of /watch/ links BEFORE it, whose episodes
+// are popularity-ranked and often weeks old — scanning the whole page mixed
+// those into the new-episodes feed. Legacy HTML without the heading keeps the
+// old whole-page behaviour.
+function parseWitHomeEpisodes(html: string): HomeEpisode[] {
+  const out: HomeEpisode[] = [];
+  const seen = new Set<string>();
+  const scope = witSectionHtml(html, "أحدث الحلقات") || html;
+  collectWitWatchCards(scope, out, seen);
+  const blocks = scope.split("episodes-card-container");
   for (let i = 1; i < blocks.length; i++) {
     const b = blocks[i];
     const epM = b.match(/episodes-card-title[^>]*>\s*<h3[^>]*>\s*<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
@@ -1669,8 +1754,31 @@ export async function fetchWitHomeDirect(): Promise<WitHomeDirect | null> {
   const featured = parseWitFeatured(html);
   return { featured: featured.length ? featured : animes.slice(0, 5).map((item) => ({
     title: item.title, href: item.href, image: item.image, description: null, genres: [],
-  })), animes, episodes };
+  })), animes, episodes, ...parseWitHomeRails(html) };
 }
+
+// The "أحدث الحلقات" rail's own pager hits /new-episodes, which answers JSON
+// { page, html, hasOlder } whose `html` is the same card grid as the home rail
+// — the site's canonical newest-first episode order, paginated. The see-all
+// grid sources every page from it so page N+1 always continues page N.
+export function parseWitNewEpisodes(body: unknown): { episodes: HomeEpisode[]; hasNext: boolean; page: number } | null {
+  const data = body as { html?: unknown; hasOlder?: unknown; page?: unknown } | null;
+  if (!data || typeof data.html !== "string") return null;
+  const page = typeof data.page === "number" && Number.isFinite(data.page) ? data.page : 0;
+  const episodes: HomeEpisode[] = [];
+  collectWitWatchCards(data.html, episodes, new Set<string>());
+  return { episodes, hasNext: !!data.hasOlder, page };
+}
+
+export async function fetchWitNewEpisodesDirect(page = 1): Promise<{ episodes: HomeEpisode[]; hasNext: boolean; page: number } | null> {
+  const safePage = Math.max(1, Math.floor(page));
+  // The route only answers JSON when the request accepts it; the default HTML
+  // Accept falls through to a 404 page.
+  const raw = await window.pantoufa.fetchHtml?.(`${WIT_BASE}/new-episodes?page=${safePage}`, WIT_BASE + "/", { accept: "application/json" }).catch(() => null);
+  if (!raw) return null;
+  try { return parseWitNewEpisodes(JSON.parse(raw)); } catch { return null; }
+}
+
 
 export type WitRecentSitemapEntry = { href: string; slug: string; number: number; updatedAt: number };
 

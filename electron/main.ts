@@ -4054,7 +4054,7 @@ app.whenReady().then(() => {
   // transient miss self-heals in well under a second instead of bubbling up.
   ipcMain.handle("pantoufa:fetch-html", async (
     _evt,
-    opts: { url: string; referer?: string; attempts?: number; timeoutMs?: number },
+    opts: { url: string; referer?: string; attempts?: number; timeoutMs?: number; accept?: string },
   ): Promise<string | null> => {
     // anime3rb's edge does NOT 404 unknown paths — it TARPITS them (the
     // connection hangs until our timeout), and a burst of stalled probes gets
@@ -4065,7 +4065,8 @@ app.whenReady().then(() => {
     const sourceHeaders = {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      // witanime's /new-episodes pager answers JSON only when asked for it.
+      "Accept": opts.accept || "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "ar,en;q=0.9",
       ...(opts.referer ? { Referer: opts.referer } : {}),
     };
@@ -4074,6 +4075,13 @@ app.whenReady().then(() => {
     // edge first so title/episode lookups avoid the 8–12 second timeout.
     const viaEdge = await fetchSourceViaWorkingEdge(opts.url, sourceHeaders, PER_ATTEMPT_TIMEOUT_MS);
     if (viaEdge) return viaEdge;
+    // JSON endpoints (witanime's /new-episodes pager) 404 through Chromium's
+    // net stack — it rewrites the request headers the route keys on — so ask
+    // the plain Node client first and keep net.fetch as the DNS-block fallback.
+    if (opts.accept) {
+      const viaNode = await fetchViaSystemDns(opts.url, sourceHeaders, PER_ATTEMPT_TIMEOUT_MS);
+      if (viaNode) return viaNode;
+    }
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
       await awaitHostCooldown(opts.url);
       const controller = new AbortController();

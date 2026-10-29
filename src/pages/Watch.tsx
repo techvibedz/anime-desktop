@@ -24,6 +24,7 @@ import {
 import { saveProgress, getProgress } from "../lib/history";
 import { cueAt, parseVtt, type SubtitleCue } from "../lib/subtitles";
 import { recordEpisodeWatched } from "../lib/completion";
+import { extractEpisodeNumber } from "../lib/episode-utils";
 import { toAnimeUrl } from "../lib/favorites";
 import {
   subscribeDownloads, getDownloadByEpisode,
@@ -579,7 +580,10 @@ export function WatchPage() {
   // anime4up sibling when no explicit ?up4= was supplied).
   const currentEpNumber = useMemo(() => {
     if (Number.isFinite(epParam) && epParam > 0) return epParam;
-    const m = episodeUrl.match(/الحلقة[\s\-_]*(\d+)/);
+    let decoded = episodeUrl;
+    try { decoded = decodeURIComponent(episodeUrl); } catch {}
+    // anime4up …الحلقة-N, witanime /watch/<slug>/<n>, anime3rb /episode/<slug>/<n>.
+    const m = decoded.match(/الحلقة[\s\-_]*(\d+)/) || decoded.match(/\/(?:watch|episode)\/(?!movie\/)[^/]+\/(\d+)(?:[/?#]|$)/i);
     if (m) return parseInt(m[1], 10);
     const byHref = siblings.find((e) => {
       try { return decodeURIComponent(e.href || "").replace(/\/+$/, "") === decodeURIComponent(episodeUrl).replace(/\/+$/, ""); }
@@ -2143,18 +2147,17 @@ export function WatchPage() {
     const needle = norm(episodeUrl);
     let idx = byNum.findIndex((e) => norm(e.href || "") === needle);
     if (idx === -1) {
-      const m = episodeUrl.match(/الحلقة[\s\-_]*(\d+)/);
-      if (m) {
-        const num = parseInt(m[1], 10);
-        idx = byNum.findIndex((e) => e.number === num);
-      }
+      // Number fallback: witanime /watch/<slug>/<n>, anime4up …الحلقة-N, or the
+      // ?ep= the opener passed (the old الحلقة-only match missed witanime).
+      const num = extractEpisodeNumber(episodeUrl) ?? (Number.isFinite(epParam) && epParam > 0 ? epParam : null);
+      if (num != null) idx = byNum.findIndex((e) => e.number === num);
     }
     if (idx === -1) return { prev: null, next: null };
     return {
       prev: idx > 0 ? byNum[idx - 1] : null,
       next: idx + 1 < byNum.length ? byNum[idx + 1] : null,
     };
-  }, [siblings, episodeUrl]);
+  }, [siblings, episodeUrl, epParam]);
 
   const navTo = useCallback((ep: Episode, auto = false) => {
     if (partyClientRef.current) return; // host drives episode changes in a party
@@ -3131,7 +3134,7 @@ export function WatchPage() {
                 className="flex items-center gap-2 rounded-full bg-accent px-6 py-3 text-base font-bold text-black shadow-glow hover:bg-accent-bright transition"
               >
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
-                {t.playNow ?? "▶ Play"}
+                {t.playDownload}
               </button>
             ) : (
               <>
@@ -3172,7 +3175,7 @@ export function WatchPage() {
           <button
             onClick={() => prev && navTo(prev)}
             disabled={!prev}
-            className="flex items-center gap-1.5 rounded-full border border-white/10 bg-surface px-3 py-1.5 text-xs font-semibold text-white hover:border-white/30 disabled:opacity-30 disabled:hover:border-white/10"
+            className="flex h-10 items-center gap-2 rounded-control border border-white/10 bg-white/[0.06] px-4 text-sm font-bold text-white transition hover:bg-white/[0.12] disabled:opacity-30"
           >
             <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M15.41 16.59L10.83 12l4.58-4.59L14 6l-6 6 6 6 1.41-1.41z" /></svg>
             {t.episode} {prev?.number ?? ""}
@@ -3180,7 +3183,7 @@ export function WatchPage() {
           <button
             onClick={() => next && navTo(next)}
             disabled={!next}
-            className="flex items-center gap-1.5 rounded-full border border-white/10 bg-surface px-3 py-1.5 text-xs font-semibold text-white hover:border-white/30 disabled:opacity-30 disabled:hover:border-white/10"
+            className="flex h-10 items-center gap-2 rounded-control bg-accent px-4 text-sm font-extrabold text-on-accent transition hover:bg-accent-bright disabled:bg-white/[0.06] disabled:text-white disabled:opacity-30"
           >
             {t.episode} {next?.number ?? ""}
             <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z" /></svg>

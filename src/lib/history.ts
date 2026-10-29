@@ -5,6 +5,21 @@ const KEY = "watch_history";
 const DISMISSED_KEY = "watch_history_dismissed_desktop";
 const MAX_ITEMS = 200;
 
+// Change notifier: the completion store re-reconciles badges whenever the
+// history changes (mirrors mobile lib/history.ts subscribeHistory).
+const historyListeners = new Set<() => void>();
+export function subscribeHistory(cb: () => void): () => void {
+  historyListeners.add(cb);
+  return () => { historyListeners.delete(cb); };
+}
+
+async function writeHistory(list: WatchEntry[]): Promise<void> {
+  await writeHistory(list);
+  for (const cb of historyListeners) {
+    try { cb(); } catch {}
+  }
+}
+
 export interface WatchEntry {
   episodeHref: string;
   episodeTitle: string;
@@ -118,7 +133,7 @@ export async function pullHistoryFromCloud() {
   const merged = [...byHref.values()]
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, MAX_ITEMS);
-  await storage.setItem(KEY, JSON.stringify(merged));
+  await writeHistory(merged);
 }
 
 async function getDismissedHrefs(): Promise<Set<string>> {
@@ -160,7 +175,7 @@ export async function saveProgress(entry: Omit<WatchEntry, "updatedAt">) {
     if (list.length > MAX_ITEMS) list.length = MAX_ITEMS;
   }
   list.sort((a, b) => b.updatedAt - a.updatedAt);
-  await storage.setItem(KEY, JSON.stringify(list));
+  await writeHistory(list);
   const dismissed = await getDismissedHrefs();
   if (dismissed.delete(entry.episodeHref)) await setDismissedHrefs(dismissed);
   pushToCloud(merged).catch(() => {});
@@ -206,7 +221,7 @@ export async function getProgress(episodeHref: string): Promise<WatchEntry | nul
 
 export async function removeFromHistory(episodeHref: string) {
   const list = await getHistory();
-  await storage.setItem(KEY, JSON.stringify(list.filter((e) => e.episodeHref !== episodeHref)));
+  await writeHistory(list.filter((e) => e.episodeHref !== episodeHref));
   deleteFromCloud(episodeHref).catch(() => {});
 }
 
@@ -326,11 +341,85 @@ function deriveEpNum(e: WatchEntry): number | null {
     try { d = decodeURIComponent(s); } catch {}
     const m =
       d.match(/الحلقة[\s\-_]*(\d+)/) ||
-      d.match(/\/episode\/[^/]+\/(\d+)/i) ||
+      d.match(/\/(?:episode|watch)\/[^/]+\/(\d+)(?:\/|$)/i) ||
       d.match(/\bepisode\s*(\d+)/i);
     return m ? parseInt(m[1], 10) : null;
   };
   return fromStr(e.episodeHref) ?? fromStr(e.episodeTitle);
+}
+
+/** One row per anime across the whole history (For You seeding). */
+export interface AnimeHistoryGroup {
+  key: string;
+  animeTitle: string;
+  animeHref: string;
+  image: string;
+  last: WatchEntry;
+  updatedAt: number;
+  /** Distinct episodes stored for the anime (across sources). */
+  episodes: number;
+  /** Distinct episodes completed. */
+  watched: number;
+  lastEpNum: number | null;
+}
+
+/**
+ * Group raw history into one row per anime, newest activity first. Keys by
+ * normalized title (the same anime recurs under different animeHref values)
+ * and falls back to the normalized anime href. Mirrors mobile lib/history.ts.
+ */
+export function groupHistoryByAnime(list: readonly WatchEntry[]): AnimeHistoryGroup[] {
+  const titleByHrefKey = new Map<string, string>();
+  for (const entry of list) {
+    const tk = animeTitleKey(entry.animeTitle);
+    const hk = normAnimeKey(entry.animeHref);
+    if (tk && hk && !titleByHrefKey.has(hk)) titleByHrefKey.set(hk, tk);
+  }
+  const groups = new Map<string, { entries: WatchEntry[]; last: WatchEntry }>();
+  for (const entry of list) {
+    const hk = normAnimeKey(entry.animeHref);
+    const key = animeTitleKey(entry.animeTitle) || titleByHrefKey.get(hk) || hk || entry.animeHref || entry.animeTitle;
+    if (!key) continue;
+    const g = groups.get(key);
+    if (g) {
+      g.entries.push(entry);
+      if ((entry.updatedAt || 0) > (g.last.updatedAt || 0)) g.last = entry;
+    } else {
+      groups.set(key, { entries: [entry], last: entry });
+    }
+  }
+  const out: AnimeHistoryGroup[] = [];
+  for (const [key, g] of groups) {
+    const epKeys = new Set<string>();
+    const watchedKeys = new Set<string>();
+    let image = "";
+    let animeHref = "";
+    for (const e of g.entries) {
+      const n = deriveEpNum(e);
+      const ek = n != null ? `n${n}` : normHref(e.episodeHref);
+      if (ek) epKeys.add(ek);
+      if (ek && isCompleted(e)) watchedKeys.add(ek);
+      if (!image && e.image) image = e.image;
+      if (!animeHref && e.animeHref?.includes("/anime/")) animeHref = e.animeHref;
+    }
+    if (!animeHref) animeHref = g.entries.find((e) => e.animeHref)?.animeHref || "";
+    out.push({
+      key,
+      animeTitle: g.last.animeTitle || g.entries.find((e) => e.animeTitle)?.animeTitle || "",
+      animeHref,
+      image,
+      last: g.last,
+      updatedAt: g.last.updatedAt || 0,
+      episodes: epKeys.size,
+      watched: watchedKeys.size,
+      lastEpNum: deriveEpNum(g.last),
+    });
+  }
+  return out.sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+export async function getHistoryByAnime(): Promise<AnimeHistoryGroup[]> {
+  return groupHistoryByAnime(await getHistory());
 }
 
 /**
@@ -342,24 +431,49 @@ function deriveEpNum(e: WatchEntry): number | null {
 export interface CompletedSets {
   hrefs: Set<string>;
   numbersByTitle: Map<string, Set<number>>;
+  /** Episode numbers per title for EVERY history entry (watched or not) — tells
+   *  "explicitly unwatched" apart from "aged out of the capped history". */
+  knownNumbersByTitle: Map<string, Set<number>>;
+  /** Normalized hrefs of every history entry (watched or not). */
+  knownHrefs: Set<string>;
 }
 
 export async function getCompletedSets(): Promise<CompletedSets> {
   const list = await getHistory();
   const hrefs = new Set<string>();
   const numbersByTitle = new Map<string, Set<number>>();
+  const knownNumbersByTitle = new Map<string, Set<number>>();
+  const knownHrefs = new Set<string>();
   for (const e of list) {
-    if (!isCompleted(e)) continue;
-    hrefs.add(normHref(e.episodeHref));
+    knownHrefs.add(normHref(e.episodeHref));
     const n = deriveEpNum(e);
     const tk = animeTitleKey(e.animeTitle);
+    if (tk && n != null) {
+      let known = knownNumbersByTitle.get(tk);
+      if (!known) { known = new Set(); knownNumbersByTitle.set(tk, known); }
+      known.add(n);
+    }
+    if (!isCompleted(e)) continue;
+    hrefs.add(normHref(e.episodeHref));
     if (n != null && tk) {
       let set = numbersByTitle.get(tk);
       if (!set) { set = new Set<number>(); numbersByTitle.set(tk, set); }
       set.add(n);
     }
   }
-  return { hrefs, numbersByTitle };
+  return { hrefs, numbersByTitle, knownNumbersByTitle, knownHrefs };
+}
+
+/** True if history has ANY entry (watched or not) for this episode. False
+ *  means the capped local history simply does not know it — an old finale
+ *  aged out and must not read as unwatched. */
+export function isEpisodeTracked(
+  sets: CompletedSets,
+  opts: { hrefs: (string | null | undefined)[]; epNum?: number | null; animeTitle?: string | null },
+): boolean {
+  if (opts.hrefs.some((h) => h && sets.knownHrefs.has(normHref(h)))) return true;
+  return opts.epNum != null && !!opts.animeTitle &&
+    !!sets.knownNumbersByTitle.get(animeTitleKey(opts.animeTitle))?.has(opts.epNum);
 }
 
 /** True if an episode is watched by EITHER a same-source href match OR a
@@ -391,7 +505,7 @@ export async function toggleWatched(
       updatedAt: Date.now(),
     };
     list[idx] = next;
-    await storage.setItem(KEY, JSON.stringify(list));
+    await writeHistory(list);
     pushToCloud(next).catch(() => {});
     return next.completed === true;
   }
@@ -410,7 +524,16 @@ export async function toggleWatched(
   };
   list.unshift(newEntry);
   if (list.length > MAX_ITEMS) list.length = MAX_ITEMS;
-  await storage.setItem(KEY, JSON.stringify(list));
+  await writeHistory(list);
   pushToCloud(newEntry).catch(() => {});
   return true;
+}
+
+/** Drop this device's watch history (account switch / sign-out). */
+export async function resetLocalHistory(): Promise<void> {
+  await storage.removeItem(KEY).catch(() => {});
+  await storage.removeItem(DISMISSED_KEY).catch(() => {});
+  for (const cb of historyListeners) {
+    try { cb(); } catch {}
+  }
 }

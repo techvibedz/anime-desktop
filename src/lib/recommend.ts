@@ -122,21 +122,28 @@ export function parseRecommendations(nodes: unknown): RecItem[] {
  */
 export function rankRecommendations(
   batches: readonly (readonly RecItem[])[],
-  opts: { excluded?: (item: RecItem) => boolean; cap?: number } = {},
+  opts: { excluded?: (item: RecItem) => boolean; cap?: number; weights?: readonly number[] } = {},
 ): RankedRec[] {
   const cap = opts.cap ?? 15;
   const merged = new Map<number, RankedRec>();
-  for (const batch of batches) {
+  // With weights (taste seeds), each batch is normalised to its own best rating
+  // and scaled by the seed's weight so one seed with hugely-upvoted recs can't
+  // drown the others (mobile parity). Without, raw upvotes are summed.
+  batches.forEach((batch, i) => {
+    const weighted = !!opts.weights;
+    const weight = opts.weights?.[i] ?? 1;
+    const top = Math.max(1, ...batch.map((it) => (it ? it.rating : 0)));
     for (const item of batch) {
       if (!item || item.anilistId == null) continue;
+      const part = weighted ? (Math.max(0, item.rating) / top) * weight : item.rating;
       const cur = merged.get(item.anilistId);
       if (cur) {
-        cur.score += item.rating;
+        cur.score += part;
         continue;
       }
-      merged.set(item.anilistId, { ...item, score: item.rating });
+      merged.set(item.anilistId, { ...item, score: part });
     }
-  }
+  });
   return [...merged.values()]
     .filter((item) => !opts.excluded?.(item))
     .sort((a, b) => b.score - a.score || (b.seasonYear ?? 0) - (a.seasonYear ?? 0))
@@ -159,4 +166,44 @@ export async function fetchForYou(
     seeds.map((s) => fetchAnimeRecommendations(s.animeTitle, s.animeHref).catch(() => [] as RecItem[])),
   );
   return rankRecommendations(batches, { excluded: opts.excluded, cap: opts.cap });
+}
+
+/** One anime from the full watch history, as pickTasteSeeds reads it. */
+export interface TasteSource extends RecSeedSource {
+  /** Distinct episodes watched (engagement). */
+  watched: number;
+  updatedAt: number;
+}
+
+export interface WeightedSeed extends RecSeed {
+  weight: number;
+}
+
+const TASTE_HALF_LIFE_MS = 60 * 24 * 60 * 60 * 1000; // 60 days
+
+/**
+ * Seeds that represent the whole taste, not just the latest anime: every
+ * distinct anime in the history is weighted by how much of it was watched
+ * (log-scaled, so a 1000-episode One Piece does not own the rail) and how
+ * recently (60-day half-life, floored so an old favourite still counts).
+ * Mirrors mobile lib/recommend.ts.
+ */
+export function pickTasteSeeds(
+  groups: readonly TasteSource[],
+  keyOf: (entry: RecSeedSource) => string,
+  cap = 6,
+  now = Date.now(),
+): WeightedSeed[] {
+  const best = new Map<string, WeightedSeed>();
+  for (const g of groups) {
+    if (!g || !g.animeTitle || !g.animeTitle.trim()) continue;
+    const key = keyOf(g) || g.animeTitle.trim().toLowerCase();
+    const engagement = 1 + Math.log2(1 + Math.max(0, g.watched || 0));
+    const age = Math.max(0, now - (g.updatedAt || 0));
+    const recency = Math.max(0.25, Math.pow(0.5, age / TASTE_HALF_LIFE_MS));
+    const weight = engagement * recency;
+    const cur = best.get(key);
+    if (!cur || weight > cur.weight) best.set(key, { animeTitle: g.animeTitle, animeHref: g.animeHref, weight });
+  }
+  return [...best.values()].sort((a, b) => b.weight - a.weight).slice(0, cap);
 }

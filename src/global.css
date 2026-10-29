@@ -4,8 +4,12 @@
 
 html, body, #root { height: 100%; margin: 0; }
 body {
-  font-family: "IBM Plex Sans Arabic", system-ui, sans-serif;
+  font-family: "Cairo Variable", system-ui, sans-serif;
+  background: #08090C;
+  color: #fff;
   overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 h1, h2, h3 { text-wrap: balance; }
@@ -13,11 +17,13 @@ h1, h2, h3 { text-wrap: balance; }
 /* Scrollbars — quiet, on the black canvas */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.10); border-radius: 8px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.20); }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.09); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.18); background-clip: padding-box; }
 
-/* Legacy helper — one family system-wide; weight carries hierarchy */
-.font-display { font-family: "IBM Plex Sans Arabic", system-ui, sans-serif; }
+/* Latin display face for titles / numerals; Arabic glyphs fall through to Cairo */
+.font-display { font-family: "Outfit Variable", "Cairo Variable", system-ui, sans-serif; }
+
+::selection { background: rgba(139,147,255,0.35); color: #fff; }
 
 /* Shimmer keyframes */
 @keyframes shimmer {
@@ -25,7 +31,7 @@ h1, h2, h3 { text-wrap: balance; }
   100% { background-position: 400px 0; }
 }
 .shimmer {
-  background: linear-gradient(90deg, oklch(14.5% 0.004 113) 0%, oklch(20% 0.006 113) 50%, oklch(14.5% 0.004 113) 100%);
+  background: linear-gradient(90deg, #14161C 0%, #1F222B 50%, #14161C 100%);
   background-size: 800px 100%;
   animation: shimmer 1.4s infinite linear;
 }
@@ -43,11 +49,11 @@ h1, h2, h3 { text-wrap: balance; }
 a { color: inherit; text-decoration: none; }
 button { font-family: inherit; }
 
-/* Keyboard focus — visible ring in the brand green, no ring on mouse click */
+/* Keyboard focus — visible periwinkle ring, none on mouse click */
 :focus-visible {
-  outline: 2px solid oklch(80% 0.17 113 / 0.8);
+  outline: 2px solid rgba(139,147,255,0.85);
   outline-offset: 2px;
-  border-radius: 4px;
+  border-radius: 6px;
 }
 
 /* Hide native scrollbars on horizontal carousels */
@@ -57,11 +63,27 @@ button { font-family: inherit; }
   -webkit-overflow-scrolling: touch;
 }
 .scroll-x::-webkit-scrollbar { display: none; }
+.no-scrollbar { scrollbar-width: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
 
 /* Long home pages: skip layout/paint for offscreen rails */
 .lazy-section {
   content-visibility: auto;
   contain-intrinsic-size: auto 320px;
+}
+
+/* Bottom scrim used on poster cards so overlaid titles stay AA-legible */
+.poster-scrim {
+  background: linear-gradient(to top, rgba(8,9,12,0.96) 0%, rgba(8,9,12,0.72) 34%, rgba(8,9,12,0) 62%);
+}
+
+/* Section heading tick (mobile's sectionTick) */
+.section-tick {
+  display: inline-block;
+  width: 18px;
+  height: 3px;
+  border-radius: 999px;
+  background: #8B93FF;
 }
 
 @media (prefers-reduced-motion: reduce) {

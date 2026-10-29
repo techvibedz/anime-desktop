@@ -152,6 +152,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signOut = useCallback(async () => {
     await supabase.auth.signOut();
+    // The next person on this PC starts clean (mobile parity).
+    const { releaseLocalData } = await import("./accountData");
+    await releaseLocalData().catch(() => {});
   }, []);
 
   const sendPasswordReset = useCallback(async (email: string) => {

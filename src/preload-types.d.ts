@@ -46,7 +46,7 @@ declare global {
       fetchHtml: (
         url: string,
         referer?: string,
-        opts?: { attempts?: number; timeoutMs?: number },
+        opts?: { attempts?: number; timeoutMs?: number; accept?: string },
       ) => Promise<string | null>;
       fetchJson: (opts: { url: string; method?: string; body?: string; headers?: Record<string, string> }) => Promise<string | null>;
       cfRender?: (opts: { url: string; marker?: string; rawText?: boolean; timeoutMs?: number }) => Promise<string | null>;

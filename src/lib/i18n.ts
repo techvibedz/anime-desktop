@@ -682,6 +682,44 @@ export const ar = {
   mangaFitOriginal: "الحجم الأصلي",
   mangaFitSmart: "ذكي",
   mangaRemoveContinueConfirm: "إزالة هذا العمل من متابعة القراءة؟",
+
+  // Shell
+  upNext: "التالي",
+  markWatched: "وضع علامة: تمت المشاهدة",
+  markUnwatched: "إلغاء علامة المشاهدة",
+  playFromStart: "شاهد الحلقة 1",
+  resumeEpisode: (n: number) => `استئناف الحلقة ${n}`,
+  playEpisodeN: (n: number) => `شاهد الحلقة ${n}`,
+  rewatchEpisode: (n: number) => `إعادة الحلقة ${n}`,
+  menu: "القائمة",
+  navBrowse: "تصفّح",
+  navLibrary: "مكتبتي",
+  navAccount: "الحساب",
+  navAdmin: "الإدارة",
+
+  // Home (mobile parity)
+  latestMovies: "أحدث الأفلام",
+  topAnimes: "أكثر الأنميات مشاهدة",
+  topMovies: "أكثر الأفلام مشاهدة",
+  heroDetails: "التفاصيل",
+  resume: "استئناف",
+  minLeft: (m: number) => `${m} د متبقّية`,
+  homeEmptyTitle: "تعذّر تحميل المحتوى",
+  homeEmptySub: "قد يكون الاتصال ضعيفًا أو أن المصدر مشغول. حاول مرة أخرى.",
+  offlineTitle: "أنت غير متّصل بالإنترنت",
+  offlineSub: "تصفّح المحتوى يحتاج اتصالًا بالإنترنت، لكن يمكنك مشاهدة الحلقات التي نزّلتها في أي وقت.",
+  watchDownloads: "مشاهدة التنزيلات",
+  searchPlaceholderShort: "ابحث عن أنمي…",
+  greetingMorning: "صباح الخير",
+  greetingEvening: "مساء الخير",
+
+  // Hand-made "completed" mark + completed shelf (mobile parity)
+  markCompleted: "وضع علامة: شاهدته كاملًا",
+  unmarkCompleted: "إزالة علامة المكتمل",
+  markedCompleted: "أُضيف إلى المكتملة",
+  unmarkedCompleted: "أُزيل من المكتملة",
+  completedFromHistory: "مكتمل حسب سجل مشاهدتك",
+  completedShelf: "مكتملة",
 };
 
 export const t = ar;

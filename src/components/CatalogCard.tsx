@@ -4,6 +4,7 @@
 
 import { memo } from "react";
 import { CompletionBadge } from "./CompletionBadge";
+import { Pill, PosterFrame } from "./AnimeCard";
 import { t } from "../lib/i18n";
 
 export interface CatalogCardData {
@@ -30,39 +31,23 @@ export const CatalogCard = memo(function CatalogCard({
   className?: string;
 }) {
   return (
-    <button type="button" onClick={onClick} className={`group block w-full text-start ${className}`}>
-      <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface ring-1 ring-transparent transition-shadow duration-200 group-hover:shadow-glow group-hover:ring-accent/50">
-        {item.image ? (
-          <img
-            src={item.image}
-            alt={item.title}
-            className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.04]"
-            loading="lazy"
-            decoding="async"
-          />
-        ) : (
-          <div className="h-full w-full shimmer" />
-        )}
-        {item.score != null && item.score > 0 && (
-          <span className="absolute end-2 top-2 rounded-md bg-black/70 px-1.5 py-0.5 text-[10px] font-bold text-gold">
+    <button type="button" onClick={onClick} className={"group block w-full text-start outline-none " + className} title={item.title}>
+      <PosterFrame
+        image={item.image}
+        title={item.title}
+        topStart={item.badge ? <Pill tone="accent">{item.badge}</Pill> : undefined}
+        topEnd={item.score != null && item.score > 0 ? (
+          <span className="absolute end-2 top-2 z-10 rounded-md bg-black/75 px-1.5 py-0.5 text-[10px] font-bold text-gold backdrop-blur-sm">
             ★ {(item.score / 10).toFixed(1)}
           </span>
-        )}
-        {item.badge && (
-          <span className="absolute start-2 top-2 rounded-md bg-accent px-1.5 py-0.5 text-[10px] font-bold text-black">
-            {item.badge}
-          </span>
-        )}
-        {loading && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+        ) : undefined}
+        bottomEnd={<CompletionBadge hrefs={[item.href]} titles={[item.title]} className="" />}
+        overlay={loading ? (
+          <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/60">
             <div className="h-7 w-7 animate-spin rounded-full border-2 border-accent border-t-transparent" />
           </div>
-        )}
-        <CompletionBadge hrefs={[item.href]} titles={[item.title]} className="absolute bottom-2 end-2" />
-      </div>
-      <h3 className="mt-2 line-clamp-2 text-[13px] font-semibold leading-snug text-text-secondary transition-colors group-hover:text-white">
-        {item.title}
-      </h3>
+        ) : undefined}
+      />
     </button>
   );
 });

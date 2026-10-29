@@ -23,14 +23,17 @@ import { getNotificationScope, getNotificationsEnabled, getDailyAnimeNotif } fro
 import { supabase, isSupabaseConfigured } from "./supabase";
 import { storage } from "./storage";
 import { shouldRunEpisodeNotifier } from "./notificationQueue";
-import { localDayKey, orderDailyPool, pickOfTheDay } from "./dailyPick";
+import { dailyIndex, localDayKey, localDayNumber } from "./dailyPick";
+import { getDailyPool } from "./dailyPool";
 import { fetchSeasonAnime, currentSeason } from "./seasons";
 import { t } from "./i18n";
 
 const LIST_KEY = "@notifications_v1";
 // v3: dedup keys switched to the TLD-normalized anime key (see normAnimeKey).
-const SEEN_KEYS_KEY = "@notif_seen_keys_v3"; // { scope, keys: string[] } — dedup of notified episodes
-const QUEUE_SEEN_KEY = "@queue_seen_v2"; // scope-independent keys already reported to the server
+// v4/v3: the feed switched from anime4up to witanime (different anime keys) —
+// re-seed silently instead of re-announcing the current episodes.
+const SEEN_KEYS_KEY = "@notif_seen_keys_v4"; // { scope, keys: string[] } — dedup of notified episodes
+const QUEUE_SEEN_KEY = "@queue_seen_v3"; // scope-independent keys already reported to the server
 const DAILY_DAY_KEY = "@daily_notif_day"; // last local day the daily reminder was shown
 const MAX_STORED = 60;
 const MAX_SEEN_KEYS = 1000; // cap the dedup set (recent feed ages old keys out anyway)
@@ -471,16 +474,17 @@ export async function maybeDailyAnimeReminder(): Promise<void> {
     const today = localDayKey(now);
     if ((await storage.getItem(DAILY_DAY_KEY)) === today) return;
 
-    const { season, year } = currentSeason(now);
-    const list = orderDailyPool(await fetchSeasonAnime(season, year));
-    const pick = pickOfTheDay(list, today);
+    // Same all-time pool + day order as the home card (and mobile).
+    const list = await getDailyPool();
+    if (list.length === 0) return;
+    const pick = list[dailyIndex(list.length, localDayNumber(now))];
     if (!pick) return;
 
     await storage.setItem(DAILY_DAY_KEY, today);
     void window.pantoufa?.notify?.({
       title: t.dailyNotifTitle,
       body: t.dailyNotifBody(pick.title),
-      data: { href: pick.sourceHref ?? "", episode: null },
+      data: { href: "", episode: null },
     })?.catch(() => {});
   } catch {}
 }
@@ -514,4 +518,10 @@ export function stopNotificationSync(): void {
     syncTimer = null;
   }
   syncUserId = undefined;
+}
+
+/** Drop this device's notification center (account switch / sign-out). */
+export async function resetLocalNotifications(): Promise<void> {
+  await storage.removeItem(LIST_KEY).catch(() => {});
+  emitChanged();
 }

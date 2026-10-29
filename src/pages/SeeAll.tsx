@@ -10,6 +10,7 @@ import { CompletionBadge } from "../components/CompletionBadge";
 import { CardLayoutControl } from "../components/CardLayoutControl";
 import { useCardLayout, type CardLayout } from "../lib/cardLayout";
 import { extractEpisodeNumber } from "../lib/episode-utils";
+import { animeTitleKey } from "../lib/history";
 import { Shimmer } from "../components/Shimmer";
 import { t } from "../lib/i18n";
 
@@ -18,13 +19,13 @@ type ItemKind = "anime" | "episode";
 // comfortable = the grids as they always were; compact packs one step denser;
 // list renders one row per item (poster thumb + text).
 const ANIME_GRID: Record<CardLayout, string> = {
-  comfortable: "grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-6",
-  compact: "grid grid-cols-3 gap-2 sm:grid-cols-5 lg:grid-cols-8",
+  comfortable: "grid grid-cols-3 gap-x-4 gap-y-5 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7",
+  compact: "grid grid-cols-4 gap-3 md:grid-cols-5 lg:grid-cols-7 xl:grid-cols-8 2xl:grid-cols-9",
   list: "flex flex-col gap-2",
 };
 const EPISODE_GRID: Record<CardLayout, string> = {
-  comfortable: "grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6",
-  compact: "grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8",
+  comfortable: "grid grid-cols-2 gap-x-4 gap-y-6 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5",
+  compact: "grid grid-cols-3 gap-x-3 gap-y-5 md:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6",
   list: "flex flex-col gap-2",
 };
 
@@ -58,7 +59,8 @@ export function SeeAllPage() {
       try {
         if (section === "recently_updated") {
           setTitle(t.recentlyUpdated); setKind("episode");
-          const seeded = (location.state as { episodes?: EpisodeItem[] } | null)?.episodes;
+          const st = location.state as { episodes?: EpisodeItem[]; items?: EpisodeItem[] } | null;
+          const seeded = st?.items ?? st?.episodes;
           if (Array.isArray(seeded) && seeded.length > 0) {
             const seen = new Set<string>();
             seenAnimeRef.current = seen;
@@ -80,14 +82,22 @@ export function SeeAllPage() {
           setItems(r.data.items);
           setHasMore(r.data.hasNext && r.data.items.length > 0);
         } else {
-          // Sections derived from the cached home payload — no pagination.
-          const home = await fetchHome();
-          if (cancelled) return;
-          const found = home.data.sections.find((s) => s.id === section);
-          if (found) {
-            setTitle(localizedTitle(section, found.title));
-            setKind(found.type);
-            setItems(found.items);
+          // Sections derived from the home payload — no pagination. The home
+          // rail hands its items over in the route state so they paint at once.
+          const st = location.state as { items?: AnimeItem[]; type?: ItemKind; title?: string } | null;
+          if (Array.isArray(st?.items) && st.items.length > 0) {
+            setTitle(localizedTitle(section, st.title || ""));
+            setKind(st.type ?? "anime");
+            setItems(st.items);
+          } else {
+            const home = await fetchHome();
+            if (cancelled) return;
+            const found = home.data.sections.find((s) => s.id === section);
+            if (found) {
+              setTitle(localizedTitle(section, found.title));
+              setKind(found.type);
+              setItems(found.items);
+            }
           }
           setHasMore(false);
         }
@@ -160,10 +170,14 @@ export function SeeAllPage() {
   }, [loadMore, hasMore, loading, loadingMore, items.length]);
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-6">
       <div className="flex items-center gap-3">
-        <Link to="/" className="text-text-muted hover:text-white">→ {t.back}</Link>
-        <h1 className="text-3xl font-bold">{title || t.loading}</h1>
+        <h1 className="flex items-center gap-3 text-[32px] font-extrabold text-white">
+          {title || t.loading}
+          {!loading && items.length > 0 && (
+            <span className="rounded-full bg-white/[0.07] px-2.5 py-0.5 text-sm font-bold text-text-muted">{items.length}</span>
+          )}
+        </h1>
         <div className="ms-auto">
           <CardLayoutControl layout={layout} onChange={setLayout} />
         </div>
@@ -200,12 +214,12 @@ export function SeeAllPage() {
                     )}
                   </div>
                   <div className="min-w-0 flex-1">
-                    {it.animeTitle && <p className="line-clamp-1 text-[11px] font-semibold text-accent/90">{it.animeTitle}</p>}
-                    <h3 className="line-clamp-1 text-sm font-semibold text-text-secondary transition-colors group-hover:text-white">
-                      {it.title}
-                    </h3>
+                    <h3 className="line-clamp-1 text-sm font-bold text-white">{it.animeTitle || it.title}</h3>
+                    {it.animeTitle && num == null && (
+                      <p className="line-clamp-1 text-xs font-semibold text-text-muted">{it.title}</p>
+                    )}
                     {num != null && (
-                      <span className="mt-1 inline-block rounded bg-accent px-1.5 py-0.5 text-[10px] font-bold text-black">
+                      <span className="mt-1.5 inline-block rounded-full bg-accent px-2 py-0.5 text-[10px] font-bold text-on-accent">
                         {t.episode} {num}
                       </span>
                     )}
@@ -264,9 +278,9 @@ export function SeeAllPage() {
           ) : (
             <button
               onClick={loadMore}
-              className="rounded-full border border-white/10 bg-surface px-6 py-2.5 text-sm font-semibold text-white hover:border-accent hover:bg-accent/10"
+              className="rounded-control border border-white/10 bg-white/[0.06] px-6 py-2.5 text-sm font-bold text-white hover:border-accent hover:bg-accent/10"
             >
-              عرض المزيد
+              {t.loadMore}
             </button>
           )}
         </div>
@@ -290,20 +304,24 @@ function dedupe<T extends { href: string }>(arr: T[]): T[] {
 // The recently-updated feed lists raw episodes newest-first; we want each anime
 // to appear exactly once (its latest episode). Because the feed is newest-first,
 // the first episode seen for an anime is its newest one.
-function episodeAnimeKey(ep: EpisodeItem): string {
-  const href = String(ep.animeHref || "").trim();
-  if (href) return "h:" + href.toLowerCase().replace(/\/+$/, "");
-  const at = String(ep.animeTitle || "").trim();
-  if (at) return "t:" + at.toLowerCase();
-  return "x:" + String(ep.href || ep.title || "");
+// One anime arrives from different sources with different hrefs (and the same
+// source can spell a title differently), so key on BOTH (mobile parity).
+function episodeAnimeKeys(ep: EpisodeItem): string[] {
+  const keys: string[] = [];
+  const href = String(ep.animeHref || "").trim().toLowerCase().replace(/\/+$/, "");
+  if (href) keys.push("h:" + href);
+  const title = animeTitleKey(ep.animeTitle);
+  if (title) keys.push("t:" + title);
+  if (!keys.length) keys.push("x:" + String(ep.href || ep.title || ""));
+  return keys;
 }
 
 function dedupeEpisodes(eps: EpisodeItem[], seen: Set<string>): EpisodeItem[] {
   const out: EpisodeItem[] = [];
   for (const ep of eps) {
-    const key = episodeAnimeKey(ep);
-    if (seen.has(key)) continue;
-    seen.add(key);
+    const keys = episodeAnimeKeys(ep);
+    if (keys.some((k) => seen.has(k))) continue;
+    for (const k of keys) seen.add(k);
     out.push(ep);
   }
   return out;
@@ -322,9 +340,11 @@ async function fillRecent(fromPage: number, seen: Set<string>) {
 
 function localizedTitle(id: string, fallback: string): string {
   switch (id) {
-    case "trending": return t.trendingNow;
     case "recently_updated": return t.recentlyUpdated;
-    case "tv_series": return t.tvSeries;
+    case "latest_movies": return t.latestMovies;
+    case "top_animes": return t.topAnimes;
+    case "top_movies": return t.topMovies;
+    case "trending": return t.trendingNow;
     case "movies": return t.movies;
     default: return fallback;
   }

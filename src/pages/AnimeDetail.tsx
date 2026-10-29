@@ -1,14 +1,14 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
-import { useParams, Link, useNavigate } from "react-router-dom";
+import { useParams, Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   fetchEpisodes, fetchEpisodesUp4, fetchAnime3rbEpisodes,
   findAnime3rbAnimeUrl, findWitanimeAnimeUrl, findAnime4upAnimeUrl,
   type AnimeDetail, type Episode,
 } from "../lib/api";
 import { addFavorite, removeFavorite, favoriteListOf, type FavoriteList } from "../lib/favorites";
-import { getCompletedSets, isEpisodeWatched, animeTitleKey, normHref, toggleWatched, type CompletedSets } from "../lib/history";
-import { recordAnimeCompletion } from "../lib/completion";
-import { fetchSeriesFinished } from "../lib/airing";
+import { getCompletedSets, getHistory, isCompleted as isEntryCompleted, isEpisodeWatched, isEpisodeTracked, animeTitleKey, normAnimeKey, normHref, toggleWatched, type CompletedSets, type WatchEntry } from "../lib/history";
+import { extractEpisodeNumber } from "../lib/episode-utils";
+import { recordAnimeCompletion, setAnimeMarkedCompleted, useAnimeCompletion } from "../lib/completion";
 import {
   fetchAnimeMal, fetchAnimeInfo, fetchAnimeRecommendations, peekMalRating,
   type AnimeInfoField, type RecItem,
@@ -21,6 +21,7 @@ import { AiringCountdown } from "../components/AiringCountdown";
 import { CardLayoutControl } from "../components/CardLayoutControl";
 import { ShareCard } from "../components/ShareCard";
 import { Shimmer } from "../components/Shimmer";
+import { Pill, PosterFrame } from "../components/AnimeCard";
 import { DownloadPicker } from "../components/DownloadPicker";
 import type { DownloadMeta } from "../lib/downloads";
 import { t } from "../lib/i18n";
@@ -42,7 +43,11 @@ function copyToClipboard(text: string) {
 export function AnimeDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const autoPlay = searchParams.get("play") === "1";
   const animeHref = id ? decodeURIComponent(id) : "";
+  const [lastWatched, setLastWatched] = useState<WatchEntry | null>(null);
+  const [lastWatchedLoaded, setLastWatchedLoaded] = useState(false);
   const [data, setData] = useState<AnimeDetail | null>(null);
   const [episodes4up, setEpisodes4up] = useState<Episode[]>([]);
   const [episodes3rb, setEpisodes3rb] = useState<Episode[]>([]);
@@ -53,7 +58,8 @@ export function AnimeDetailPage() {
   const [bookmarkList, setBookmarkList] = useState<FavoriteList | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [downloadMeta, setDownloadMeta] = useState<DownloadMeta | null>(null);
-  const [completed, setCompleted] = useState<CompletedSets>({ hrefs: new Set(), numbersByTitle: new Map() });
+  const [setsLoaded, setSetsLoaded] = useState(false);
+  const [completed, setCompleted] = useState<CompletedSets>({ hrefs: new Set(), numbersByTitle: new Map(), knownNumbersByTitle: new Map(), knownHrefs: new Set() });
 
   // Tabs + hero extras (mobile parity: app/anime/[id].tsx).
   const [activeTab, setActiveTab] = useState<TabKey>("episodes");
@@ -82,7 +88,10 @@ export function AnimeDetailPage() {
     setEpisodeQuery(""); setJumpError(false); setHighlightedEpisode(null);
     episodeRefs.current.clear();
     favoriteListOf(animeHref).then(setBookmarkList);
-    getCompletedSets().then(setCompleted);
+    setSetsLoaded(false);
+    getCompletedSets().then((sets) => { if (!cancelled) { setCompleted(sets); setSetsLoaded(true); } });
+    setLastWatched(null);
+    setLastWatchedLoaded(false);
 
     // Kick off the primary scrape. As soon as it returns the up4Hint
     // (from a direct link on the wit page) we start the up4 scrape with
@@ -274,17 +283,18 @@ export function AnimeDetailPage() {
   // Derive last episode number + caught-up state. Memoized so the recording
   // effect depends on PRIMITIVES, not the `completed` object (new ref per load),
   // and toggling a non-final episode doesn't re-fire the AniList airing check.
-  const { maxNum, caughtUp } = useMemo(() => {
-    if (!data) return { maxNum: 0, caughtUp: false };
+  const { maxNum, caughtUp, lastTracked } = useMemo(() => {
+    if (!data) return { maxNum: 0, caughtUp: false, lastTracked: false };
     const all = [...data.episodes, ...trusted.up4, ...trusted.a3rb];
     let mx = 0;
     let hasNum = false;
     for (const e of all) {
       if (e.number != null && e.number > mx) { mx = e.number; hasNum = true; }
     }
-    if (!hasNum) return { maxNum: 0, caughtUp: false };
+    if (!hasNum) return { maxNum: 0, caughtUp: false, lastTracked: false };
     const lastHrefs = all.filter((e) => e.number === mx).map((e) => e.href).filter(Boolean) as string[];
-    return { maxNum: mx, caughtUp: isEpisodeWatched(completed, { hrefs: lastHrefs, epNum: mx, animeTitle: data.title }) };
+    const last = { hrefs: lastHrefs, epNum: mx, animeTitle: data.title };
+    return { maxNum: mx, caughtUp: isEpisodeWatched(completed, last), lastTracked: isEpisodeTracked(completed, last) };
   }, [data, trusted, completed]);
 
   // Union all three trusted episode lists by number. Each grid entry retains
@@ -344,43 +354,106 @@ export function AnimeDetailPage() {
     [completed, data],
   );
 
+  // The newest history entry for this anime (any source) — drives "Resume".
   useEffect(() => {
-    if (!data || !animeHref || maxNum === 0) return;
-    let cancelled = false;
-    (async () => {
-      const finished = caughtUp ? await fetchSeriesFinished(data.title, maxNum) : false;
-      if (cancelled) return;
-      // Record EVERY known source href + title so a card from any source rail
-      // resolves the badge — not just the URL the anime happened to be opened
-      // under. Any source whose URL isn't already known is resolved by title
-      // here (memoized — repeat records don't re-search), all three in parallel.
-      const hrefs: (string | null | undefined)[] = [animeHref, merged?.anime4up];
-      const has = (re: RegExp) => hrefs.some((h) => h && re.test(h));
-      const resolvers: Promise<void>[] = [];
-      if (!has(/witanime/i))
-        resolvers.push(findWitanimeAnimeUrl(data.title).then((u) => { if (u) hrefs.push(u); }));
-      if (!has(/anime4up/i))
-        resolvers.push(findAnime4upAnimeUrl(data.title).then((u) => { if (u) hrefs.push(u); }));
-      if (!has(/anime3rb\.com/i))
-        resolvers.push(findAnime3rbAnimeUrl(data.title).then((u) => { if (u) hrefs.push(u); }));
-      await Promise.all(resolvers);
-      if (cancelled) return;
-      await recordAnimeCompletion({
-        hrefs,
-        titles: [data.title],
-        lastEpNum: maxNum,
-        caughtUp,
-        finished,
-      }).catch(() => {});
-    })();
-    return () => { cancelled = true; };
-  }, [data?.title, animeHref, merged?.anime4up, maxNum, caughtUp]);
+    if (!data?.title) return;
+    let alive = true;
+    const titleKey = animeTitleKey(data.title);
+    const hrefKey = normAnimeKey(animeHref);
+    getHistory().then((list) => {
+      if (!alive) return;
+      const mine = list.filter((e) => (titleKey && animeTitleKey(e.animeTitle) === titleKey) || (hrefKey && normAnimeKey(e.animeHref) === hrefKey));
+      setLastWatched(mine.sort((a, b) => b.updatedAt - a.updatedAt)[0] ?? null);
+      setLastWatchedLoaded(true);
+    }).catch(() => { if (alive) setLastWatchedLoaded(true); });
+    return () => { alive = false; };
+  }, [data?.title, animeHref, completed]);
+
+  const watchUrlFor = useCallback((ep: GridEpisode, primaryOverride?: string | null) => {
+    // Resuming reopens the exact URL the progress was saved under — the player
+    // looks the position up by href, so another source's copy restarts at 0.
+    const primary = primaryOverride || ep.href || ep.href4up || ep.href3rb || "";
+    const params = new URLSearchParams();
+    if (ep.href4up && ep.href4up !== primary) params.set("up4", ep.href4up);
+    if (ep.href3rb && ep.href3rb !== primary) params.set("a3rb", ep.href3rb);
+    const artwork = ep.screenshot || data?.poster;
+    if (artwork) params.set("img", artwork);
+    params.set("anime", animeHref);
+    if (data?.title) params.set("title", data.title);
+    params.set("ep", String(ep.number));
+    return `/watch/${encodeURIComponent(primary)}?${params.toString()}`;
+  }, [animeHref, data?.title, data?.poster]);
+
+  // Mirrors mobile: the completion store keeps one record per source page and
+  // confirms "finished" against AniList itself, so the page only reports what
+  // it sees. lastTracked=false (the finale aged out of the capped history)
+  // must not erase an earned badge. Waits for the watched-set to load.
+  useEffect(() => {
+    if (!data || !animeHref || maxNum === 0 || !setsLoaded) return;
+    void recordAnimeCompletion({ hrefs: [animeHref, merged?.anime4up], titles: [data.title], lastEpNum: maxNum, caughtUp, lastTracked }).catch(() => {});
+  }, [data?.title, animeHref, merged?.anime4up, maxNum, caughtUp, lastTracked, setsLoaded]);
+
+  // "I've finished this" — for anime watched before the app / elsewhere. Saved
+  // to the account (anime_completion.marked_completed, shared with mobile) and
+  // hides the anime from Continue Watching.
+  const completion = useAnimeCompletion([animeHref, merged?.anime4up], [data?.title]);
+  const isCompleted = !!completion?.finished;
+  const isMarked = !!completion?.marked;
+  const [completedToast, setCompletedToast] = useState<string | null>(null);
+  const toggleCompleted = useCallback(() => {
+    if (!data || !animeHref) return;
+    const flash = (msg: string) => {
+      setCompletedToast(msg);
+      window.setTimeout(() => setCompletedToast((cur) => (cur === msg ? null : cur)), 1800);
+    };
+    if (isCompleted && !isMarked) { flash(t.completedFromHistory); return; }
+    const marked = !isMarked;
+    flash(marked ? t.markedCompleted : t.unmarkedCompleted);
+    void setAnimeMarkedCompleted({
+      hrefs: [animeHref, merged?.anime4up],
+      titles: [data.title],
+      image: data.poster,
+      lastEpNum: maxNum,
+      marked,
+      caughtUp,
+      lastTracked,
+    }).catch(() => {});
+  }, [data, animeHref, merged?.anime4up, isCompleted, isMarked, maxNum, caughtUp, lastTracked]);
+
+  // "Resume" target: the last episode in progress, else the one after the
+  // newest finished episode, else episode 1 (three clicks to playing).
+  const playTarget = useMemo(() => {
+    if (displayEpisodes.length === 0) return null;
+    const sorted = [...displayEpisodes].sort((a, b) => a.number - b.number);
+    const lastNum = lastWatched ? (lastWatched.epNum ?? extractEpisodeNumber(lastWatched.episodeHref, lastWatched.episodeTitle)) : null;
+    if (lastWatched && lastNum != null) {
+      const current = sorted.find((e) => e.number === lastNum);
+      if (current && !isEntryCompleted(lastWatched)) {
+        const pct = lastWatched.durationMs > 0 ? lastWatched.positionMs / lastWatched.durationMs : 0;
+        return { ep: current, mode: pct > 0.02 ? "resume" as const : "play" as const, href: lastWatched.episodeHref };
+      }
+      const next = sorted.find((e) => e.number > lastNum);
+      if (next) return { ep: next, mode: "next" as const, href: null };
+      if (current) return { ep: current, mode: "rewatch" as const, href: null };
+    }
+    return { ep: sorted[0], mode: "start" as const, href: null };
+  }, [displayEpisodes, lastWatched]);
+
+  // Hero "Watch now" lands here with ?play=1 — start the target episode as soon
+  // as the list resolves (replace, so Back returns to the home feed).
+  const autoPlayedRef = useRef(false);
+  useEffect(() => {
+    if (!autoPlay || autoPlayedRef.current || !playTarget || !setsLoaded || !lastWatchedLoaded) return;
+    autoPlayedRef.current = true;
+    navigate(watchUrlFor(playTarget.ep, playTarget.href), { replace: true });
+  }, [autoPlay, playTarget, setsLoaded, lastWatchedLoaded, navigate, watchUrlFor]);
+  useEffect(() => { autoPlayedRef.current = false; }, [animeHref]);
 
   if (loading) {
     const provisionalTitle = titleFromSlug(animeHref);
     return (
       <div className="space-y-8">
-        <div className="relative -mx-8 -mt-7 h-[440px] overflow-hidden">
+        <div className="relative -mx-8 -mt-[92px] h-[440px] overflow-hidden">
           <div className="shimmer absolute inset-0" />
           <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-bg via-bg/60 to-transparent px-8 pb-8 pt-24">
             <p className="text-xs font-semibold text-accent">{t.loading}</p>
@@ -415,38 +488,51 @@ export function AnimeDetailPage() {
   return (
     <div className="space-y-10">
       {/* Full-bleed backdrop — the artwork owns the top of the screen */}
-      <div className="relative -mx-8 -mt-7">
-        <div className="relative h-[440px] w-full overflow-hidden">
+      <div className="relative -mx-8 -mt-[92px]">
+        <div className="relative h-[min(64vh,600px)] min-h-[460px] w-full overflow-hidden">
           {(data.banner || data.poster) && (
             <img
               src={data.banner || data.poster || ""}
               alt=""
-              className="h-full w-full scale-105 object-cover blur-[2px]"
+              className={`h-full w-full object-cover object-[50%_25%] ${data.banner ? "" : "scale-110 blur-2xl opacity-70"}`}
             />
           )}
-          <div className="absolute inset-0 bg-gradient-to-t from-bg via-bg/55 to-bg/20" />
-          <div className="absolute inset-0 bg-gradient-to-l from-bg/85 via-bg/30 to-transparent" />
+          <div className="absolute inset-x-0 top-0 h-40 bg-gradient-to-b from-bg/80 to-transparent" />
+          <div className="absolute inset-0 bg-gradient-to-t from-bg via-bg/70 via-30% to-bg/10" />
+          <div className="absolute inset-0 bg-gradient-to-l from-bg/95 via-bg/50 via-50% to-transparent" />
         </div>
-        <div className="absolute inset-x-0 bottom-0 flex items-end gap-6 px-8 pb-6">
+        <div className="absolute inset-x-0 bottom-0 flex items-end gap-8 px-8 pb-2">
           {data.poster && (
             <button
               type="button"
               onClick={() => setPosterOpen(true)}
               aria-label={t.viewPoster}
               title={t.viewPoster}
-              className="group relative hidden h-64 w-44 flex-shrink-0 overflow-hidden rounded-xl shadow-card md:block"
+              className="group relative hidden aspect-[2/3] w-[200px] flex-shrink-0 overflow-hidden rounded-[18px] shadow-lift ring-1 ring-white/10 md:block"
             >
-              <img src={data.poster} alt={data.title} className="h-full w-full object-cover" />
-              <span className="absolute bottom-2 end-2 flex h-7 w-7 items-center justify-center rounded-full border border-white/25 bg-black/70 text-white opacity-0 transition group-hover:opacity-100">
+              <img src={data.poster} alt={data.title} className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105" />
+              <span className="absolute bottom-2 end-2 flex h-8 w-8 items-center justify-center rounded-full border border-white/25 bg-black/70 text-white opacity-0 transition group-hover:opacity-100">
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
                   <path d="M9 3H3v6M15 21h6v-6M3 15v6h6M21 9V3h-6" />
                 </svg>
               </span>
             </button>
           )}
-          <div className="flex min-w-0 flex-col gap-3 pb-1">
-            <div className="flex items-center gap-3">
-              <h1 className="text-3xl font-bold leading-tight text-white lg:text-5xl">
+          <div className="flex min-w-0 max-w-[860px] flex-col gap-3.5 pb-1">
+            {(availableSources.length > 0 || data.genres.length > 0) && (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                {data.genres.length > 0 && (
+                  <span className="text-sm font-bold text-mint">{data.genres.slice(0, 4).join("  ·  ")}</span>
+                )}
+                {availableSources.map((source) => (
+                  <span key={source} className="rounded-full border border-white/10 bg-white/[0.06] px-2.5 py-0.5 text-[11px] font-bold text-text-secondary">
+                    {sourceLabel(source)}
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="flex items-start gap-3">
+              <h1 className="font-display text-[clamp(30px,3.6vw,52px)] font-extrabold leading-[1.1] tracking-tight text-white">
                 {data.title}
               </h1>
               <button
@@ -454,10 +540,10 @@ export function AnimeDetailPage() {
                 onClick={onCopyTitle}
                 aria-label={t.titleCopied}
                 title={t.titleCopied}
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-white/15 bg-black/40 text-text-secondary transition-colors hover:border-accent hover:text-white"
+                className="mt-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-white/15 bg-black/40 text-text-secondary transition-colors hover:border-accent hover:text-white"
               >
                 {titleCopied ? (
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" className="text-accent" aria-hidden>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" className="text-mint" aria-hidden>
                     <path d="M20 6 9 17l-5-5" />
                   </svg>
                 ) : (
@@ -468,66 +554,94 @@ export function AnimeDetailPage() {
                 )}
               </button>
             </div>
-            {titleCopied && (
-              <span className="inline-flex items-center gap-1 self-start rounded-full bg-accent/15 px-2.5 py-1 text-[11px] font-bold text-accent">
-                {t.titleCopied}
-              </span>
+            <div className="flex flex-wrap items-center gap-2 text-xs font-bold">
+              <MalScoreBadge score={malScore} style={{ position: "static" }} />
+              {data.rating && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-gold/15 px-2.5 py-1 text-gold">
+                  <span aria-hidden>★</span> {data.rating}
+                </span>
+              )}
+              {maxNum > 0 && (
+                <span className="rounded-full bg-white/[0.07] px-2.5 py-1 text-text-secondary">{t.episodeCount(maxNum)}</span>
+              )}
+              {isCompleted && (
+                <span className="rounded-full bg-mint/15 px-2.5 py-1 text-mint">✓✓ {t.completedBadge}</span>
+              )}
+              {titleCopied && (
+                <span className="rounded-full bg-accent/15 px-2.5 py-1 text-accent">{t.titleCopied}</span>
+              )}
+            </div>
+            {data.synopsis && (
+              <p className="line-clamp-3 max-w-[72ch] text-[15px] leading-relaxed text-text-secondary">
+                {data.synopsis}
+              </p>
             )}
-            {(malScore != null || data.rating) && (
-              <div className="flex flex-wrap items-center gap-2">
-                <MalScoreBadge score={malScore} style={{ position: "static" }} />
-                {data.rating && (
-                  <span className="inline-flex items-center gap-1 rounded-full border border-glass-border bg-raised/80 px-2.5 py-1 text-xs font-bold text-gold">
-                    <span aria-hidden>★</span> {data.rating}
-                  </span>
-                )}
-              </div>
-            )}
-            {data.genres.length > 0 && (
-              <div className="flex flex-wrap gap-x-3 gap-y-1">
-                {data.genres.map((g) => (
-                  <span key={g} className="text-xs font-medium text-text-secondary">{g}</span>
-                ))}
-              </div>
-            )}
-            <p className="line-clamp-3 max-w-[65ch] text-sm leading-relaxed text-text-secondary">
-              {data.synopsis}
-            </p>
-            <div className="flex flex-wrap items-center gap-3">
+            <div className="flex flex-wrap items-center gap-2.5 pt-1">
+              {playTarget && (
+                <Link
+                  to={watchUrlFor(playTarget.ep, playTarget.href)}
+                  className="inline-flex h-12 items-center gap-2.5 rounded-control bg-accent px-7 text-[15px] font-extrabold text-on-accent shadow-glow transition hover:bg-accent-bright active:scale-[0.98]"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden><path d="M8 5v14l11-7z" /></svg>
+                  {playTarget.mode === "resume"
+                    ? t.resumeEpisode(playTarget.ep.number)
+                    : playTarget.mode === "rewatch"
+                      ? t.rewatchEpisode(playTarget.ep.number)
+                      : t.playEpisodeN(playTarget.ep.number)}
+                </Link>
+              )}
               {bookmarkList ? (
                 <button
+                  type="button"
                   onClick={onUnbookmark}
-                  className="flex items-center gap-2 rounded-full bg-accent px-5 py-2.5 text-sm font-bold text-black transition-colors hover:bg-accent-bright"
+                  title={t.saved}
+                  className="inline-flex h-12 items-center gap-2 rounded-control border border-accent/40 bg-accent/15 px-5 text-sm font-bold text-white transition-colors hover:bg-accent/25"
                 >
-                  ♥ {t.saved} ({bookmarkList === "watching" ? t.currentlyWatching : t.planToWatch})
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" className="text-accent" aria-hidden><path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1Z" /></svg>
+                  {bookmarkList === "watching" ? t.currentlyWatching : t.planToWatch}
                 </button>
               ) : (
                 <button
+                  type="button"
                   onClick={() => setPickerOpen(true)}
-                  className="flex items-center gap-2 rounded-full border border-white/15 bg-black/40 px-5 py-2.5 text-sm font-bold text-white transition-colors hover:border-accent hover:text-accent"
+                  className="inline-flex h-12 items-center gap-2 rounded-control border border-white/15 bg-white/10 px-5 text-sm font-bold text-white backdrop-blur-md transition-colors hover:bg-white/20"
                 >
-                  ♡ {t.addToList}
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" aria-hidden><path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1Z" /></svg>
+                  {t.addToList}
                 </button>
               )}
               <button
                 type="button"
+                onClick={toggleCompleted}
+                aria-pressed={isCompleted}
+                title={isMarked ? t.unmarkCompleted : t.markCompleted}
+                aria-label={isMarked ? t.unmarkCompleted : t.markCompleted}
+                className={`flex h-12 w-12 items-center justify-center rounded-control border backdrop-blur-md transition-colors ${
+                  isCompleted ? "border-mint/40 bg-mint/15 text-mint" : "border-white/15 bg-white/10 text-white hover:bg-white/20"
+                }`}
+              >
+                <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                  <circle cx="12" cy="12" r="9.5" />
+                  <path d="m7.5 12.5 2.5 2.5 6-6" />
+                </svg>
+              </button>
+              <button
+                type="button"
                 onClick={() => setShareOpen(true)}
                 aria-label={t.shareCardShare}
-                className="flex items-center gap-2 rounded-full border border-white/15 bg-black/40 px-5 py-2.5 text-sm font-bold text-white transition-colors hover:border-accent hover:text-accent"
+                title={t.shareCardShare}
+                className="flex h-12 w-12 items-center justify-center rounded-control border border-white/15 bg-white/10 text-white backdrop-blur-md transition-colors hover:bg-white/20"
               >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
                   <circle cx="18" cy="5" r="3" />
                   <circle cx="6" cy="12" r="3" />
                   <circle cx="18" cy="19" r="3" />
                   <path d="m8.6 10.5 6.8-4M8.6 13.5l6.8 4" />
                 </svg>
-                {t.shareCardShare}
               </button>
-              {availableSources.map((source) => (
-                <span key={source} className="rounded-full bg-violet/20 px-3 py-1 text-[11px] font-semibold text-white">
-                  {sourceLabel(source)}
-                </span>
-              ))}
+              {completedToast && (
+                <span className="animate-fadeIn rounded-full bg-mint/15 px-3 py-1.5 text-xs font-bold text-mint">{completedToast}</span>
+              )}
             </div>
           </div>
         </div>
@@ -538,7 +652,7 @@ export function AnimeDetailPage() {
 
       <section className="space-y-4">
         {/* Editorial underline tabs — الحلقات / ذات صلة / قد يعجبك / تفاصيل */}
-        <div className="flex border-b border-white/10">
+        <div className="sticky top-16 z-rail -mx-8 flex items-center gap-1.5 border-b border-white/[0.06] bg-bg/90 px-8 py-3 backdrop-blur-xl">
           {tabs.map((tab) => {
             const active = activeTab === tab.key;
             return (
@@ -546,13 +660,13 @@ export function AnimeDetailPage() {
                 key={tab.key}
                 type="button"
                 onClick={() => setActiveTab(tab.key)}
-                className={`flex flex-1 items-center justify-center gap-1.5 border-b-2 px-2 py-3.5 text-sm font-semibold transition-colors ${
-                  active ? "border-accent text-white" : "border-transparent text-text-muted hover:text-white"
+                className={`flex items-center gap-2 rounded-full px-4 py-2 text-sm font-bold transition-colors ${
+                  active ? "bg-white text-on-accent" : "text-text-muted hover:bg-white/[0.06] hover:text-white"
                 }`}
               >
                 {tab.label}
-                {tab.count != null && (
-                  <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${active ? "bg-accent/15 text-accent" : "bg-white/5 text-text-muted"}`}>
+                {tab.count != null && tab.count > 0 && (
+                  <span className={`rounded-full px-1.5 py-px text-[10px] font-extrabold ${active ? "bg-on-accent/10 text-on-accent" : "bg-white/[0.07] text-text-muted"}`}>
                     {tab.count}
                   </span>
                 )}
@@ -578,20 +692,20 @@ export function AnimeDetailPage() {
                   inputMode="numeric"
                   placeholder={t.episodeJumpPlaceholder}
                   aria-label={t.episodeJumpPlaceholder}
-                  className={`h-10 w-36 rounded-lg border bg-surface px-3 text-sm text-white outline-none placeholder:text-text-muted focus:border-accent ${
-                    jumpError ? "border-red-500/60" : "border-white/15"
+                  className={`h-10 w-40 rounded-control border bg-surface px-3.5 text-sm text-white outline-none placeholder:text-text-muted focus:border-accent ${
+                    jumpError ? "border-danger/60" : "border-white/10"
                   }`}
                 />
                 <button
                   type="button"
                   onClick={jumpToEpisode}
-                  className="h-10 rounded-lg border border-accent/40 bg-white/5 px-5 text-sm font-bold text-white transition hover:bg-white/10"
+                  className="h-10 rounded-control border border-white/10 bg-white/[0.06] px-5 text-sm font-bold text-white transition hover:bg-white/[0.12]"
                 >
                   {t.goToEpisode}
                 </button>
-                {jumpError && <span className="text-xs font-semibold text-red-400">{t.episodeNotFound}</span>}
+                {jumpError && <span className="text-xs font-semibold text-danger">{t.episodeNotFound}</span>}
               </div>
-              <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4 lg:grid-cols-8">
+              <div className="grid grid-cols-2 gap-x-3.5 gap-y-4 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
               {displayEpisodes.map((ep) => {
                 // Cheap per-card check (no NFKD): href membership OR the precomputed
                 // cross-source episode-number set.
@@ -616,21 +730,11 @@ export function AnimeDetailPage() {
                     className="group relative"
                   >
                     <Link
-                      to={(() => {
-                        const params = new URLSearchParams();
-                        if (ep.href4up && ep.href4up !== primary) params.set("up4", ep.href4up);
-                        if (ep.href3rb && ep.href3rb !== primary) params.set("a3rb", ep.href3rb);
-                        if (artwork) params.set("img", artwork);
-                        params.set("anime", animeHref);
-                        params.set("title", data.title);
-                        params.set("ep", String(ep.number));
-                        const q = params.toString();
-                        return `/watch/${encodeURIComponent(primary)}${q ? `?${q}` : ""}`;
-                      })()}
-                      className={`relative block aspect-video overflow-hidden rounded-lg bg-surface ring-1 transition ${
+                      to={watchUrlFor(ep, playTarget?.mode === "resume" && playTarget.ep.number === ep.number ? playTarget.href : null)}
+                      className={`relative block aspect-video overflow-hidden rounded-card bg-surface ring-1 transition duration-300 hover:-translate-y-0.5 hover:shadow-glow ${
                         ep.number === highlightedEpisode
                           ? "ring-2 ring-accent shadow-glow"
-                          : isDone ? "opacity-60 ring-accent/40" : "ring-white/5 hover:ring-accent/60"
+                          : playTarget?.ep.number === ep.number ? "ring-accent/60" : isDone ? "ring-mint/25" : "ring-white/[0.05]"
                       }`}
                     >
                       <div className="absolute inset-0 bg-gradient-to-br from-raised to-surface" />
@@ -653,33 +757,39 @@ export function AnimeDetailPage() {
                           }}
                         />
                       )}
-                      <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent" />
+                      <div className={`absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-transparent ${isDone ? "bg-black/35" : ""}`} />
                       <div className="absolute start-1.5 top-1.5 flex gap-1">
                         {ep.sources.map((source) => (
-                          <span key={source} className="rounded bg-black/70 px-1 py-0.5 text-[8px] font-bold uppercase text-white/80">
+                          <span key={source} className="rounded-md bg-black/65 px-1.5 py-0.5 text-[9px] font-bold uppercase text-white/85 backdrop-blur-sm">
                             {sourceShortLabel(source)}
                           </span>
                         ))}
                       </div>
                       <div className="absolute inset-x-1.5 bottom-1.5 flex items-center justify-between">
-                        <span className="rounded bg-black/60 px-1.5 py-0.5 text-[11px] font-bold text-white">
+                        <span className="text-[13px] font-extrabold text-white drop-shadow">
                           {t.episode} {ep.number}
                         </span>
-                        {isDone && <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-bold text-black">✓</span>}
+                        {isDone ? (
+                          <span className="flex h-5 w-5 items-center justify-center rounded-full bg-mint text-on-accent" title={t.watched}>
+                            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M20 6 9 17l-5-5" /></svg>
+                          </span>
+                        ) : playTarget?.ep.number === ep.number ? (
+                          <span className="rounded-full bg-accent px-2 py-0.5 text-[10px] font-extrabold text-on-accent">{t.upNext}</span>
+                        ) : null}
                       </div>
                     </Link>
-                    <div className="absolute end-1.5 top-1.5 hidden flex-col gap-1 group-hover:flex">
+                    <div className="absolute end-2 top-2 hidden gap-1.5 group-hover:flex">
                       <button
                         onClick={() => onDownload(ep)}
-                        className="flex h-6 w-6 items-center justify-center rounded-full bg-black/75 text-white transition-colors hover:bg-accent hover:text-black"
+                        className="flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-white backdrop-blur-sm transition-colors hover:bg-accent hover:text-on-accent"
                         title={t.downloadEpisode}
                       >
                         <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3v10.55l3.3-3.3 1.4 1.4L12 17.4l-4.7-4.75 1.4-1.4 3.3 3.3V3h2zM5 19h14v2H5z" /></svg>
                       </button>
                       <button
                         onClick={() => onToggleWatched(ep)}
-                        className="flex h-6 w-6 items-center justify-center rounded-full bg-black/75 text-[11px] text-white transition-colors hover:bg-accent hover:text-black"
-                        title={isDone ? "Mark unwatched" : "Mark watched"}
+                        className="flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-[12px] font-bold text-white backdrop-blur-sm transition-colors hover:bg-mint hover:text-on-accent"
+                        title={isDone ? t.markUnwatched : t.markWatched}
                       >
                         {isDone ? "↶" : "✓"}
                       </button>
@@ -870,7 +980,7 @@ function PosterGrid({
     <div>
       <div className="mb-4 flex items-center justify-between">
         <CardLayoutControl layout={cards.layout} onChange={cards.setLayout} />
-        <span className="text-xs text-text-muted">{t.episodeCount(items.length)}</span>
+        <span className="text-xs font-semibold text-text-muted">{items.length}</span>
       </div>
 
       {cards.layout === "list" ? (
@@ -903,38 +1013,22 @@ function PosterGrid({
           })}
         </div>
       ) : (
-        <div className={cards.layout === "comfortable" ? "grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4" : "grid grid-cols-3 gap-2.5 sm:grid-cols-4 lg:grid-cols-6"}>
+        <div className={cards.layout === "comfortable" ? "grid grid-cols-3 gap-x-4 gap-y-5 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7" : "grid grid-cols-4 gap-3 md:grid-cols-5 lg:grid-cols-7 xl:grid-cols-8 2xl:grid-cols-9"}>
           {items.map((item) => {
             const resolving = resolvingKey === item.key;
             return (
-              <button key={item.key} type="button" onClick={() => onOpen(item)} className="group text-start">
-                <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface ring-1 ring-white/5 transition group-hover:ring-accent/60">
-                  {item.image ? (
-                    <img
-                      src={item.image}
-                      alt={item.title}
-                      className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.04]"
-                      loading="lazy"
-                      decoding="async"
-                    />
-                  ) : (
-                    <div className="h-full w-full shimmer" />
-                  )}
-                  <MalCardBadge title={item.title} />
-                  {item.badge && (
-                    <span className="absolute inset-x-0 bottom-0 truncate bg-accent/85 px-1.5 py-0.5 text-center text-[9px] font-bold text-black">
-                      {item.badge}
-                    </span>
-                  )}
-                  {resolving && (
-                    <span className="absolute inset-0 flex items-center justify-center bg-black/60">
+              <button key={item.key} type="button" onClick={() => onOpen(item)} className="group block w-full text-start outline-none" title={item.title}>
+                <PosterFrame
+                  image={item.image}
+                  title={item.title}
+                  topStart={item.badge ? <Pill tone="accent">{item.badge}</Pill> : undefined}
+                  topEnd={<MalCardBadge title={item.title} />}
+                  overlay={resolving ? (
+                    <span className="absolute inset-0 z-20 flex items-center justify-center bg-black/60">
                       <span className="h-7 w-7 animate-spin rounded-full border-2 border-accent border-t-transparent" />
                     </span>
-                  )}
-                </div>
-                <p className="mt-2 line-clamp-2 text-[13px] font-semibold leading-snug text-text-secondary transition-colors group-hover:text-white">
-                  {item.title}
-                </p>
+                  ) : undefined}
+                />
               </button>
             );
           })}

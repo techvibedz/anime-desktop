@@ -1,25 +1,32 @@
 import type { Config } from "tailwindcss";
 
-// Cinematic dark system — near-black canvas, luminous green primary (hue 113),
-// violet secondary accent. Text on `accent` fills is BLACK (pale saturated
-// fill); text on `violet` fills is white.
+// "The Personal Screening Room" — the mobile app's palette (anime-mobile
+// DESIGN.md / lib/theme.ts): near-black canvas, periwinkle primary, mint
+// secondary, gold for ratings. Filled accent/mint controls carry DARK labels
+// (`text-black` / `text-on-accent`), never white. Token names are unchanged so
+// every screen picks the new palette up.
 export default {
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
       colors: {
-        bg: "oklch(8% 0 0)",
-        surface: "oklch(14.5% 0.004 113)",
-        raised: "oklch(19% 0.006 113)",
-        accent: "oklch(80% 0.17 113)",
-        "accent-bright": "oklch(86% 0.16 113)",
-        violet: "oklch(58% 0.15 300)",
-        indigo: "oklch(58% 0.15 280)",
-        gold: "oklch(83% 0.12 90)",
-        green: "oklch(72% 0.19 145)",
-        text: "oklch(96% 0.005 113)",
-        "text-secondary": "oklch(80% 0.008 113)",
-        "text-muted": "oklch(63% 0.01 113)",
+        bg: "#08090C",
+        "bg-deep": "#050507",
+        surface: "#14161C",
+        "surface-container": "#101218",
+        raised: "#1C1F27",
+        accent: "#8B93FF",
+        "accent-bright": "#A5ABFF",
+        "on-accent": "#0A0B12",
+        mint: "#5EEAD4",
+        violet: "#7C6CF2",
+        indigo: "#6A72E8",
+        gold: "#FFCE5C",
+        green: "#4ADE80",
+        danger: "#FF6B6B",
+        text: "#FFFFFF",
+        "text-secondary": "#B4B8C5",
+        "text-muted": "#8A8F9E",
         "glass-border": "rgba(255,255,255,0.08)",
         // Manga's own ink-and-paper palette (mobile lib/manga/design parity) —
         // deliberately independent of the anime UI.
@@ -43,12 +50,19 @@ export default {
         },
       },
       fontFamily: {
-        display: ['"IBM Plex Sans Arabic"', "system-ui", "sans-serif"],
-        sans: ['"IBM Plex Sans Arabic"', "system-ui", "sans-serif"],
+        // Cairo carries Arabic (the first-class script); Outfit sets Latin
+        // titles and numerals in display sizes.
+        display: ['"Outfit Variable"', '"Cairo Variable"', "system-ui", "sans-serif"],
+        sans: ['"Cairo Variable"', "system-ui", "sans-serif"],
+      },
+      borderRadius: {
+        card: "16px",
+        control: "14px",
       },
       boxShadow: {
-        glow: "0 0 20px oklch(80% 0.17 113 / 0.25)",
-        card: "0 12px 32px rgba(0,0,0,0.55)",
+        glow: "0 0 0 1px rgba(139,147,255,0.45), 0 12px 32px -8px rgba(139,147,255,0.35)",
+        card: "0 18px 40px -12px rgba(0,0,0,0.7)",
+        lift: "0 24px 48px -16px rgba(0,0,0,0.85)",
       },
       // Semantic z scale: rail arrows < sticky chrome < modal < toast.
       zIndex: {
@@ -57,6 +71,18 @@ export default {
         modal: "100",
         toast: "200",
         player: "9999",
+      },
+      keyframes: {
+        rise: { from: { opacity: "0", transform: "translateY(10px)" }, to: { opacity: "1", transform: "none" } },
+        fadeIn: { from: { opacity: "0" }, to: { opacity: "1" } },
+        kenburns: { from: { transform: "scale(1)" }, to: { transform: "scale(1.08)" } },
+        sheetUp: { from: { opacity: "0", transform: "translateY(24px) scale(0.98)" }, to: { opacity: "1", transform: "none" } },
+      },
+      animation: {
+        rise: "rise 420ms cubic-bezier(0.22,1,0.36,1) both",
+        fadeIn: "fadeIn 300ms ease-out both",
+        kenburns: "kenburns 9s ease-out both",
+        sheetUp: "sheetUp 280ms cubic-bezier(0.22,1,0.36,1) both",
       },
     },
   },

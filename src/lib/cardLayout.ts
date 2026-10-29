@@ -81,10 +81,15 @@ export function setCardLayout(scope: CardLayoutScope, value: CardLayout): Promis
   return store.writes;
 }
 
-export function cardLayoutMetrics(layout: CardLayout, viewportWidth: number, gap = 12, padding = 20) {
-  const contentWidth = Math.max(1, viewportWidth - padding * 2);
-  const desiredColumns = layout === "compact" ? 3 : layout === "comfortable" ? 2 : 1;
-  const columns = Math.min(desiredColumns, Math.max(1, Math.floor((contentWidth + gap) / (92 + gap))));
+// Desktop sizing: columns follow the available width with a minimum poster
+// width per density (the mobile port fixed 2/3 columns, which rendered three
+// giant posters across a desktop window). The sidebar is subtracted.
+const SIDEBAR_W = 256;
+const MIN_CARD_W: Record<CardLayout, number> = { comfortable: 168, compact: 128, list: 10_000 };
+
+export function cardLayoutMetrics(layout: CardLayout, viewportWidth: number, gap = 12, padding = 32) {
+  const contentWidth = Math.max(1, viewportWidth - SIDEBAR_W - padding * 2);
+  const columns = layout === "list" ? 1 : Math.max(2, Math.floor((contentWidth + gap) / (MIN_CARD_W[layout] + gap)));
   // Floor to 2dp so float epsilon can't overflow a flexWrap grid and wrap a
   // card onto its own line (which reads as a huge gap).
   const cardWidth = Math.floor(((contentWidth - gap * (columns - 1)) / columns) * 100) / 100;

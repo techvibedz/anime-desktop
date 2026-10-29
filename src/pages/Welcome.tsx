@@ -2,6 +2,7 @@
 // landing with the three feature rows and the two auth CTAs (register / login).
 
 import { Link } from "react-router-dom";
+import { AuthBackdrop } from "../components/AuthBackdrop";
 import { t } from "../lib/i18n";
 
 const FEATURES: { d: string; text: string }[] = [
@@ -12,8 +13,9 @@ const FEATURES: { d: string; text: string }[] = [
 
 export function WelcomePage() {
   return (
-    <div dir="rtl" className="flex min-h-screen items-center justify-center bg-bg p-6">
-      <div className="w-full max-w-sm space-y-6 rounded-2xl border border-white/10 bg-surface p-8 shadow-card">
+    <div dir="rtl" className="relative flex min-h-screen items-center justify-center overflow-hidden bg-bg p-6">
+      <AuthBackdrop />
+      <div className="relative z-10 w-full max-w-sm space-y-6 rounded-[22px] border border-white/[0.08] bg-surface/85 p-8 shadow-lift backdrop-blur-xl">
         <div className="text-center">
           <img src="./logo.png" alt="" className="mx-auto h-14 w-14 rounded-2xl" />
           <h1 className="mt-3 text-2xl font-bold text-white">{t.appName}</h1>
@@ -29,7 +31,7 @@ export function WelcomePage() {
                 </svg>
               </span>
               <span className="min-w-0 flex-1 text-sm leading-6 text-text-secondary">{f.text}</span>
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 text-green-400" aria-hidden>
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 text-mint" aria-hidden>
                 <path d="m5 13 4 4L19 7" />
               </svg>
             </div>

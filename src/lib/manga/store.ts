@@ -411,3 +411,15 @@ export function useReadChapters(source: MangaSourceId, id: string): string[] {
 export function useInMangaLibrary(source: MangaSourceId, id: string): boolean | null {
   return useMangaSnapshot(() => isInMangaLibrary(source, id), null, [source, id]);
 }
+
+/** Drop this device's manga library + progress (account switch / sign-out). */
+export async function resetLocalManga(): Promise<void> {
+  if (progressEmitTimer) { clearTimeout(progressEmitTimer); progressEmitTimer = null; }
+  for (const timer of persistTimers.values()) clearTimeout(timer);
+  persistTimers.clear();
+  libCache = [];
+  progressCache = {};
+  readCache = {};
+  await Promise.all([LIB_KEY, PROGRESS_KEY, READ_KEY].map((k) => AsyncStorage.removeItem(k).catch(() => {})));
+  emit();
+}

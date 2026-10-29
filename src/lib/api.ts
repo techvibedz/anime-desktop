@@ -4,6 +4,7 @@ import { fuzzyScore, sourceSearchQueries } from "./fuzzy";
 import {
   scrapeWitanimeHome,
   fetchWitHomeDirect,
+  fetchWitNewEpisodesDirect,
   scrapeEpisodesPage,
   scrapeSearch,
   fetchAnime4upRecentPageDirect,
@@ -51,8 +52,11 @@ import {
   videoContentType,
 } from "./videoProviders";
 
-const HOME_CACHE_KEY = "@home_cache_v2";
+const HOME_CACHE_KEY = "@home_cache_v3";
+// Served (stale-while-revalidate) for up to a week; revalidated in the
+// background once older than HOME_FRESH_MS.
 const HOME_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
+const HOME_FRESH_MS = 5 * 60 * 1000;
 const DETAIL_CACHE_PREFIX = "@detail_v4:";
 const DETAIL_CACHE_TTL = 30 * 60 * 1000;
 const UP4_CACHE_PREFIX = "@up4_eps_v2:";
@@ -69,6 +73,15 @@ async function readCache<T>(key: string, ttlMs: number): Promise<T | null> {
     const parsed = JSON.parse(raw);
     if (Date.now() - parsed.ts > ttlMs) return null;
     return parsed.data as T;
+  } catch { return null; }
+}
+async function readCacheEntry<T>(key: string, ttlMs: number): Promise<{ ts: number; data: T } | null> {
+  try {
+    const raw = await storage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || Date.now() - parsed.ts > ttlMs) return null;
+    return { ts: parsed.ts, data: parsed.data as T };
   } catch { return null; }
 }
 async function writeCache(key: string, data: unknown) {
@@ -124,56 +137,112 @@ function cleanAnimeTitle(raw: string | null | undefined): string {
 }
 
 type HomePayload = { success: boolean; data: { featured: FeaturedItem[]; sections: HomeSection[] } };
-let bgRefreshInFlight = false;
 let homeFreshInFlight: Promise<HomePayload> | null = null;
 
-function normalizeHomeSource(wit: { featured?: any[]; animes?: any[]; episodes?: any[] } | null | undefined) {
-  return {
-    featured: Array.isArray(wit?.featured) ? wit.featured : [],
-    animes: Array.isArray(wit?.animes) ? wit.animes : [],
-    episodes: Array.isArray(wit?.episodes) ? wit.episodes : [],
-  };
+// The ids the home feed renders, in display order — the same set the mobile
+// app shows. A cached payload carrying the retired "trending"/"tv_series"/
+// "movies" rails is treated as stale and re-scraped.
+export const HOME_SECTION_IDS = ["recently_updated", "latest_movies", "top_animes", "top_movies"];
+
+// A home payload is only worth caching/showing if it actually carries content.
+// An empty scrape (cold window / un-cleared Cloudflare) frozen for the cache TTL
+// is what makes the app open to "zero content", so gate reads and writes on it.
+function homeHasContent(p: HomePayload | null | undefined): p is HomePayload {
+  return !!p?.data && Array.isArray(p.data.featured) && Array.isArray(p.data.sections) &&
+    (p.data.featured.length > 0 || p.data.sections.length > 0);
 }
 
-function buildHomePayload(witRaw: { featured?: FeaturedItem[]; animes?: any[]; episodes?: any[] } | null | undefined): HomePayload {
-  const wit = normalizeHomeSource(witRaw);
-  const merged: MergedAnimeItem[] = wit.animes.map((w: any) => ({ ...w, image: imgOrEmpty(w.image), sources: ["witanime"], sourceHrefs: { witanime: w.href } }));
-  const featured: FeaturedItem[] = wit.featured;
-  const recentEpisodes: EpisodeItem[] = wit.episodes.map((e: any) => ({ title: e.title, href: e.href, image: imgOrEmpty(e.image), animeTitle: e.animeTitle, animeHref: e.animeHref, isNew: e.isNew }));
+function homeIsCurrentShape(p: HomePayload): boolean {
+  return p.data.sections.every((s) => HOME_SECTION_IDS.includes(s.id));
+}
+
+type HomeSource = {
+  featured?: any[];
+  animes?: any[];
+  episodes?: any[];
+  latestMovies?: any[];
+  topAnimes?: any[];
+  topMovies?: any[];
+};
+
+// Build the home feed from witanime's own home rails, in display order: the
+// newest episodes first, then latest movies, most-watched animes and
+// most-watched movies (mirrors mobile lib/api.ts buildHomePayload). A rail the
+// source did not render is simply omitted.
+function buildHomePayload(src: HomeSource): HomePayload {
+  const featured: FeaturedItem[] = (src.featured ?? []).filter((f: any) => f?.href && f?.title);
+  const recentEpisodes: EpisodeItem[] = (src.episodes ?? []).map((e: any) => ({
+    title: e.title, href: e.href, image: imgOrEmpty(e.image),
+    animeTitle: e.animeTitle, animeHref: e.animeHref, isNew: !!e.isNew,
+  }));
+  const toAnimeItems = (cards: any[] | undefined): AnimeItem[] => (cards ?? []).map((c: any) => ({
+    title: c.title, href: c.href, image: imgOrEmpty(c.image),
+    type: c.type ?? null, status: c.status ?? null, description: c.description ?? null,
+    rating: c.rating ?? null, isNew: !!c.isNew,
+  }));
   const sections: HomeSection[] = [];
-  if (merged.length > 0) sections.push({ id: "trending", title: "Trending Now", type: "anime", items: merged });
   if (recentEpisodes.length > 0) sections.push({ id: "recently_updated", title: "Recently Updated", type: "episode", items: recentEpisodes });
-  const tvItems = merged.filter((a) => a.type && (a.type.includes("TV") || a.type.includes("مسلسل")));
-  const movieItems = merged.filter((a) => a.type && (a.type.includes("فيلم") || a.type.includes("Movie")));
-  if (tvItems.length >= 3) sections.push({ id: "tv_series", title: "TV Series", type: "anime", items: tvItems });
-  if (movieItems.length >= 2) sections.push({ id: "movies", title: "Movies", type: "anime", items: movieItems });
-  return { success: true, data: { featured: featured.slice(0, 5), sections } };
+  const rails: [string, string, any[] | undefined][] = [
+    ["latest_movies", "Latest Movies", src.latestMovies],
+    ["top_animes", "Most Watched Animes", src.topAnimes],
+    ["top_movies", "Most Watched Movies", src.topMovies],
+  ];
+  for (const [id, title, cards] of rails) {
+    const items = toAnimeItems(cards);
+    if (items.length > 0) sections.push({ id, title, type: "anime", items });
+  }
+  return { success: true, data: { featured: featured.slice(0, 6), sections } };
+}
+
+// One episode card per anime (the primary source's newest), in source order.
+// The same anime carries a different animeHref per source, so de-dupe on the
+// normalized title too.
+function mergeRecentEpisodes<T extends { href?: string | null; animeHref?: string | null; animeTitle?: string | null }>(
+  primary: readonly T[],
+  fallback: readonly T[],
+): T[] {
+  const seenHref = new Set<string>();
+  const seenTitle = new Set<string>();
+  const out: T[] = [];
+  for (const ep of [...primary, ...fallback]) {
+    const hrefKey = (ep.animeHref || ep.href || "").toLowerCase().replace(/\/+$/, "").trim();
+    const titleKey = animeTitleKey(ep.animeTitle || "");
+    if ((hrefKey && seenHref.has(hrefKey)) || (titleKey && seenTitle.has(titleKey))) continue;
+    if (hrefKey) seenHref.add(hrefKey);
+    if (titleKey) seenTitle.add(titleKey);
+    out.push(ep);
+  }
+  return out;
+}
+
+function sourceHomeHasContent(home: HomeSource | null | undefined): home is HomeSource {
+  return !!home && ((home.featured?.length ?? 0) > 0 || (home.animes?.length ?? 0) > 0 || (home.episodes?.length ?? 0) > 0);
 }
 
 async function fetchHomeFresh(): Promise<HomePayload> {
-  // Fast path: read the home page's static HTML directly (sub-second, no headless
-  // window cold-start / Cloudflare-clear). Fall back to the headless scrape only
-  // when the direct fetch comes back empty (CF challenge / cold body).
-  const [witDirect, anime4upRecent] = await Promise.all([
-    fetchWitHomeDirect().catch(() => null),
-    fetchAnime4upRecentPageDirect(1).catch(() => null),
-  ]);
-  let wit = normalizeHomeSource(witDirect);
-  if (!wit || (wit.animes.length === 0 && wit.episodes.length === 0)) {
-    wit = normalizeHomeSource(await withTimeout(scrapeWitanimeHome().catch(() => null), 10_000, null));
+  // Fast path: read witanime's home HTML directly (sub-second, no headless
+  // window cold-start / Cloudflare-clear). Fall back to the headless scrape
+  // only when the direct fetch comes back empty.
+  let home: HomeSource | null = await fetchWitHomeDirect().catch(() => null);
+  if (!sourceHomeHasContent(home)) {
+    const viaWindow = await withTimeout(scrapeWitanimeHome().catch(() => null), 20_000, null);
+    home = sourceHomeHasContent(viaWindow) ? viaWindow : null;
   }
-  if (wit.animes.length === 0 && wit.episodes.length === 0 && anime4upRecent?.episodes.length) {
-    wit = { ...wit, episodes: anime4upRecent.episodes };
+  // Witanime's own "أحدث الحلقات" rail leads the feed — it is the canonical
+  // newest-first order. anime4up's archive often leads with a batch upload of
+  // an older show, so it is only used when witanime is unreachable.
+  const up4 = home ? null : await fetchAnime4upRecentPageDirect(1).catch(() => null);
+  if (!home && !up4?.episodes.length) throw new Error("Home content unavailable");
+  const base: HomeSource = home ?? { featured: [], animes: [], episodes: [] };
+  const episodes = mergeRecentEpisodes(base.episodes ?? [], up4?.episodes ?? []);
+  const result = buildHomePayload({ ...base, episodes });
+  if (homeHasContent(result)) {
+    void writeCache(HOME_CACHE_KEY, result);
+    // Scout upload: successful live scrapes seed the crowdsourced cloud cache
+    // (shared with mobile) so devices whose ISP blocks every source still get
+    // a home feed.
+    void writeCloudHome(result);
   }
-  if (wit.animes.length === 0 && wit.episodes.length === 0) {
-    throw new Error("Home content unavailable");
-  }
-  if (anime4upRecent?.episodes.length) wit = { ...wit, episodes: anime4upRecent.episodes };
-  const result = buildHomePayload(wit);
-  void writeCache(HOME_CACHE_KEY, result);
-  // Scout upload: successful live scrapes seed the crowdsourced cloud cache so
-  // devices whose ISP blocks every source still get a home feed.
-  void writeCloudHome(result);
   return result;
 }
 
@@ -183,9 +252,8 @@ function fetchHomeFreshShared(): Promise<HomePayload> {
   return homeFreshInFlight;
 }
 
-// Cheap change detector for the SWR push: a new episode / new trending entry
-// always alters a section's item count or its first item, so comparing section
-// counts + lead hrefs catches every visible change without a full deep-equal.
+// Cheap change detector for the SWR push: a new episode / new rail lead item
+// always alters a section's item count or its first item.
 function homeSignature(p: HomePayload): string {
   return (
     p.data.sections.map((s) => `${s.id}:${s.items.length}:${s.items[0]?.href || ""}`).join("|") +
@@ -193,30 +261,37 @@ function homeSignature(p: HomePayload): string {
   );
 }
 
-export async function fetchHome(onUpdated?: (p: HomePayload) => void): Promise<HomePayload> {
-  // Stale-while-revalidate: return cached payload immediately if present,
-  // then kick off a background refresh. When the fresh scrape lands with
-  // visibly different content, push it to the open screen via onUpdated so the
-  // user sees new episodes WITHOUT a manual refresh.
-  const cached = await readCache<HomePayload>(HOME_CACHE_KEY, HOME_CACHE_TTL);
-  if (cached) {
-    if (!bgRefreshInFlight) {
-      bgRefreshInFlight = true;
+export async function fetchHome(
+  onUpdated?: (p: HomePayload) => void,
+  options: { forceRefresh?: boolean } = {},
+): Promise<HomePayload> {
+  // Stale-while-revalidate: return the cached payload immediately, then
+  // revalidate in the background when it is older than the freshness window
+  // (or on an explicit refresh). A visibly different fresh scrape is pushed to
+  // the open screen via onUpdated — new episodes appear without a reload.
+  const entry = await readCacheEntry<HomePayload>(HOME_CACHE_KEY, HOME_CACHE_TTL);
+  const cached = entry?.data ?? null;
+  if (homeHasContent(cached) && homeIsCurrentShape(cached)) {
+    const stale = !entry || Date.now() - entry.ts > HOME_FRESH_MS;
+    if (options.forceRefresh || stale || homeFreshInFlight) {
       void fetchHomeFreshShared()
         .then((fresh) => {
-          if (onUpdated && homeSignature(fresh) !== homeSignature(cached)) onUpdated(fresh);
+          if (onUpdated && homeHasContent(fresh) && homeSignature(fresh) !== homeSignature(cached)) onUpdated(fresh);
         })
-        .catch(() => {})
-        .finally(() => { bgRefreshInFlight = false; });
+        .catch(() => {});
     }
     return cached;
   }
   try {
-    return await fetchHomeFreshShared();
+    const fresh = await fetchHomeFreshShared();
+    if (homeHasContent(fresh)) return fresh;
+    throw new Error("Home content unavailable");
   } catch (e) {
     // Last-resort failover: a crowdsourced home feed uploaded by another device.
     const cloud = await readCloudHome<HomePayload>().catch(() => null);
-    if (cloud) return cloud;
+    if (homeHasContent(cloud)) {
+      return { ...cloud, data: { ...cloud.data, sections: cloud.data.sections.filter((s) => HOME_SECTION_IDS.includes(s.id)) } };
+    }
     throw e;
   }
 }
@@ -504,6 +579,15 @@ export function findAnime4upAnimeUrl(title: string): Promise<string | null> {
 }
 
 export async function fetchRecent(page = 1) {
+  // Canonical path: witanime's own paginated new-episodes feed — contiguous and
+  // strictly newest-first, so the see-all grid continues the home rail's order
+  // page after page (mirrors mobile). The pager clamps requests past its end
+  // (response page < requested), which routes those to the archive fallback.
+  const wit = await fetchWitNewEpisodesDirect(page).catch(() => null);
+  if (wit?.page === page && wit.episodes.length) {
+    return { success: true, data: { page, episodes: wit.episodes.map((e) => ({ title: e.title, href: e.href, image: imgOrEmpty(e.image), animeTitle: e.animeTitle, animeHref: e.animeHref, isNew: e.isNew })), hasNext: true } };
+  }
+  // witanime blocked / past its end: anime4up's archive.
   const r = await fetchAnime4upRecentPageDirect(page).catch(() => null);
   if (r) return { success: true, data: { page, episodes: r.episodes.map((e) => ({ title: e.title, href: e.href, image: imgOrEmpty(e.image), animeTitle: e.animeTitle, animeHref: e.animeHref, isNew: e.isNew })), hasNext: r.hasNext } };
   if (page === 1) {

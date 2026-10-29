@@ -45,7 +45,7 @@ function SearchRowCard({ item }: { item: SearchResult }) {
   return (
     <Link
       to={`/anime/${encodeURIComponent(item.href)}`}
-      className="group flex items-center gap-4 rounded-xl border border-white/10 bg-raised p-3 transition-colors hover:bg-white/5"
+      className="group flex items-center gap-4 rounded-card bg-surface p-3 ring-1 ring-white/[0.05] transition-colors hover:bg-raised hover:ring-accent/40"
     >
       <div className="relative aspect-[2/3] w-[84px] shrink-0 overflow-hidden rounded-lg bg-surface">
         {showImg ? (
@@ -323,7 +323,7 @@ export function SearchPage() {
         {list.map((it) => <SearchRowCard key={it.href} item={it} />)}
       </div>
     ) : (
-      <div className="grid gap-3" style={gridStyle}>
+      <div className="grid gap-x-4 gap-y-5" style={gridStyle}>
         {list.map((it) => <AnimeCard key={it.href} item={it} />)}
       </div>
     );
@@ -333,8 +333,8 @@ export function SearchPage() {
         {Array.from({ length: 6 }).map((_, i) => <Shimmer key={i} className="h-[148px] w-full" />)}
       </div>
     ) : (
-      <div className="grid gap-3" style={gridStyle}>
-        {Array.from({ length: cards.columns * 4 }).map((_, i) => <Shimmer key={i} className="aspect-[2/3]" />)}
+      <div className="grid gap-x-4 gap-y-5" style={gridStyle}>
+        {Array.from({ length: cards.columns * 3 }).map((_, i) => <Shimmer key={i} className="aspect-[2/3] rounded-card" />)}
       </div>
     );
 
@@ -342,39 +342,43 @@ export function SearchPage() {
     <div className="space-y-6">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-3xl font-bold">{t.discover}</h1>
-          <p className="mt-1 text-sm text-text-muted">{t.searchSub}</p>
+          <h1 className="text-[32px] font-extrabold text-white">{t.discover}</h1>
+          <p className="mt-1 text-sm font-semibold text-text-muted">{t.searchSub}</p>
         </div>
         <CardLayoutControl layout={cards.layout} onChange={cards.setLayout} />
       </div>
 
-      <form onSubmit={submit} className="flex gap-2">
+      <form onSubmit={submit} className="relative">
+        <span className="pointer-events-none absolute inset-y-0 start-5 flex items-center text-text-muted">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden><path d="M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z" /><path d="m21 21-4.3-4.3" /></svg>
+        </span>
         <input
+          data-search-input
           value={q}
           onChange={(e) => setQ(e.target.value)}
           autoFocus
           placeholder={t.searchPlaceholder}
-          className="flex-1 rounded-full border border-white/10 bg-surface px-6 py-3.5 text-base text-white placeholder:text-text-muted focus:border-accent focus:outline-none"
+          className="h-14 w-full rounded-[18px] border border-white/[0.08] bg-surface pe-32 ps-14 text-base font-semibold text-white placeholder:font-medium placeholder:text-text-muted focus:border-accent/60 focus:outline-none"
         />
         <button
           type="submit"
-          className="rounded-full bg-accent px-7 py-3.5 text-sm font-bold text-black transition-colors hover:bg-accent-bright"
+          className="absolute inset-y-2 end-2 rounded-[12px] bg-accent px-6 text-sm font-extrabold text-on-accent transition-colors hover:bg-accent-bright"
         >
           {t.search}
         </button>
       </form>
 
-      <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
+      <div className="no-scrollbar -mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
         {GENRES.map((g) => (
           <button
             key={g}
             type="button"
             onClick={() => handleGenre(g)}
             aria-pressed={activeGenre === g}
-            className={`shrink-0 rounded-full border px-4 py-2 text-sm font-semibold transition-colors ${
+            className={`shrink-0 rounded-full px-4 py-2 text-sm font-bold transition-colors ${
               activeGenre === g
-                ? "border-accent/60 bg-accent/15 text-accent"
-                : "border-white/10 bg-raised text-text-secondary hover:bg-white/5 hover:text-white"
+                ? "bg-white text-on-accent"
+                : "bg-white/[0.06] text-text-secondary hover:bg-white/[0.1] hover:text-white"
             }`}
           >
             {GENRE_LABELS[g]}

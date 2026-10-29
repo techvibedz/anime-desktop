@@ -56,16 +56,15 @@ export function NewsArticlePage() {
   return (
     <article className="pb-12">
       {item.image && (
-        <div className="relative -mx-8 -mt-7 h-[340px] overflow-hidden lg:h-[420px]">
+        <div className="relative -mx-8 -mt-[92px] h-[340px] overflow-hidden lg:h-[420px]">
           <img src={item.image} alt="" referrerPolicy="no-referrer" className="h-full w-full object-cover" />
           <div className="absolute inset-0 bg-gradient-to-t from-bg via-bg/45 to-bg/10" />
         </div>
       )}
 
       <div className={`mx-auto max-w-3xl ${item.image ? "relative -mt-20" : "pt-2"}`}>
-        <Link to="/news" className="text-sm text-text-muted transition-colors hover:text-white">→ {t.back}</Link>
 
-        <div className="mt-8 flex items-center gap-2.5 text-xs">
+        <div className="flex items-center gap-2.5 text-xs">
           <span className="font-semibold text-accent">{t.newsTimeAgo(item.date)}</span>
           {item.tags && (
             <>

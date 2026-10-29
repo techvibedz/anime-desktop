@@ -165,7 +165,7 @@ export function AdminChatViewPage() {
   const composerDisabled = closed || sending || sendingPhoto;
 
   return (
-    <div className="mx-auto flex h-[calc(100vh-8rem)] max-w-3xl flex-col">
+    <div className="mx-auto flex h-[calc(100vh-9rem)] max-w-3xl flex-col">
       <div className="flex items-center justify-between gap-3 pb-4">
         <div className="flex min-w-0 items-center gap-2">
           <button

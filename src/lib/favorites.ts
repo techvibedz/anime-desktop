@@ -13,26 +13,15 @@ export interface FavoriteAnime {
   list: FavoriteList;
 }
 
-export function toAnimeUrl(href: string): string | null {
-  if (!href) return null;
-  if (href.includes("/anime/")) return href;
-  if (!href.includes("/episode/")) return href;
-  try {
-    const decoded = decodeURIComponent(href);
-    const stripped = decoded.replace(/-?الحلقة[-\s]*\d+[^/]*/, "");
-    const converted = stripped.replace("/episode/", "/anime/");
-    if (converted !== decoded && converted.includes("/anime/")) {
-      const u = new URL(converted);
-      return u.origin + u.pathname.split("/").map((seg, i) =>
-        i === 0 ? seg : encodeURIComponent(decodeURIComponent(seg))
-      ).join("/");
-    }
-  } catch {}
-  return null;
-}
+// URL identity rules shared with mobile (lib/favoritesIdentity.ts): witanime
+// episodes are /watch/<slug>/<n>, its anime pages /anime/<slug>.
+import { toAnimeUrl, isAnimeDetailUrl } from "./favoritesIdentity";
+export { toAnimeUrl, isEpisodeUrl, isAnimeDetailUrl } from "./favoritesIdentity";
 
 function isAnimeUrl(href: string): boolean {
-  return !!href && href.includes("/anime/") && !href.includes("/episode/");
+  // /anime/<slug>, witanime /movie/<slug>, anime3rb /titles/<slug> — never a
+  // /watch/ or /episode/ page (movies could not be bookmarked before).
+  return isAnimeDetailUrl(href);
 }
 
 async function pushFavoriteToCloud(fav: FavoriteAnime) {
@@ -127,4 +116,9 @@ export async function favoriteListOf(href: string): Promise<FavoriteList | null>
 
 export async function isFavorite(href: string): Promise<boolean> {
   return (await favoriteListOf(href)) !== null;
+}
+
+/** Drop this device's favorites (account switch / sign-out). */
+export async function resetLocalFavorites(): Promise<void> {
+  await storage.removeItem(KEY).catch(() => {});
 }
