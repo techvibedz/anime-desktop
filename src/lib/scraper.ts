@@ -321,6 +321,12 @@ export async function scrapeWitanimeEpisodePageDirect(
 ): Promise<{ servers: RawServer[]; episodeTitle: string; animeTitle: string } | null> {
   const resolvedUrl = rewriteWitUrl(episodeUrl);
   const current = await window.pantoufa.resolveWitServers?.(resolvedUrl);
+  // witanime is answering 429: an empty (non-null) result keeps the caller off
+  // its static + headless fallbacks, which would only prolong the lockout.
+  if (current?.rateLimited) {
+    console.warn("[servers] witanime rate-limited — skipping fallbacks");
+    return { servers: [], episodeTitle: "", animeTitle: "" };
+  }
   if (current?.servers.length) {
     return {
       episodeTitle: current.episodeTitle,

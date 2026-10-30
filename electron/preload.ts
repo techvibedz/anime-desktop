@@ -105,6 +105,7 @@ contextBridge.exposeInMainWorld("pantoufa", {
     servers: { id: string; name: string; iframeUrl: string }[];
     episodeTitle: string;
     animeTitle: string;
+    rateLimited?: boolean;
   } | null>,
 
   // ── Offline downloads ──

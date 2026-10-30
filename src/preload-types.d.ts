@@ -55,6 +55,7 @@ declare global {
         servers: { id: string; name: string; iframeUrl: string; provider?: string }[];
         episodeTitle: string;
         animeTitle: string;
+        rateLimited?: boolean;
       } | null>;
       downloadStart: (opts: { id: string; url: string; provider: string }) => Promise<{ ok: boolean; total?: number }>;
       downloadDelete: (id: string) => Promise<boolean>;

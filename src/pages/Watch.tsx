@@ -2056,7 +2056,10 @@ export function WatchPage() {
       }
       if (now - last < 10000) return;
       last = now;
-      if (!isFinite(v.duration)) return;
+      saveNow();
+    };
+    const saveNow = () => {
+      if (!isFinite(v.duration) || v.duration <= 0 || v.currentTime <= 0) return;
       saveProgress({
         episodeHref: episodeUrl,
         episodeTitle: meta.episodeTitle || `${t.episode}`,
@@ -2069,8 +2072,18 @@ export function WatchPage() {
         epNum: currentEpNumber ?? undefined,
       }).catch(() => {});
     };
+    // Pausing, closing the window, or navigating away must not lose the last
+    // <10s of position the throttled saver hasn't written yet.
+    const onPause = () => { last = Date.now(); saveNow(); };
+    window.addEventListener("beforeunload", saveNow);
     v.addEventListener("timeupdate", onTime);
-    return () => v.removeEventListener("timeupdate", onTime);
+    v.addEventListener("pause", onPause);
+    return () => {
+      v.removeEventListener("timeupdate", onTime);
+      v.removeEventListener("pause", onPause);
+      window.removeEventListener("beforeunload", saveNow);
+      saveNow();
+    };
   }, [episodeUrl, meta, up4Param, resolved, animeParam, imgParam, posterFromDetail, animeTitleFromDetail, resolvedAnimeHref, currentEpNumber]);
 
   // Iframe embeds never report a position, so the timeupdate saver above never

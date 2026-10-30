@@ -14,7 +14,7 @@ export function subscribeHistory(cb: () => void): () => void {
 }
 
 async function writeHistory(list: WatchEntry[]): Promise<void> {
-  await writeHistory(list);
+  await storage.setItem(KEY, JSON.stringify(list));
   for (const cb of historyListeners) {
     try { cb(); } catch {}
   }

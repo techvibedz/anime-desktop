@@ -834,7 +834,10 @@ export function fetchVideoServers(episodeUrl: string, url4up?: string, force = f
   if (force) serversCache.delete(key);
   const hit = serversCache.get(key);
   if (hit && Date.now() - hit.ts < SERVERS_TTL) return hit.promise;
-  const promise = doFetchVideoServers(episodeUrl, url4up).catch((e) => { serversCache.delete(key); throw e; });
+  const promise = doFetchVideoServers(episodeUrl, url4up)
+    // An empty list (rate limit, transient block) must not stick for the TTL.
+    .then((payload) => { if (!payload.data.servers.length) serversCache.delete(key); return payload; })
+    .catch((e) => { serversCache.delete(key); throw e; });
   serversCache.set(key, { ts: Date.now(), promise });
   return promise;
 }

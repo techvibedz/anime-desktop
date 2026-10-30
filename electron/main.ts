@@ -3842,9 +3842,7 @@ app.whenReady().then(() => {
       // (a cross-origin redirect is unreadable from the page's fetch), and is
       // the REAL provider embed the native extractors can play.
       const gateRedirects = witGateRedirects;
-      let handshake: unknown = null;
-      try {
-        handshake = await enqueue({
+      const handshake: unknown = await enqueue({
           url: episode.toString(),
           injectAfter: `new Promise((resolve) => {
             (async () => {
@@ -3853,6 +3851,12 @@ app.whenReady().then(() => {
                 // player config to exist before giving up.
                 const waitStart = Date.now();
                 while (!document.querySelector('[x-data*="watchPlayer"]') && Date.now() - waitStart < 20000) {
+                  // witanime's rate-limit page never hydrates a player — bail
+                  // now instead of idling out the whole 20s wait.
+                  if (/طلبات كثيرة|too many requests/i.test(document.title)) {
+                    resolve([{ debug: "rate-limited", href: location.href, title: document.title }]);
+                    return;
+                  }
                   await new Promise((r) => setTimeout(r, 250));
                 }
                 if (!document.querySelector('[x-data*="watchPlayer"]')) {
@@ -3897,6 +3901,36 @@ app.whenReady().then(() => {
                 const rank = (l) => l.includes("hgcloud") ? 0 : l.includes("videa") ? 1 : l.includes("mp4upload") ? 2 : 3;
                 entries.sort((a, b) => rank(a.label) - rank(b.label));
                 const out = [{ animeTitle: document.querySelector('main h1')?.textContent?.trim() || "", pageTitle: document.title }];
+                // ProviderBrowser (WebView2) writes each gate's 302 target into
+                // window.__pantoufaGateRedirects as it lands, so wait only until
+                // every gate has answered instead of a fixed sleep. The Electron
+                // fallback captures redirects main-side, where the page can't
+                // see them — it keeps the full wait.
+                const inWebView = !!(window.chrome && window.chrome.webview);
+                const landedCount = () => {
+                  const g = window.__pantoufaGateRedirects || {};
+                  return out.filter((item) => item.token && g[item.token]).length;
+                };
+                // Gates that answer do so within a second or two of their
+                // iframe attaching; the rest rarely land later (measured: a
+                // fixed 10s wait gained nothing over ~2s of quiet). Stop when
+                // every gate landed, or nothing new landed for QUIET_MS, capped
+                // at maxMs. Unlanded gates still ship as stream-gate iframes.
+                const QUIET_MS = 2000;
+                const waitForGates = async (maxMs) => {
+                  const start = Date.now();
+                  if (!inWebView) { await new Promise((r) => setTimeout(r, maxMs)); return; }
+                  const total = out.filter((item) => item.token).length;
+                  let seen = landedCount();
+                  let lastChange = Date.now();
+                  while (Date.now() - start < maxMs) {
+                    const now = landedCount();
+                    if (now >= total) return;
+                    if (now !== seen) { seen = now; lastChange = Date.now(); }
+                    else if (Date.now() - lastChange >= QUIET_MS) return;
+                    await new Promise((r) => setTimeout(r, 150));
+                  }
+                };
                 for (const e of entries) {
                   try {
                     let ready = await fetch("/watch/stream-source/" + e.token, { method: "POST", headers });
@@ -3915,18 +3949,18 @@ app.whenReady().then(() => {
                     document.body.appendChild(frame);
                     out.push({ label: e.label, quality: e.quality, token: e.token, sandbox: settings.sandbox, referrerPolicy: settings.referrerPolicy });
                   } catch (err) {}
-                  await new Promise((r) => setTimeout(r, 1200));
+                  await new Promise((r) => setTimeout(r, 700));
                 }
                 // The gate's anti-bot layer rejects fetch (Sec-Fetch-Mode:
                 // cors) and top-level navigations, but accepts IFRAME
                 // navigations (measured live: fetch → 404, iframe → 302).
                 // Attach a hidden iframe per gate; main captures each
                 // redirectURL via onBeforeRedirect.
-                await new Promise((r) => setTimeout(r, 10000));
+                await waitForGates(inWebView ? 6000 : 10000);
                 // Retry only gates the Windows browser saw fail; no second manifest.
                 if (window.__pantoufaGateRedirects) {
                   for (const item of out) if (item.token && !window.__pantoufaGateRedirects[item.token]) {
-                    await new Promise((r) => setTimeout(r, 1200));
+                    await new Promise((r) => setTimeout(r, 700));
                     const ready = await fetch("/watch/stream-source/" + item.token, { method: "POST", headers });
                     if (!ready.ok) continue;
                     const frame = document.createElement("iframe");
@@ -3935,7 +3969,7 @@ app.whenReady().then(() => {
                     frame.src = "/watch/stream-gate/" + item.token;
                     document.body.appendChild(frame);
                   }
-                  await new Promise((r) => setTimeout(r, 4000));
+                  await waitForGates(inWebView ? 3000 : 4000);
                 }
                 for (const item of out) if (item.token) item.iframeUrl = window.__pantoufaGateRedirects?.[item.token];
                 resolve(out);
@@ -3946,15 +3980,17 @@ app.whenReady().then(() => {
           priority: true,
           stopAfter: true,
         });
-        // Give the gate redirects a beat to land after the job resolves.
-        await new Promise((resolve) => setTimeout(resolve, 800));
-      } finally {
-        // Redirect capture is shared across jobs; finishing one visit must not
-        // remove the listener while another episode's frames are loading.
-      }
+      // Electron-fallback visits record gate redirects main-side; give any
+      // still in flight a beat to land. WebView2 visits already carry them.
+      const needsSettle = Array.isArray(handshake) && (handshake as { token?: string; iframeUrl?: string }[])
+        .some((item) => item?.token && !item.iframeUrl);
+      if (needsSettle) await new Promise((resolve) => setTimeout(resolve, 800));
       const servers: { id: string; name: string; iframeUrl: string; provider: string; sandbox?: string | false; referrerPolicy?: string }[] = [];
       if (Array.isArray(handshake) && handshake.length && (handshake[0] as any)?.debug) {
         console.info(`[wit-servers] handshake detail: ${JSON.stringify(handshake).slice(0, 400)}`);
+        // Tell the renderer so it skips its static + headless fallbacks: they
+        // hit the same limiter and only extend the lockout.
+        if ((handshake[0] as any).debug === "rate-limited") return { servers: [], episodeTitle: "", animeTitle: "", rateLimited: true };
       }
       if (Array.isArray(handshake)) {
         for (const item of handshake as { label?: string; quality?: string; token?: string; iframeUrl?: string; sandbox?: string | false; referrerPolicy?: string }[]) {

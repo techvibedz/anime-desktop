@@ -665,7 +665,12 @@ export function CompletionProvider({ children }: { children: ReactNode }) {
     // built the badges — this only corrects caught-up state). An earlier
     // history change reconciles right away instead.
     timer = setTimeout(reconcile, 3500);
-    const unsubscribe = subscribeHistory(reconcile);
+    // Playback saves progress every 10s; coalesce those writes instead of
+    // re-parsing the map + history on each one.
+    const unsubscribe = subscribeHistory(() => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(reconcile, 1500);
+    });
     return () => { if (timer) clearTimeout(timer); listeners.delete(refresh); unsubscribe(); };
   }, [refresh]);
   return <CompletionContext.Provider value={lookup}>{children}</CompletionContext.Provider>;
