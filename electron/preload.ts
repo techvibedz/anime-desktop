@@ -107,6 +107,12 @@ contextBridge.exposeInMainWorld("pantoufa", {
     animeTitle: string;
     rateLimited?: boolean;
   } | null>,
+  // Servers from an in-flight wit-servers handshake, emitted as each gate lands.
+  onWitServersProgress: (handler: (info: { url: string; servers: { id: string; name: string; iframeUrl: string; provider?: string }[]; animeTitle: string }) => void) => {
+    const listener = (_evt: unknown, info: { url: string; servers: { id: string; name: string; iframeUrl: string; provider?: string }[]; animeTitle: string }) => handler(info);
+    ipcRenderer.on("pantoufa:wit-servers-progress", listener);
+    return () => ipcRenderer.removeListener("pantoufa:wit-servers-progress", listener);
+  },
 
   // ── Offline downloads ──
   downloadStart: (opts: { id: string; url: string; provider: string }) =>

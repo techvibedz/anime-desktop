@@ -74,6 +74,8 @@ function run(source, context) {
   const probes = [];
   const edgeContext = {
     isIP, AbortSignal, Promise, Set, URL, Buffer, Math, console, setTimeout, clearTimeout,
+    // anime4up mirror helpers live outside the extracted slice.
+    isUp4Host: (host) => /anime4up/.test(host), noteUp4Mirror: () => {},
     fetch: async (url) => ({
       json: async () => (url.includes('cloudflare')
         ? { Answer: [{ data: '172.67.201.154' }, { data: '104.21.44.172' }] }

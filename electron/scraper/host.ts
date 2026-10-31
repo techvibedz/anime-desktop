@@ -25,6 +25,9 @@ export type ScrapeJob = {
   // jobs (witanime gate → provider embed) that land on a page which would
   // otherwise keep a player buffering in a hidden window.
   stopAfter?: boolean;
+  // Partial results posted by the page as {pantoufaProgress} (Windows browser
+  // only; not serialized to the helper).
+  onProgress?: (value: unknown) => void;
 };
 
 type Pending = {

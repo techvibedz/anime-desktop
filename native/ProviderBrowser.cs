@@ -7,6 +7,23 @@ using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
+// Invisible host window that NEVER takes the foreground. A normally shown
+// Form activates itself; every background scrape then stole the foreground
+// from the app, and Windows re-shows the taskbar over a fullscreen window the
+// moment it stops being foreground — the "taskbar pops up randomly during a
+// fullscreen episode" bug. WS_EX_NOACTIVATE keeps activation with the player;
+// WS_EX_TOOLWINDOW keeps it out of Alt+Tab.
+class HiddenForm : Form {
+  protected override bool ShowWithoutActivation { get { return true; } }
+  protected override CreateParams CreateParams {
+    get {
+      var cp = base.CreateParams;
+      cp.ExStyle |= 0x08000000 | 0x00000080; // WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+      return cp;
+    }
+  }
+}
+
 // Keep verification in the Windows browser; return the result to the native player.
 class ProviderBrowser {
   [STAThread] static void Main(string[] args) {
@@ -17,7 +34,7 @@ class ProviderBrowser {
     if (args.Length != 2 || !Uri.TryCreate(args[0], UriKind.Absolute, out url) || url.Scheme != "https") return;
     var job = json.Deserialize<Dictionary<string, object>>(Console.ReadLine());
     var script = (string)job["injectAfter"];
-    var form = new Form { Width = 1280, Height = 800, ShowInTaskbar = false, Opacity = 0 };
+    var form = new HiddenForm { Width = 1280, Height = 800, ShowInTaskbar = false, Opacity = 0 };
     var browser = new WebView2 { Dock = DockStyle.Fill };
     form.Controls.Add(browser);
     var deadline = DateTime.UtcNow.AddMilliseconds(Convert.ToInt32(job["timeoutMs"]));
@@ -48,12 +65,21 @@ class ProviderBrowser {
         core.NavigationStarting += (sender, request) => {
           Uri target;
           if (!Uri.TryCreate(request.Uri, UriKind.Absolute, out target) || target.Scheme != "https" ||
-              (!Regex.IsMatch(target.Host, @"^(?:[^.]+\.)?(?:vik(?:i|1)ngfile\.(?:com|site)|vk\.(?:com|ru)|vkvideo\.ru|(?:witanime|anime4up|streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix)\.[a-z]+)$") && target.Host != url.Host)) request.Cancel = true;
+              (!Regex.IsMatch(target.Host, @"^(?:[^.]+\.)?(?:vik(?:i|1)ngfile\.(?:com|site)|vk\.(?:com|ru)|vkvideo\.ru|(?:witanime|anime4up|streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix)\.[a-z]+)$") && target.Host != url.Host &&
+               // anime4up's canonical host 307s to a rotating *.shop mirror.
+               !(url.Host.Contains("anime4up") && target.Host.EndsWith(".shop")))) request.Cancel = true;
         };
         core.WebMessageReceived += (sender, message) => {
           if (message.Source != core.Source) return;
           try {
             var result = json.Deserialize<Dictionary<string, object>>(message.WebMessageAsJson);
+            // Partial results stream out one JSON line each, so the app can
+            // show servers as they land instead of after the whole job.
+            if (result.ContainsKey("pantoufaProgress")) {
+              Console.WriteLine(message.WebMessageAsJson);
+              Console.Out.Flush();
+              return;
+            }
             if (!result.ContainsKey("pantoufaResult")) return;
             Console.WriteLine(message.WebMessageAsJson);
             form.Close();

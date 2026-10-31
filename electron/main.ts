@@ -250,6 +250,10 @@ function providerRefererForHost(host: string): { referer: string; origin: string
   if (/uqload/.test(host)) return { referer: "https://uqload.io/", origin: "https://uqload.io" };
   if (/share4max|megamax/.test(host)) return { referer: "https://share4max.com/", origin: "https://share4max.com" };
   if (/videa|vidvaita|vidit/.test(host)) return { referer: "https://videa.hu/", origin: "https://videa.hu" };
+  // streamruby's media CDN (*.streamruby.net) tarpits a streamruby.com Referer
+  // (connection hangs until timeout) but serves its own root — same pattern as
+  // the streamwish mirrors. The embed pages still want streamruby.com.
+  if (/(^|\.)streamruby\.net$/.test(host)) return { referer: "https://streamruby.net/", origin: "https://streamruby.net" };
   if (/streamruby|rubyvidhub|rubystm|ruby/.test(host)) return { referer: "https://streamruby.com/", origin: "https://streamruby.com" };
   if (/ok\.ru|odnoklassniki/.test(host)) return { referer: "https://ok.ru/", origin: "https://ok.ru" };
   if (/vk\.com|vkvideo/.test(host)) return { referer: "https://vk.com/", origin: "https://vk.com" };
@@ -1226,21 +1230,43 @@ async function extractViaHtml(
         headers.Referer = canon.referer;
         headers.Origin = canon.origin;
       }
-      const resp = await session.defaultSession.fetch(pageUrl, {
-        method: "GET",
-        headers,
-        redirect: "follow",
-        // Carry the defaultSession cookies (Cloudflare clearance, provider
-        // session) exactly like the playback proxy does — witanime's gate
-        // handoff and the rotating streamwish mirrors both bind to them.
-        credentials: "include",
-        cache: "no-store",
-        // Fail fast on dead/blocked mirrors. Without this a streamwish CDN
-        // that TCP-times-out (ERR_CONNECTION_TIMED_OUT) hangs ~2min on the
-        // Chromium socket-connect default before we fall through to the
-        // headless-capture fallback — 8s is plenty for a reachable embed.
-        signal: AbortSignal.timeout(8000),
-      });
+      let resp: Response;
+      try {
+        resp = await session.defaultSession.fetch(pageUrl, {
+          method: "GET",
+          headers,
+          redirect: "follow",
+          // Carry the defaultSession cookies (Cloudflare clearance, provider
+          // session) exactly like the playback proxy does — witanime's gate
+          // handoff and the rotating streamwish mirrors both bind to them.
+          credentials: "include",
+          cache: "no-store",
+          // Fail fast on dead/blocked mirrors. Without this a streamwish CDN
+          // that TCP-times-out (ERR_CONNECTION_TIMED_OUT) hangs ~2min on the
+          // Chromium socket-connect default before we fall through to the
+          // headless-capture fallback — 8s is plenty for a reachable embed.
+          signal: AbortSignal.timeout(8000),
+        });
+      } catch (e) {
+        // Chromium refuses some cross-origin mirror redirects outright
+        // (rubyvidhub.com → nuvorel.top fails with net::ERR_FAILED) — the
+        // plain Node client follows them fine. Timeouts don't get a retry.
+        if ((e as Error)?.name === "TimeoutError") throw e;
+        // Chromium rejects a credentialed cross-origin redirect (rubyvidhub.com
+        // → nuvorel.top: net::ERR_FAILED). Retry through Chromium without
+        // credentials/Origin FIRST: streamruby binds its stream token to the
+        // client stack that fetched the page, and playback runs through
+        // Chromium — a Node-fetched page yields a token that 403s there.
+        const { Origin: _origin, ...noOrigin } = headers;
+        try {
+          resp = await session.defaultSession.fetch(pageUrl, {
+            method: "GET", headers: noOrigin, redirect: "follow", cache: "no-store", signal: AbortSignal.timeout(8000),
+          });
+        } catch {
+          const { "X-Pantoufa-Proxy": _marker, ...plain } = noOrigin;
+          resp = await fetch(pageUrl, { headers: plain, redirect: "follow", signal: AbortSignal.timeout(8000) });
+        }
+      }
       if (!resp.ok) {
         console.info(`[${label}] static GET ${pageUrl} → ${resp.status}`);
         // Removed file: a definitive failure, not a reason for a 30s capture.
@@ -1432,7 +1458,7 @@ async function extractShare4max(iframeUrl: string): Promise<{ url: string; type:
 async function extractVk(
   iframeUrl: string,
   background = false,
-): Promise<{ url: string; type: "hls" | "mp4" } | null> {
+): Promise<{ url: string; type: "hls" | "mp4"; denied?: boolean } | null> {
   try {
     const canonical = new URL(iframeUrl);
     if (canonical.hostname === "vkvideo.ru") canonical.hostname = "vk.com";
@@ -1450,7 +1476,36 @@ async function extractVk(
       cache: "no-store",
     });
     if (!resp.ok) return null;
-    const html = await resp.text();
+    let html = await resp.text();
+    // vk's embed is now a single-page app: the static HTML carries no stream
+    // URLs, only an anonymous API token the app then uses for video.get. Make
+    // the same call — its JSON has the familiar mp4_<q>/hls/failover_host keys.
+    if (!/"(?:url|mp4_)\d{3,4}"\s*:/.test(html)) {
+      const token = html.match(/"access_token"\s*:\s*"(anonym\.[^"]+)"/)?.[1];
+      const oid = canonical.searchParams.get("oid");
+      const id = canonical.searchParams.get("id");
+      const hash = canonical.searchParams.get("hash");
+      if (token && oid && id) {
+        try {
+          const api = await session.defaultSession.fetch("https://api.vk.com/method/video.get?v=5.289&client_id=6287487", {
+            method: "POST",
+            headers: {
+              "User-Agent": PLAYBACK_UA,
+              "Content-Type": "application/x-www-form-urlencoded",
+              "Referer": "https://vk.com/",
+              "Origin": "https://vk.com",
+              "X-Pantoufa-Proxy": "1",
+            },
+            body: new URLSearchParams({ videos: [oid, id, hash].filter(Boolean).join("_"), access_token: token }).toString(),
+            signal: AbortSignal.timeout(8000),
+            cache: "no-store",
+          });
+          if (api.ok) html += "\n" + (await api.text());
+        } catch (e) {
+          console.warn("[extractVk] video.get failed:", e);
+        }
+      }
+    }
     const unesc = (s: string) => s.replace(/\\\//g, "/").replace(/\\u0026/g, "&").replace(/&amp;/g, "&");
     const candidates: { q: number; url: string }[] = [];
     const re = /"(?:url|mp4_)(\d{3,4})"\s*:\s*"([^"]+)"/g;
@@ -1471,15 +1526,25 @@ async function extractVk(
       }
     }
     const unreachable = new Set<string>();
+    let answered = false;
     for (const candidate of candidates.sort((a, b) => b.q - a.q)) {
       const host = new URL(candidate.url).hostname;
       if (unreachable.has(host)) continue;
       try {
         const probe = await fetch(candidate.url, { headers: { "User-Agent": PLAYBACK_UA, Referer: "https://vk.com/", Range: "bytes=0-1" }, signal: AbortSignal.timeout(4000) });
+        answered = true;
         await probe.body?.cancel();
         if (!probe.ok) continue;
         return { url: candidate.url, type: "mp4" };
       } catch { unreachable.add(host); }
+    }
+    // Every vk CDN host (primary AND failover) timed out: the network can't
+    // reach vk video at all (common on some ISPs). The headless capture and
+    // the iframe would hit the same dead CDN for ~40s — fail now so the
+    // player moves straight to the next server.
+    if (candidates.length && !answered) {
+      console.info("[extractVk] vk video CDN unreachable from this network");
+      return { url: "", type: "mp4", denied: true };
     }
     if (candidates.length) return extractViaCapture(iframeUrl, "extractVk", 30000, background);
     const hls = html.match(/"hls(?:_fmp4)?"\s*:\s*"([^"]+)"/);
@@ -1580,6 +1645,56 @@ function anime4upEdgeHosts(html: string): string[] {
   }
 }
 
+// anime4up's canonical host (w1.anime4up.rest) now 307-redirects every path to
+// a throwaway mirror (4u.dvcei4b.shop, 4y.dr71rvt.shop, …) that rotates without
+// notice, and every link on the mirror's pages is absolute on the mirror. Those
+// .shop hosts tripped the ad heuristic (requests cancelled) and the renderer
+// recognises anime4up URLs by the "anime4up" hostname — so a mirror episode URL
+// was treated as an unknown site, sent to the headless scraper and blocked
+// there: anime4up servers silently vanished. Learn the mirror from the
+// redirect, fetch it directly (no 307 hop per request), allow it past the ad
+// filter, and hand the renderer HTML whose mirror links are rewritten back to
+// the canonical host so every existing anime4up check keeps working.
+const UP4_CANON_HOST = "w1.anime4up.rest";
+const up4MirrorHosts = new Set<string>();
+let up4ActiveMirror: string | null = null;
+function isUp4Host(host: string): boolean {
+  host = (host || "").toLowerCase();
+  return /(^|\.)anime4up\.[a-z]+$/.test(host) || up4MirrorHosts.has(host);
+}
+function noteUp4Mirror(fromUrl: string, toUrl: string | null | undefined): void {
+  try {
+    const from = new URL(fromUrl).hostname.toLowerCase();
+    const to = new URL(String(toUrl || ""), fromUrl).hostname.toLowerCase();
+    if (!isUp4Host(from) || !to || to === from || /anime4up/.test(to)) return;
+    if (up4ActiveMirror !== to) console.info(`[up4-mirror] ${from} → ${to}`);
+    up4MirrorHosts.add(to);
+    up4ActiveMirror = to;
+    allowHost(`https://${to}/`);
+  } catch {}
+}
+// Canonical anime4up URL → the live mirror, so a fetch skips the 307 hop.
+function up4FetchUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    if (up4ActiveMirror && u.hostname.toLowerCase() === UP4_CANON_HOST) {
+      u.hostname = up4ActiveMirror;
+      return u.toString();
+    }
+  } catch {}
+  return raw;
+}
+function canonicalizeUp4Html(html: string): string {
+  if (!up4MirrorHosts.size) return html;
+  let out = html;
+  for (const host of up4MirrorHosts) {
+    out = out.split(`https://${host}`).join(`https://${UP4_CANON_HOST}`)
+      .split(`https:\/\/${host}`).join(`https:\/\/${UP4_CANON_HOST}`)
+      .split(`//${host}/`).join(`//${UP4_CANON_HOST}/`);
+  }
+  return out;
+}
+
 // Chromium (and session fetch) rides the forced DoH resolver below. On several
 // ISPs that resolver answers for Cloudflare-hosted source domains with the
 // carrier's PARKED anycast IPs (measured live: w1.anime4up.rest and the
@@ -1600,6 +1715,7 @@ async function fetchViaSystemDns(
       redirect: "follow",
       signal: AbortSignal.timeout(timeout),
     });
+    if (resp.url && resp.url !== target) noteUp4Mirror(target, resp.url);
     if (!resp.ok) return null;
     return (await resp.text()).replace(/\\\//g, "/");
   } catch (e) {
@@ -1856,10 +1972,11 @@ async function resolveSourceEdgeIps(): Promise<string[]> {
   return [...new Set([...cf, ...google])];
 }
 
-async function fetchSourceViaWorkingEdge(url: string, headers: Record<string, string>, timeout: number): Promise<string | null> {
+const EDGE_REDIRECT = "\u0000redirect:";
+async function fetchSourceViaWorkingEdge(url: string, headers: Record<string, string>, timeout: number, hops = 0): Promise<string | null> {
   try {
     const parsed = new URL(url);
-    if (parsed.hostname !== "anime3rb.com" && parsed.hostname !== "w1.anime4up.rest") return null;
+    if (parsed.hostname !== "anime3rb.com" && !isUp4Host(parsed.hostname)) return null;
     sourceEdgeIpsPromise ||= resolveSourceEdgeIps().catch(() => [] as string[]);
     const ips = await sourceEdgeIpsPromise;
     if (ips.length === 0) { sourceEdgeIpsPromise = null; return null; }
@@ -1875,7 +1992,15 @@ async function fetchSourceViaWorkingEdge(url: string, headers: Record<string, st
           else callback(null, ip, 4);
         },
       }, (res) => {
-        const playerDenial = parsed.hostname === "w1.anime4up.rest" && /^\/Anime4up-S[12]\//i.test(parsed.pathname) && res.statusCode === 403;
+        const playerDenial = isUp4Host(parsed.hostname) && /^\/Anime4up-S[12]\//i.test(parsed.pathname) && res.statusCode === 403;
+        // The edge answered with anime4up's mirror redirect — that IS an answer
+        // (the edge works); follow it below instead of writing the edge off.
+        const location = res.headers?.location;
+        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && location && isUp4Host(parsed.hostname)) {
+          res.resume();
+          resolve(EDGE_REDIRECT + new URL(location, url).toString());
+          return;
+        }
         if (res.statusCode !== 200 && !playerDenial) { res.resume(); resolve(null); return; }
         const chunks: Buffer[] = [];
         let size = 0;
@@ -1936,7 +2061,13 @@ async function fetchSourceViaWorkingEdge(url: string, headers: Record<string, st
       // Self-calibrating: keep the edge that answered at the front of the list.
       const ip = candidates[winner];
       sourceEdgeIpsPromise = Promise.resolve([ip, ...ips.filter((x) => x !== ip)]);
-      return results[winner];
+      const body = results[winner] as string;
+      if (body.startsWith(EDGE_REDIRECT)) {
+        const next = body.slice(EDGE_REDIRECT.length);
+        noteUp4Mirror(url, next);
+        return hops < 2 ? fetchSourceViaWorkingEdge(next, headers, timeout, hops + 1) : null;
+      }
+      return body;
     }
     // Every candidate black-holed — drop the memo so the next call re-resolves.
     sourceEdgeIpsPromise = null;
@@ -2436,6 +2567,9 @@ function registerVideoProxy() {
     }
     if (/share4max|megamax/.test(host)) {
       return { referer: "https://share4max.com/", origin: "https://share4max.com" };
+    }
+    if (/(^|\.)streamruby\.net$/.test(host)) {
+      return { referer: "https://streamruby.net/", origin: "https://streamruby.net" };
     }
     if (/streamruby|rubyvidhub|rubystm|ruby/.test(host)) {
       return { referer: "https://streamruby.com/", origin: "https://streamruby.com" };
@@ -3071,12 +3205,15 @@ app.whenReady().then(() => {
     if (url.hostname !== "anime4up" || !url.pathname.startsWith("/wp-content/uploads/")) {
       return new Response("invalid poster", { status: 400 });
     }
-    const target = `https://w1.anime4up.rest${url.pathname}${url.search}`;
+    const canonical = `https://w1.anime4up.rest${url.pathname}${url.search}`;
+    // The canonical host 307s to the live mirror; go there directly.
+    const target = up4FetchUrl(canonical);
     const headers = { Referer: "https://w1.anime4up.rest/" };
     try {
       let response: Response;
       try {
-        response = await fetch(target, { headers, redirect: "error", signal: AbortSignal.timeout(8000) });
+        response = await fetch(target, { headers, redirect: "follow", signal: AbortSignal.timeout(8000) });
+        if (response.url && response.url !== target) noteUp4Mirror(target, response.url);
       } catch {
         response = await net.fetch(target, { headers, signal: AbortSignal.timeout(8000) });
       }
@@ -3194,7 +3331,7 @@ app.whenReady().then(() => {
       if (inFlightProxyTargets.has(u)) return callback({});
       if (details.resourceType === "image") {
         const imageUrl = new URL(u);
-        if (imageUrl.hostname === "w1.anime4up.rest" && imageUrl.pathname.startsWith("/wp-content/uploads/")) {
+        if (isUp4Host(imageUrl.hostname) && imageUrl.pathname.startsWith("/wp-content/uploads/")) {
           return callback({ redirectURL: `${POSTER_PROTOCOL}://anime4up${imageUrl.pathname}${imageUrl.search}` });
         }
       }
@@ -3235,6 +3372,20 @@ app.whenReady().then(() => {
     callback({});
   });
   session.defaultSession.webRequest.onBeforeRedirect((details) => {
+    // Learn (and un-block) anime4up's rotating mirror before the redirected
+    // request reaches the ad filter in onBeforeRequest.
+    noteUp4Mirror(details.url, details.redirectURL);
+    // Provider embeds hop to rotating mirrors on cheap TLDs (rubyvidhub.com →
+    // nuvorel.top) that the TLD ad heuristic cancels — the "streamruby never
+    // plays natively" bug. A server-side redirect from a host we already
+    // trust is the provider's own mirror; allow it unless the target is a
+    // named ad network (TLD rule neutralised by testing it as .com).
+    try {
+      const from = new URL(details.url).hostname.toLowerCase();
+      const to = new URL(details.redirectURL).hostname.toLowerCase();
+      if (to && to !== from && (dynamicAllowedHosts.has(from) || providerRefererForHost(from)) &&
+          !AD_HOST_RE.test(to.replace(/\.[a-z]+$/, ".com"))) allowHost(details.redirectURL);
+    } catch {}
     const token = details.url.match(/^https:\/\/witanime\.site\/watch\/stream-gate\/([a-f0-9]{64})$/i)?.[1];
     if (!token || !/^https?:\/\//i.test(details.redirectURL)) return;
     if (witGateRedirects.size >= 256) witGateRedirects.delete(witGateRedirects.keys().next().value!);
@@ -3408,7 +3559,7 @@ app.whenReady().then(() => {
           ref = "https://anime3rb.com/";
           ori = "";
           force = true;
-        } else if (/anime4up/.test(host)) {
+        } else if (isUp4Host(host)) {
           // anime4up's poster CDN (w1.anime4up.rest/wp-content) hotlink-checks
           // the Referer: it 403s the app's dev localhost Referer but serves 200
           // with an anime4up site Referer (or none). Only witanime posters skip
@@ -3738,10 +3889,16 @@ app.whenReady().then(() => {
       const url = new URL(String(rawUrl || ""));
       if (url.protocol !== "http:" && url.protocol !== "https:") return finish(false, 0);
       allowHost(url.toString());
+      // Same client fingerprint as the playback proxy and the extractors:
+      // several CDNs bind the signed URL to the UA that fetched the embed, and
+      // the session default UA carries an Electron token.
+      const ua = mainWindow?.webContents.getUserAgent() || PLAYBACK_UA;
       const attempt = async (headers: Record<string, string>) => {
         const res = await session.defaultSession.fetch(url.toString(), {
           method: "GET",
-          headers,
+          // Accept-Language too: streamruby's token covers UA + language, and
+          // the proxy/extractors all send this exact value.
+          headers: { "User-Agent": ua, "Accept-Language": "en-US,en;q=0.9", ...headers },
           signal: controller.signal,
           redirect: "follow",
         });
@@ -3811,7 +3968,7 @@ app.whenReady().then(() => {
   // sources manifest → prime token → gate redirect. Resolve that redirect in
   // the privileged main process so the renderer receives real provider embeds
   // that its native extractors can play.
-  ipcMain.handle("pantoufa:wit-servers", async (_evt, rawUrl: string) => {
+  ipcMain.handle("pantoufa:wit-servers", async (evt, rawUrl: string) => {
     try {
       const episode = new URL(rawUrl);
       if (episode.protocol !== "https:" || episode.hostname !== "witanime.site" || !episode.pathname.startsWith("/watch/")) return null;
@@ -3842,7 +3999,47 @@ app.whenReady().then(() => {
       // (a cross-origin redirect is unreadable from the page's fetch), and is
       // the REAL provider embed the native extractors can play.
       const gateRedirects = witGateRedirects;
+      type WitServer = { id: string; name: string; iframeUrl: string; provider: string; sandbox?: string | false; referrerPolicy?: string };
+      type HandshakeItem = { label?: string; quality?: string; token?: string; iframeUrl?: string; sandbox?: string | false; referrerPolicy?: string };
+      // Gate rows → servers. Unlanded gates ship as stream-gate iframes only in
+      // the FINAL result (allowGates); progress emits landed embeds only.
+      const toServers = (items: unknown, allowGates: boolean): WitServer[] => {
+        const servers: WitServer[] = [];
+        if (!Array.isArray(items)) return servers;
+        for (const item of items as HandshakeItem[]) {
+          const token = String(item?.token || "");
+          // Debug/diagnostic rows carry no token — never surface them.
+          if (!/^[a-f0-9]{64}$/i.test(token)) continue;
+          let target = item.iframeUrl || gateRedirects.get(token) || "";
+          if (!/^https?:\/\//i.test(target)) {
+            // MEGA only plays through the native stream (no iframe fallback),
+            // which needs the real mega.nz link — an unresolved gate is dead.
+            if (!allowGates || providerForLabel(String(item.label || "")) === "mega") continue;
+            target = `${episode.origin}/watch/stream-gate/${token}`;
+          }
+          if (servers.some((s) => s.iframeUrl === target)) continue;
+          servers.push({
+            id: token,
+            name: `${item.label || "witanime"} ${item.quality || ""}`.trim(),
+            iframeUrl: target,
+            provider: providerForLabel(String(item.label || "")),
+            sandbox: item.sandbox,
+            referrerPolicy: item.referrerPolicy,
+          });
+        }
+        return servers;
+      };
+      let progressCount = 0;
+      const witT0 = Date.now();
       const handshake: unknown = await enqueue({
+          onProgress: (value: unknown) => {
+            const progress = value as { animeTitle?: string; items?: unknown } | null;
+            const servers = toServers(progress?.items, false);
+            if (servers.length <= progressCount || evt.sender.isDestroyed()) return;
+            progressCount = servers.length;
+            console.info(`[wit-servers] +${Date.now() - witT0}ms partial: ${servers.map((s) => s.name).join(", ")}`);
+            evt.sender.send("pantoufa:wit-servers-progress", { url: rawUrl, servers, animeTitle: progress?.animeTitle || "" });
+          },
           url: episode.toString(),
           injectAfter: `new Promise((resolve) => {
             (async () => {
@@ -3850,6 +4047,7 @@ app.whenReady().then(() => {
                 // Cloudflare interstitials / late hydration: wait for the
                 // player config to exist before giving up.
                 const waitStart = Date.now();
+                const __t = { start: waitStart };
                 while (!document.querySelector('[x-data*="watchPlayer"]') && Date.now() - waitStart < 20000) {
                   // witanime's rate-limit page never hydrates a player — bail
                   // now instead of idling out the whole 20s wait.
@@ -3888,6 +4086,7 @@ app.whenReady().then(() => {
                   if (!manifestResp.ok) { resolve([{ debug: "manifest-" + manifestResp.status }]); return; }
                   manifest = await manifestResp.json();
                 }
+                __t.manifest = Date.now() - waitStart;
                 const entries = [];
                 const seen = {};
                 Object.keys(manifest.players || {}).forEach((q) => {
@@ -3898,8 +4097,15 @@ app.whenReady().then(() => {
                     entries.push({ quality: q, label: label, token: e.token });
                   });
                 });
-                const rank = (l) => l.includes("hgcloud") ? 0 : l.includes("videa") ? 1 : l.includes("mp4upload") ? 2 : 3;
+                const rank = (l) => l.includes("hgcloud") ? 0 : l.includes("videa") ? 1 : l.includes("mp4upload") ? 2 : /vik(?:i|1)ngfile/.test(l) ? 3 : l.includes("mega") ? 4 : 9;
                 entries.sort((a, b) => rank(a.label) - rank(b.label));
+                // Every primed token is two more /watch/ hits against a limiter
+                // that locks the whole IP out for 20+ minutes. Hosts the app
+                // can't play natively (4shared, …) only ever iframe-play, so
+                // skip them whenever natively playable ones exist.
+                if (entries.filter((e) => rank(e.label) < 9).length >= 2) {
+                  for (let i = entries.length - 1; i >= 0; i--) if (rank(entries[i].label) >= 9) entries.splice(i, 1);
+                }
                 const out = [{ animeTitle: document.querySelector('main h1')?.textContent?.trim() || "", pageTitle: document.title }];
                 // ProviderBrowser (WebView2) writes each gate's 302 target into
                 // window.__pantoufaGateRedirects as it lands, so wait only until
@@ -3931,11 +4137,35 @@ app.whenReady().then(() => {
                     await new Promise((r) => setTimeout(r, 150));
                   }
                 };
+                // Stream each gate's target out the moment it lands so the
+                // player can list (and warm) that server immediately instead
+                // of waiting for the slowest gate and the retry round.
+                const posted = {};
+                const postProgress = () => {
+                  if (!inWebView) return;
+                  const g = window.__pantoufaGateRedirects || {};
+                  if (!out.some((item) => item.token && g[item.token] && !posted[item.token])) return;
+                  const items = out.filter((item) => item.token && g[item.token]).map((item) => {
+                    posted[item.token] = 1;
+                    return { label: item.label, quality: item.quality, token: item.token, iframeUrl: g[item.token], sandbox: item.sandbox, referrerPolicy: item.referrerPolicy };
+                  });
+                  try { window.chrome.webview.postMessage({ pantoufaProgress: { animeTitle: out[0].animeTitle, items } }); } catch (e) {}
+                };
+                const progressTimer = setInterval(postProgress, 200);
+                __t.prime = [];
+                let primeGap = 700;
                 for (const e of entries) {
                   try {
+                    const __p0 = Date.now();
                     let ready = await fetch("/watch/stream-source/" + e.token, { method: "POST", headers });
+                    __t.prime.push(e.label + ":" + ready.status + ":" + (Date.now() - __p0));
                     if (ready.status === 429) {
-                      await new Promise((r) => setTimeout(r, 900));
+                      // The token endpoint allows a burst of ~2 then refills
+                      // slowly; slow the rest of the round down instead of
+                      // collecting a 429 per entry (each one feeds the long
+                      // /watch/ lockout).
+                      primeGap = 1300;
+                      await new Promise((r) => setTimeout(r, 1300));
                       ready = await fetch("/watch/stream-source/" + e.token, { method: "POST", headers });
                     }
                     if (!ready.ok) continue;
@@ -3949,14 +4179,16 @@ app.whenReady().then(() => {
                     document.body.appendChild(frame);
                     out.push({ label: e.label, quality: e.quality, token: e.token, sandbox: settings.sandbox, referrerPolicy: settings.referrerPolicy });
                   } catch (err) {}
-                  await new Promise((r) => setTimeout(r, 700));
+                  await new Promise((r) => setTimeout(r, primeGap));
                 }
                 // The gate's anti-bot layer rejects fetch (Sec-Fetch-Mode:
                 // cors) and top-level navigations, but accepts IFRAME
                 // navigations (measured live: fetch → 404, iframe → 302).
                 // Attach a hidden iframe per gate; main captures each
                 // redirectURL via onBeforeRedirect.
+                __t.primed = Date.now() - waitStart;
                 await waitForGates(inWebView ? 6000 : 10000);
+                __t.gates = Date.now() - waitStart;
                 // Retry only gates the Windows browser saw fail; no second manifest.
                 if (window.__pantoufaGateRedirects) {
                   for (const item of out) if (item.token && !window.__pantoufaGateRedirects[item.token]) {
@@ -3972,6 +4204,9 @@ app.whenReady().then(() => {
                   await waitForGates(inWebView ? 3000 : 4000);
                 }
                 for (const item of out) if (item.token) item.iframeUrl = window.__pantoufaGateRedirects?.[item.token];
+                clearInterval(progressTimer);
+                __t.done = Date.now() - waitStart;
+                out[0].timing = __t;
                 resolve(out);
               } catch (err) { resolve([{ debug: "catch: " + String(err).slice(0, 160), href: location.href }]); }
             })();
@@ -3985,31 +4220,14 @@ app.whenReady().then(() => {
       const needsSettle = Array.isArray(handshake) && (handshake as { token?: string; iframeUrl?: string }[])
         .some((item) => item?.token && !item.iframeUrl);
       if (needsSettle) await new Promise((resolve) => setTimeout(resolve, 800));
-      const servers: { id: string; name: string; iframeUrl: string; provider: string; sandbox?: string | false; referrerPolicy?: string }[] = [];
       if (Array.isArray(handshake) && handshake.length && (handshake[0] as any)?.debug) {
         console.info(`[wit-servers] handshake detail: ${JSON.stringify(handshake).slice(0, 400)}`);
         // Tell the renderer so it skips its static + headless fallbacks: they
         // hit the same limiter and only extend the lockout.
         if ((handshake[0] as any).debug === "rate-limited") return { servers: [], episodeTitle: "", animeTitle: "", rateLimited: true };
       }
-      if (Array.isArray(handshake)) {
-        for (const item of handshake as { label?: string; quality?: string; token?: string; iframeUrl?: string; sandbox?: string | false; referrerPolicy?: string }[]) {
-          const token = String(item?.token || "");
-          // Debug/diagnostic rows carry no token — never surface them.
-          if (!/^[a-f0-9]{64}$/i.test(token)) continue;
-          let target = item.iframeUrl || gateRedirects.get(token) || "";
-          if (!/^https?:\/\//i.test(target)) target = `${episode.origin}/watch/stream-gate/${token}`;
-          if (servers.some((s) => s.iframeUrl === target)) continue;
-          servers.push({
-            id: token,
-            name: `${item.label || "witanime"} ${item.quality || ""}`.trim(),
-            iframeUrl: target,
-            provider: providerForLabel(String(item.label || "")),
-            sandbox: item.sandbox,
-            referrerPolicy: item.referrerPolicy,
-          });
-        }
-      }
+      const servers = toServers(handshake, true);
+      console.info(`[wit-servers] handshake ${Date.now() - witT0}ms timing=${JSON.stringify((Array.isArray(handshake) && (handshake[0] as any)?.timing) || null)}`);
       if (servers.length) console.info(`[wit-servers] ${servers.length} ready (${servers.map((s) => `${s.name} → ${s.iframeUrl.slice(0, 50)}`).join(", ")})`);
       const deent = (value: string) => value.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
       // The new witanime watch page has no dedicated episode heading: its only
@@ -4088,10 +4306,25 @@ app.whenReady().then(() => {
   // "servers take forever / sometimes never show" symptom. Retry each GET a few
   // times with a short per-attempt timeout and a small growing backoff so a
   // transient miss self-heals in well under a second instead of bubbling up.
-  ipcMain.handle("pantoufa:fetch-html", async (
-    _evt,
-    opts: { url: string; referer?: string; attempts?: number; timeoutMs?: number; accept?: string },
-  ): Promise<string | null> => {
+  type FetchHtmlOpts = { url: string; referer?: string; attempts?: number; timeoutMs?: number; accept?: string };
+  ipcMain.handle("pantoufa:fetch-html", async (_evt, opts: FetchHtmlOpts): Promise<string | null> => {
+    // anime4up: go straight to the live mirror (see noteUp4Mirror) and hand the
+    // renderer canonical w1.anime4up.rest links whichever host answered.
+    const requested = opts.url;
+    const isUp4 = (() => { try { return isUp4Host(new URL(requested).hostname); } catch { return false; } })();
+    if (!isUp4) return fetchHtmlOnce(opts);
+    const target = up4FetchUrl(requested);
+    let html = await fetchHtmlOnce({ ...opts, url: target });
+    // The remembered mirror rotated away — retry via the canonical host, whose
+    // redirect teaches us the new mirror.
+    if (!html && target !== requested) {
+      if (up4ActiveMirror && target.includes(up4ActiveMirror)) up4ActiveMirror = null;
+      html = await fetchHtmlOnce(opts);
+    }
+    return html ? canonicalizeUp4Html(html) : html;
+  });
+
+  async function fetchHtmlOnce(opts: FetchHtmlOpts): Promise<string | null> {
     // anime3rb's edge does NOT 404 unknown paths — it TARPITS them (the
     // connection hangs until our timeout), and a burst of stalled probes gets
     // the whole site blackholed for a while. Callers probing such hosts pass
@@ -4134,6 +4367,7 @@ app.whenReady().then(() => {
           headers: sourceHeaders,
         });
         clearTimeout(t);
+        if (res.url && res.url !== opts.url) noteUp4Mirror(opts.url, res.url);
         if (res.ok) return await res.text();
         // Retry the transient/edge statuses (rate-limit, Cloudflare, 5xx);
         // a hard 4xx (404/410) won't change on retry, so bail immediately.
@@ -4162,7 +4396,7 @@ app.whenReady().then(() => {
       await new Promise((r) => setTimeout(r, retryDelayMs));
     }
     return null;
-  });
+  }
 
   // ── Offline downloads ──
   // Stream a resolved progressive .mp4 to <userData>/downloads/<id>.mp4 with the

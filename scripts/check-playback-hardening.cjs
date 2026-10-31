@@ -61,7 +61,7 @@ function run(source, context) {
   assert.equal(chunk(false, false, 'bytes=0-'), 'bytes=0-', 'non-media Range untouched');
 
   // ── 2. applyAudioIntent: heal drift without fighting the user ──
-  const audioSrc = providers.match(/export function applyAudioIntent[\s\S]*?(?=\n\nexport function createGenerationGuard)/)?.[0]?.replace(/^export /, '');
+  const audioSrc = providers.match(/export function applyAudioIntent[\s\S]*?(?=\r?\n\r?\nexport function createGenerationGuard)/)?.[0]?.replace(/^export /, '');
   assert.ok(audioSrc, 'applyAudioIntent found');
   const audioCtx = {};
   run(`${audioSrc}\nglobalThis.applyAudioIntent = applyAudioIntent;`, audioCtx);

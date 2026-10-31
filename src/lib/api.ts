@@ -15,6 +15,7 @@ import {
   scrapeAnime4upServersDirect,
   scrapeAnime4upEpisodePageDirect,
   scrapeWitanimeEpisodePageDirect,
+  subscribeWitanimePartial,
   searchAnime4upDirect,
   searchAnime4upDirectList,
   searchWitanimeDirectList,
@@ -39,6 +40,7 @@ import { writeCloudHome, readCloudHome } from "./homeCloudCache";
 import { readCloudMetadata, writeCloudMetadata } from "./metadataCache";
 import {
   anime4upEpisodeUrl,
+  canonicalUp4Url,
   episodeNumberFromUrl,
   mergePlayableServers,
   mergeVideoServers,
@@ -834,7 +836,7 @@ export function fetchVideoServers(episodeUrl: string, url4up?: string, force = f
   if (force) serversCache.delete(key);
   const hit = serversCache.get(key);
   if (hit && Date.now() - hit.ts < SERVERS_TTL) return hit.promise;
-  const promise = doFetchVideoServers(episodeUrl, url4up)
+  const promise = doFetchVideoServers(episodeUrl, url4up, force)
     // An empty list (rate limit, transient block) must not stick for the TTL.
     .then((payload) => { if (!payload.data.servers.length) serversCache.delete(key); return payload; })
     .catch((e) => { serversCache.delete(key); throw e; });
@@ -852,7 +854,21 @@ export function invalidateServersCache(episodeUrl: string) {
   }
 }
 
-async function doFetchVideoServers(episodeUrl: string, url4up?: string) {
+// Resolved witanime embeds per episode. The gate targets are plain provider
+// embed URLs (hgcloud.to/e/<code>, mp4upload embed-<code>) that stay valid for
+// days, while resolving them costs ~15 /watch/ requests — and witanime's rate
+// limiter locks /watch/ out IP-wide for 20+ minutes once tripped, which is when
+// witanime servers "don't show". A revisit (or the next app start) is served
+// from here with zero witanime traffic. A partial list (some gates unresolved)
+// is kept briefly; a manual refresh (force) always re-resolves.
+const WIT_SERVERS_PREFIX = "@wit_servers_v1:";
+const WIT_SERVERS_COMPLETE_TTL = 6 * 60 * 60 * 1000;
+const WIT_SERVERS_PARTIAL_TTL = 15 * 60 * 1000;
+type WitServersCache = { servers: RawServer[]; episodeTitle: string; animeTitle: string; complete: boolean };
+const isWitGateUrl = (url: string) => /witanime\.[a-z]+\/watch\/stream-gate\//i.test(url);
+
+async function doFetchVideoServers(rawEpisodeUrl: string, url4up?: string, force = false) {
+  const episodeUrl = canonicalUp4Url(rawEpisodeUrl);
   const primaryIsUp4 = /anime4up/i.test(episodeUrl);
   // Fast lane for anime4up-primary episodes: the entire server list lives in
   // the static HTML, so a single privileged GET returns it in well under a
@@ -875,11 +891,26 @@ async function doFetchVideoServers(episodeUrl: string, url4up?: string) {
     // Cloudflare gate and frequently comes back empty — so decode the registry
     // straight from the static HTML. Falls back to headless when the direct
     // decode yields nothing (older pages that still ship plain iframes).
-    try {
+    const cacheKey = WIT_SERVERS_PREFIX + episodeUrl.replace(/\/+$/, "");
+    const cached = force ? null : await readCacheEntry<WitServersCache>(cacheKey, WIT_SERVERS_COMPLETE_TTL);
+    if (cached && cached.data.servers.length && (cached.data.complete || Date.now() - cached.ts < WIT_SERVERS_PARTIAL_TTL)) {
+      console.info(`[servers] witanime servers from cache: ${cached.data.servers.length}`);
+      primary = { source: "witanime", servers: cached.data.servers, episodeTitle: cached.data.episodeTitle, animeTitle: cached.data.animeTitle, up4EpisodeUrl: null, direct: true };
+    }
+    if (!primary) try {
       const direct = await scrapeWitanimeEpisodePageDirect(episodeUrl);
       if (direct) {
         console.info(`[servers] direct witanime parse: ${direct.servers.length} servers`);
         primary = { source: "witanime", servers: direct.servers, episodeTitle: direct.episodeTitle, animeTitle: direct.animeTitle, up4EpisodeUrl: null, direct: true };
+        const resolvedEmbeds = direct.servers.filter((server) => !isWitGateUrl(server.iframeUrl));
+        if (resolvedEmbeds.length) {
+          void writeCache(cacheKey, {
+            servers: resolvedEmbeds,
+            episodeTitle: direct.episodeTitle,
+            animeTitle: direct.animeTitle,
+            complete: resolvedEmbeds.length === direct.servers.length,
+          } satisfies WitServersCache);
+        }
       }
     } catch { /* fall through to headless */ }
   }
@@ -908,7 +939,7 @@ async function doFetchVideoServers(episodeUrl: string, url4up?: string) {
   // A direct anime4up episode link harvested off the witanime page lets the
   // watch screen enrich anime4up servers immediately, skipping the slow
   // cross-source search. Prefer an explicit ?up4= but fall back to it.
-  const harvestedUp4 = (!primaryIsUp4 && primary?.up4EpisodeUrl && /\/episode\/|الحلقة/i.test(primary.up4EpisodeUrl)) ? primary.up4EpisodeUrl : null;
+  const harvestedUp4 = (!primaryIsUp4 && primary?.up4EpisodeUrl && /\/episode\/|الحلقة/i.test(primary.up4EpisodeUrl)) ? canonicalUp4Url(primary.up4EpisodeUrl) : null;
   return { success: true, data: { episodeTitle: primary?.episodeTitle || "", animeTitle: primary?.animeTitle || "", animeHref: "", serverCount: merged.length, servers: merged, up4EpisodeUrl: harvestedUp4, navigation: { prev: null, next: null } } };
 }
 
@@ -950,12 +981,12 @@ export async function resolveUp4EpisodeUrl(animeTitle: string, epNumber: number)
   if (!animeTitle || epNumber == null) return null;
   const key = `${animeTitle.toLowerCase().trim()}#${epNumber}`;
   const hit = up4EpUrlCache.get(key);
-  if (hit && Date.now() - hit.ts < UP4_CACHE_TTL) return hit.url;
+  if (hit && Date.now() - hit.ts < UP4_CACHE_TTL) return hit.url && canonicalUp4Url(hit.url);
   // Successful resolutions are persisted, so revisiting an episode after an
   // app restart serves the anime4up URL instantly instead of re-running the
   // search + episode-list fetches (the main "servers take a while" cost).
   const stored = await readCache<string>(UP4_EP_URL_PREFIX + key, UP4_CACHE_TTL);
-  if (stored) { up4EpUrlCache.set(key, { url: stored, ts: Date.now() }); return stored; }
+  if (stored) { up4EpUrlCache.set(key, { url: stored, ts: Date.now() }); return canonicalUp4Url(stored); }
   console.info(`[up4-resolve] searching anime4up for "${animeTitle}" ep ${epNumber}`);
   let animeUrl: string | null = null;
   for (const v of searchVariants(animeTitle)) {
@@ -984,6 +1015,7 @@ export async function resolveUp4EpisodeUrl(animeTitle: string, epNumber: number)
     url = r.url;
     definitive = r.definitive;
   } catch (e) { console.warn(`[up4-resolve] episode lookup threw:`, e); }
+  if (url) url = canonicalUp4Url(url);
   if (url) console.info(`[up4-resolve] found ep ${epNumber}: ${url}`);
   else if (definitive) {
     definitiveMiss.add(missKey("anime4up", animeTitle, epNumber));
@@ -1238,6 +1270,17 @@ export async function fetchAnime3rbEpisodes(animeTitle: string): Promise<Episode
 
 // ── Complete three-source server discovery ──
 
+// "black-clover-2nd-season" from https://witanime.site/watch/black-clover-2nd-season/3
+function witanimeSlugTitle(url: string): string {
+  try {
+    const u = new URL(url);
+    if (!/witanime/i.test(u.hostname)) return "";
+    const m = decodeURIComponent(u.pathname).match(/\/(?:watch|episode)\/(?:movie\/)?([^/]+)/i);
+    if (!m) return "";
+    return m[1].split(/-?الحلقة/)[0].replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
+  } catch { return ""; }
+}
+
 export type CompleteVideoServersPayload = {
   success: boolean;
   data: {
@@ -1291,7 +1334,8 @@ function completePayload(
 export function fetchCompleteVideoServers(
   options: CompleteVideoServersOptions,
 ): Promise<CompleteVideoServersPayload> {
-  const episodeUrl = normalizeServerUrl(options.episodeUrl) || options.episodeUrl;
+  options = { ...options, url4up: options.url4up ? canonicalUp4Url(options.url4up) : options.url4up };
+  const episodeUrl = canonicalUp4Url(normalizeServerUrl(options.episodeUrl) || options.episodeUrl);
   const key = JSON.stringify([
     episodeUrl,
     options.url4up || "",
@@ -1443,6 +1487,7 @@ export function fetchCompleteVideoServers(
 
     const observedPrimary = primaryPromise.then((payload) => {
       primaryResult = payload;
+      if (payload?.data.servers.length) discovered.delete("primary-partial");
       resolvedTitle = initialTitle || payload?.data.animeTitle || "";
       if (payload?.data.servers.length) {
         discovered.set("primary", payload.data.servers);
@@ -1464,6 +1509,16 @@ export function fetchCompleteVideoServers(
       }
       return payload;
     });
+    // witanime-primary: list each witanime server the moment its gate lands
+    // instead of after the whole ~15s handshake.
+    const primaryIsWit = !primaryIsUp4 && !primaryIsA3rb && /witanime/i.test(episodeUrl);
+    const stopWitPartial = primaryIsWit
+      ? subscribeWitanimePartial(episodeUrl, (servers) => {
+          if (discovered.has("primary") || !servers.length) return;
+          discovered.set("primary-partial", servers.map((server) => ({ ...server, source: "witanime" })));
+          emitCandidates(primaryResult);
+        })
+      : null;
     const observeA3rb = (promise: Promise<VideoServer[]>) => promise.then((servers) => {
       if (servers.length) {
         discovered.set("anime3rb", servers);
@@ -1476,9 +1531,15 @@ export function fetchCompleteVideoServers(
     // the start: a fast fallback is surfaced even while the primary is slow.
     // Legacy links without a title start fallbacks as soon as primary metadata
     // supplies one.
-    let up4Promise = initialTitle || options.url4up ? loadUp4(initialTitle) : null;
+    // Links without a title (history, deep links) used to hold anime4up and
+    // anime3rb back until the slow witanime handshake reported one. The
+    // /watch/<slug>/<n> slug is a good search title already — start with it,
+    // and retry below with the page's real title only if the slug missed.
+    const slugTitle = initialTitle ? "" : witanimeSlugTitle(episodeUrl);
+    const earlyTitle = initialTitle || slugTitle;
+    let up4Promise = earlyTitle || options.url4up ? loadUp4(earlyTitle) : null;
     let witPromise = initialTitle || options.animeHref ? observeWit(loadWit(initialTitle)) : null;
-    let a3rbPromise = initialTitle || options.url3rb || primaryIsA3rb ? loadA3rb(initialTitle) : null;
+    let a3rbPromise = earlyTitle || options.url3rb || primaryIsA3rb ? loadA3rb(earlyTitle) : null;
     let observedUp4 = up4Promise ? observeUp4(up4Promise) : null;
     let observedA3rb = a3rbPromise ? observeA3rb(a3rbPromise) : null;
 
@@ -1493,6 +1554,12 @@ export function fetchCompleteVideoServers(
     if (!a3rbPromise) {
       a3rbPromise = loadA3rb(resolvedTitle);
       observedA3rb = observeA3rb(a3rbPromise);
+    }
+    const sameTitle = (a: string, b: string) => a.toLowerCase().replace(/[^a-z0-9]+/g, "") === b.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    if (slugTitle && resolvedTitle && !sameTitle(slugTitle, resolvedTitle)) {
+      const realTitle = resolvedTitle;
+      if (observedUp4) observedUp4 = observedUp4.then((payload) => payload?.data.servers.length ? payload : observeUp4(loadUp4(realTitle)));
+      if (observedA3rb) observedA3rb = observedA3rb.then((servers) => servers.length ? servers : observeA3rb(loadA3rb(realTitle)));
     }
 
     const remaining = Math.max(1, deadline - Date.now());
@@ -1555,6 +1622,7 @@ export function fetchCompleteVideoServers(
       }
     }));
 
+    stopWitPartial?.();
     const directServers = directCandidates.flatMap((candidate) => {
       const hit = playable.get(candidate.iframeUrl);
       return hit ? [hit] : [];

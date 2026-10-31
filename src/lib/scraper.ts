@@ -234,7 +234,9 @@ function parseUp4Servers(html: string): RawServer[] {
   const re = /<li[^>]*\sdata-watch=["']([^"']+)["'][^>]*>\s*<a[^>]*>([\s\S]*?)<\/a>/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(scope))) {
-    const src = normalizeEmbedUrl((m[1] || "").trim());
+    // Attribute values are HTML-escaped: vk's data-watch carries "&amp;id=…",
+    // and the literal "&amp;" made every vk embed request fail.
+    const src = normalizeEmbedUrl((m[1] || "").trim().replace(/&amp;/gi, "&").replace(/&#0?38;/g, "&"));
     if (!src || src.indexOf("http") !== 0 || seen.has(src)) continue;
     if (/google|facebook|pyppo|popads|disqus/.test(src)) continue;
     try {
@@ -312,6 +314,43 @@ function parseWitServers(html: string): RawServer[] {
   return out;
 }
 
+// Partial witanime results: the main-process handshake emits each server as its
+// gate lands (the full handshake can take ~15s). Listeners are keyed by the
+// rewritten episode URL so callers can subscribe with any form of it.
+const witPartialListeners = new Map<string, Set<(servers: RawServer[], animeTitle: string) => void>>();
+const witPartialKey = (url: string) => { try { return new URL(rewriteWitUrl(url)).toString().replace(/\/+$/, ""); } catch { return url; } };
+let witPartialBridge: (() => void) | null = null;
+export function subscribeWitanimePartial(episodeUrl: string, fn: (servers: RawServer[], animeTitle: string) => void): () => void {
+  const key = witPartialKey(episodeUrl);
+  let set = witPartialListeners.get(key);
+  if (!set) witPartialListeners.set(key, (set = new Set()));
+  set.add(fn);
+  if (!witPartialBridge && window.pantoufa.onWitServersProgress) {
+    witPartialBridge = window.pantoufa.onWitServersProgress((info) => {
+      const listeners = witPartialListeners.get(witPartialKey(info.url));
+      if (!listeners?.size) return;
+      const servers = mapWitServers(info.servers);
+      for (const listener of listeners) { try { listener(servers, info.animeTitle || ""); } catch {} }
+    });
+  }
+  return () => {
+    set!.delete(fn);
+    if (!set!.size) witPartialListeners.delete(key);
+  };
+}
+
+function mapWitServers(servers: { id: string; name: string; iframeUrl: string; provider?: string }[]): RawServer[] {
+  return servers.map((server) => ({
+    ...server,
+    iframeUrl: normalizeEmbedUrl(server.iframeUrl),
+    // The main-process handshake classifies by the manifest LABEL
+    // (hgcloud→streamwish, videa→videa, mega→mega, …) because the gate URL
+    // itself carries no provider pattern. Fall back to host classification
+    // for older preloads that don't send it.
+    provider: server.provider || classifyProvider(server.iframeUrl, server.name),
+  }));
+}
+
 // Full witanime episode-page parse (servers + display titles) from one static
 // GET. Returns null on fetch/decode failure so the caller falls back to the
 // headless scrape (older episodes that predate the _zX/_zK scheme still render
@@ -331,15 +370,7 @@ export async function scrapeWitanimeEpisodePageDirect(
     return {
       episodeTitle: current.episodeTitle,
       animeTitle: current.animeTitle,
-      servers: current.servers.map((server) => ({
-        ...server,
-        iframeUrl: normalizeEmbedUrl(server.iframeUrl),
-        // The main-process handshake classifies by the manifest LABEL
-        // (hgcloud→streamwish, videa→videa, mega→mega, …) because the gate URL
-        // itself carries no provider pattern. Fall back to host classification
-        // for older preloads that don't send it.
-        provider: server.provider || classifyProvider(server.iframeUrl, server.name),
-      })),
+      servers: mapWitServers(current.servers),
     };
   }
   const html = await window.pantoufa.fetchHtml?.(resolvedUrl, WIT_BASE + "/");

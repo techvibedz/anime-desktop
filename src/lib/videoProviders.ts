@@ -56,6 +56,29 @@ export function episodeNumberFromUrl(raw: string): number | null {
   return match ? parseInt(match[1], 10) : null;
 }
 
+// anime4up's canonical host 307s to a rotating throwaway mirror
+// (4u.dvcei4b.shop, 4y.dr71rvt.shop, …) whose pages link absolutely to the
+// mirror. Everything in the app recognises anime4up by its canonical hostname,
+// so fold mirror page URLs (and stale cached ones) back onto it; the main
+// process maps the canonical host to the live mirror when fetching.
+export const UP4_CANONICAL_HOST = "w1.anime4up.rest";
+export function canonicalUp4Url(raw: string | null | undefined): string {
+  const value = String(raw || "");
+  try {
+    const u = new URL(value);
+    const host = u.hostname.toLowerCase();
+    if (/(^|\.)anime4up\.[a-z]+$/.test(host) || (/\.shop$/.test(host) && /^\/(?:episode|anime)\//i.test(u.pathname))) {
+      u.hostname = UP4_CANONICAL_HOST;
+      return u.toString();
+    }
+  } catch {}
+  return value;
+}
+
+export function isUp4Url(raw: string | null | undefined): boolean {
+  return /anime4up/i.test(canonicalUp4Url(raw));
+}
+
 export function anime4upEpisodeUrl(title: string, episodeNumber: number): string | null {
   const slug = String(title || "")
     .normalize("NFKD")

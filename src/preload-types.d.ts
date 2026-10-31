@@ -57,6 +57,7 @@ declare global {
         animeTitle: string;
         rateLimited?: boolean;
       } | null>;
+      onWitServersProgress?: (handler: (info: { url: string; servers: { id: string; name: string; iframeUrl: string; provider?: string }[]; animeTitle: string }) => void) => () => void;
       downloadStart: (opts: { id: string; url: string; provider: string }) => Promise<{ ok: boolean; total?: number }>;
       downloadDelete: (id: string) => Promise<boolean>;
       downloadQuery: (id: string) => Promise<{ exists: boolean; valid: boolean; size: number }>;
