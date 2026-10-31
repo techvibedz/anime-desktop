@@ -3876,6 +3876,35 @@ app.whenReady().then(() => {
   // (only known to the renderer), so a failed first attempt is retried with the
   // embed origin explicitly and the X-Pantoufa-Proxy marker, which tells that
   // handler to leave the headers alone (same mechanism the video proxy uses).
+  // Is a manga page image still there? Sources delete uploads while the
+  // chapter page keeps listing them (3asq Naruto 590-700 are all 404), and the
+  // renderer can't read a cross-origin status, so the reader asks here.
+  // status 0 = network error/timeout (callers treat it as alive).
+  ipcMain.handle("pantoufa:probe-manga-page", async (
+    _evt,
+    opts: { url: string; referer?: string },
+  ): Promise<{ status: number; contentType: string; challenge: boolean }> => {
+    try {
+      const url = new URL(String(opts?.url || ""));
+      if (url.protocol !== "http:" && url.protocol !== "https:") return { status: 0, contentType: "", challenge: false };
+      allowHost(url.toString());
+      const headers: Record<string, string> = {
+        "User-Agent": mainWindow?.webContents.getUserAgent() || PLAYBACK_UA,
+        Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
+        Range: "bytes=0-1023",
+        // Keep our Referer: the onBeforeSendHeaders handler skips marked requests.
+        "X-Pantoufa-Proxy": "1",
+      };
+      if (opts?.referer) headers.Referer = opts.referer;
+      const res = await session.defaultSession.fetch(url.toString(), { headers, signal: AbortSignal.timeout(6000), redirect: "follow" });
+      void res.body?.cancel().catch(() => {});
+      // A Cloudflare challenge is a 403/503 HTML page too — not a deleted file.
+      return { status: res.status, contentType: res.headers.get("content-type") || "", challenge: !!res.headers.get("cf-mitigated") };
+    } catch {
+      return { status: 0, contentType: "", challenge: false };
+    }
+  });
+
   ipcMain.handle("pantoufa:probe-media", async (
     _evt,
     opts: { url: string; iframeUrl?: string } | string,
@@ -4331,9 +4360,15 @@ app.whenReady().then(() => {
     // attempts/timeoutMs overrides so a miss costs seconds, not half a minute.
     const ATTEMPTS = Math.max(1, Math.min(opts.attempts ?? 3, 5));
     const PER_ATTEMPT_TIMEOUT_MS = Math.max(1000, Math.min(opts.timeoutMs ?? 9000, 30000));
+    // lekmanga.site (mangalik) answers a desktop Chrome UA with a Cloudflare
+    // challenge but serves the page to an Android one (verified 2026-10-31) —
+    // without it every mangalik page fell to the slow hidden-window path and
+    // works like Naruto lost their mangalik chapters.
+    const mobileUaHost = (() => { try { return /(^|\.)(lekmanga\.site|mangalik\.net)$/i.test(new URL(opts.url).hostname); } catch { return false; } })();
     const sourceHeaders = {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "User-Agent": mobileUaHost
+        ? "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+        : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
       // witanime's /new-episodes pager answers JSON only when asked for it.
       "Accept": opts.accept || "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "ar,en;q=0.9",

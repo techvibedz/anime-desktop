@@ -14,7 +14,7 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { t } from "../../lib/i18n";
 import { storage } from "../../lib/storage";
 import { normFuzzy } from "../../lib/fuzzy";
-import { fetchMangaChapter } from "../../lib/manga/api";
+import { fetchReadableChapter } from "../../lib/manga/readable";
 import { chapterNumberKey, fetchMergedDetail } from "../../lib/manga/aggregate";
 import { upgradeMangaPage } from "../../lib/manga/cover";
 import { decodeReaderRef, type MangaChapterRef, type MergedChapter, type MergedMangaDetail } from "../../lib/manga/types";
@@ -406,8 +406,19 @@ export function MangaReaderPage() {
     prefetchRef.current = null;
     scrollRef.current?.scrollTo({ top: 0 });
 
-    void fetchMangaChapter(chapterSource, chapterMangaId, chapterId, { force: reloadKey > 0 })
-      .then((data) => { if (alive) { if (data.pages.length) setPages(data.pages); else setError(true); } })
+    // A copy whose images are gone (3asq Naruto 590-700 all 404) is replaced
+    // by another source's copy of the same chapter (lib/manga/readable).
+    const alternates = async (): Promise<MangaChapterRef[]> => {
+      const merged = await fetchMergedDetail(source, mangaId);
+      const numberKey = chapterNumberKey(chapterNumber);
+      const match =
+        merged.chapters.find((chapter) => chapter.id === chapterId && chapter.source === chapterSource) ??
+        (numberKey ? merged.chapters.find((chapter) => chapterNumberKey(chapter.number) === numberKey) : undefined);
+      if (!match) return [];
+      return [{ source: match.source, mangaId: match.mangaId, id: match.id }, ...(match.alternates ?? [])];
+    };
+    void fetchReadableChapter({ source: chapterSource, mangaId: chapterMangaId, id: chapterId }, alternates, { force: reloadKey > 0 })
+      .then(({ data }) => { if (alive) { if (data.pages.length) setPages(data.pages); else setError(true); } })
       .catch(() => { if (alive) setError(true); });
 
     void fetchMergedDetail(source, mangaId, { onUpdate: (merged) => { if (alive) setDetail(merged); } })
@@ -543,8 +554,11 @@ export function MangaReaderPage() {
     const key = `${newerChapter.source}:${newerChapter.id}`;
     if (prefetchRef.current === key) return;
     prefetchRef.current = key;
-    void fetchMangaChapter(newerChapter.source, newerChapter.mangaId, newerChapter.id)
-      .then((data) => { for (const url of data.pages.slice(0, 3).flatMap(pageColumns)) { const img = new Image(); img.src = upgradeMangaPage(url); } })
+    void fetchReadableChapter(
+      { source: newerChapter.source, mangaId: newerChapter.mangaId, id: newerChapter.id },
+      async () => newerChapter.alternates ?? [],
+    )
+      .then(({ data }) => { for (const url of data.pages.slice(0, 3).flatMap(pageColumns)) { const img = new Image(); img.src = upgradeMangaPage(url); } })
       .catch(() => {});
   }, [index, pages, newerChapter]);
 

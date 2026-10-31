@@ -83,6 +83,8 @@ contextBridge.exposeInMainWorld("pantoufa", {
     >,
   probeMedia: (url: string, iframeUrl?: string) =>
     ipcRenderer.invoke("pantoufa:probe-media", { url, iframeUrl }) as Promise<{ ok: boolean; status: number }>,
+  probeMangaPage: (url: string, referer?: string) =>
+    ipcRenderer.invoke("pantoufa:probe-manga-page", { url, referer }) as Promise<{ status: number; contentType: string; challenge: boolean }>,
   cancelBackgroundScrapes: () =>
     ipcRenderer.invoke("pantoufa:cancel-background-scrapes") as Promise<{ cancelled: number }>,
   // Sidecar subtitle text (VTT) fetched in the main process so the renderer can

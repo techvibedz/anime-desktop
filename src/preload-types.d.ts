@@ -42,6 +42,7 @@ declare global {
       ) => Promise<{ url: string; type: "hls" | "mp4"; subtitles?: { url: string; label?: string; lang?: string }[]; denied?: boolean } | null>;
       probeMedia: (url: string, iframeUrl?: string) => Promise<{ ok: boolean; status: number }>;
       cancelBackgroundScrapes: () => Promise<{ cancelled: number }>;
+      probeMangaPage?: (url: string, referer?: string) => Promise<{ status: number; contentType: string; challenge: boolean }>;
       fetchText: (url: string) => Promise<string | null>;
       fetchHtml: (
         url: string,
