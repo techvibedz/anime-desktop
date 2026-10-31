@@ -9,6 +9,22 @@ import { t } from "../lib/i18n";
 
 type Msg = { role: "user" | "ai"; text: string };
 
+/** AI answer: renders the **bold** spans the companion uses for key names
+ *  and terms (they showed up as raw asterisks). Bullets arrive as "• " lines
+ *  and the bubble's whitespace-pre-line keeps the line breaks. */
+function AnswerText({ text }: { text: string }) {
+  const parts = text.split(/\*\*([^*\n]+)\*\*/g);
+  return (
+    <>
+      {parts.map((p, i) =>
+        i % 2 === 1
+          ? <strong key={i} className="font-bold text-white">{p}</strong>
+          : p.replace(/\*\*/g, ""),
+      )}
+    </>
+  );
+}
+
 export function CompanionPanel({
   title,
   spoilerBound,
@@ -28,14 +44,24 @@ export function CompanionPanel({
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [failed, setFailed] = useState<{ mode: "chat" | "recap"; question: string; text: string } | null>(null);
+  const [slow, setSlow] = useState(false);
   const busyRef = useRef(false); // synchronous double-send guard
   const bodyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const el = bodyRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, busy]);
+  }, [messages, busy, failed]);
+
+  // After a few seconds the spinner says it's still working, so a slower
+  // answer doesn't look like a hang.
+  useEffect(() => {
+    setSlow(false);
+    if (!busy) return;
+    const id = setTimeout(() => setSlow(true), 6_000);
+    return () => clearTimeout(id);
+  }, [busy]);
 
   const reasonText = (reason: string) => {
     switch (reason) {
@@ -46,19 +72,23 @@ export function CompanionPanel({
     }
   };
 
-  const send = async (mode: "chat" | "recap") => {
+  const send = async (mode: "chat" | "recap", preset?: string, isRetry = false) => {
     if (busyRef.current || spoilerBound < 1) return;
-    const question = input.trim();
+    const question = (preset ?? input).trim();
     if (mode === "chat" && !question) return;
+    // A retry re-sends the failed turn, whose bubble is still the last message.
+    const prior = isRetry ? messages.slice(0, -1) : messages;
     // Snapshot BEFORE appending this turn so the model continues the thread.
-    const history = messages
+    const history = prior
       .slice(-8)
       .map((m) => ({ role: m.role, text: m.text.slice(0, 400) }));
     busyRef.current = true;
     setBusy(true);
-    setError(null);
-    setMessages((m) => [...m, { role: "user", text: mode === "recap" ? t.companionRecap : question }]);
-    setInput("");
+    setFailed(null);
+    if (!isRetry) {
+      setMessages((m) => [...m, { role: "user", text: mode === "recap" ? t.companionRecap : question }]);
+    }
+    if (preset === undefined) setInput("");
     try {
       const res = await askCompanion({
         mode,
@@ -71,9 +101,10 @@ export function CompanionPanel({
         history: mode === "chat" ? history : undefined,
       });
       if (res.ok) setMessages((m) => [...m, { role: "ai", text: res.answer }]);
-      else setError(reasonText(res.reason));
+      // Inline under the unanswered question, with a retry button.
+      else setFailed({ mode, question, text: reasonText(res.reason) });
     } catch {
-      setError(t.companionError);
+      setFailed({ mode, question, text: t.companionError });
     }
     busyRef.current = false;
     setBusy(false);
@@ -126,33 +157,50 @@ export function CompanionPanel({
                       : "mr-auto border-white/10 bg-surface text-text-secondary"
                   }`}
                 >
-                  {m.text}
+                  {m.role === "ai" ? <AnswerText text={m.text} /> : m.text}
                 </div>
               ))}
               {busy && (
                 <div className="mr-auto flex max-w-[92%] items-center gap-2 rounded-xl border border-white/10 bg-surface px-3 py-2 text-sm text-text-secondary">
                   <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-accent border-t-transparent" />
-                  {t.companionThinking}
+                  {slow ? t.companionThinkingSlow : t.companionThinking}
+                </div>
+              )}
+              {!busy && failed && (
+                <div className="mr-auto flex max-w-[92%] flex-col items-start gap-2 rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-sm text-amber-300">
+                  {failed.text}
+                  <button
+                    onClick={() => void send(failed.mode, failed.mode === "chat" ? failed.question : "", true)}
+                    className="rounded-full border border-accent/30 bg-accent/10 px-3 py-1 text-xs font-semibold text-accent transition hover:bg-accent/20"
+                  >
+                    {t.companionRetry}
+                  </button>
                 </div>
               )}
             </div>
           )}
         </div>
 
-        {error && (
-          <p className="mt-2 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-300">
-            {error}
-          </p>
-        )}
-
-        {/* Recap this episode */}
-        <button
-          onClick={() => void send("recap")}
-          disabled={busy}
-          className="mt-3 self-end rounded-full border border-accent/30 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent transition hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {t.companionRecap}
-        </button>
+        {/* Quick questions + recap this episode */}
+        <div className="mt-3 flex flex-wrap justify-start gap-2">
+          {messages.length === 0 && t.companionSuggestions.map((q) => (
+            <button
+              key={q}
+              onClick={() => void send("chat", q)}
+              disabled={busy}
+              className="rounded-full border border-accent/30 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent transition hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {q}
+            </button>
+          ))}
+          <button
+            onClick={() => void send("recap")}
+            disabled={busy}
+            className="rounded-full border border-accent/30 bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent transition hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {t.companionRecap}
+          </button>
+        </div>
 
         {/* Ask */}
         <form

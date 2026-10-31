@@ -27,11 +27,35 @@ export type CompanionResult =
   | { ok: true; answer: string; spoilerBound: number }
   | { ok: false; reason: "offline" | "signin" | "unavailable" | "rate_limited" | "error" };
 
-/** Hard client deadline so a hung function can never leave the UI busy forever. */
-const REQUEST_TIMEOUT_MS = 45_000;
+/** Per-request deadline. The function answers in ~5-10s and stops itself at
+ *  ~24s, so this only trips on a dead network. */
+const REQUEST_TIMEOUT_MS = 28_000;
+/** Whole-call deadline, INCLUDING getSession and supabase-js's own token
+ *  lookup (neither is covered by invoke's timeout — a stuck token refresh
+ *  could leave the "thinking" bubble spinning forever). */
+const TOTAL_DEADLINE_MS = 32_000;
 
 export async function askCompanion(req: CompanionRequest): Promise<CompanionResult> {
   if (!isSupabaseConfigured) return { ok: false, reason: "offline" };
+  const startedAt = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<CompanionResult>((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, reason: "error" }), TOTAL_DEADLINE_MS);
+  });
+  try {
+    const first = await Promise.race([askOnce(req), deadline]);
+    // A fast generic failure is usually a transient network/gateway blip:
+    // retry once while there's still plenty of time.
+    if (!first.ok && first.reason === "error" && Date.now() - startedAt < 6_000) {
+      return await Promise.race([askOnce(req), deadline]);
+    }
+    return first;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function askOnce(req: CompanionRequest): Promise<CompanionResult> {
   try {
     const { data: sessionData } = await supabase.auth.getSession();
     if (!sessionData?.session) return { ok: false, reason: "signin" };
