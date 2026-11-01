@@ -81,7 +81,8 @@ export function CompanionPanel({
     // Snapshot BEFORE appending this turn so the model continues the thread.
     const history = prior
       .slice(-8)
-      .map((m) => ({ role: m.role, text: m.text.slice(0, 400) }));
+      // The companion's own answers stay long enough for "explain more" to work.
+      .map((m) => ({ role: m.role, text: m.text.slice(0, m.role === "ai" ? 1200 : 500) }));
     busyRef.current = true;
     setBusy(true);
     setFailed(null);
@@ -111,7 +112,7 @@ export function CompanionPanel({
   };
 
   return (
-    <div className="fixed inset-0 z-[10000] flex justify-end bg-black/60" onClick={onClose}>
+    <div className="fixed inset-0 z-[10000] flex cursor-default justify-end bg-black/60" onClick={onClose}>
       <div
         dir="rtl"
         role="dialog"

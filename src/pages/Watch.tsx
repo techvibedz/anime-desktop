@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { createPortal } from "react-dom";
 import { useParams, useSearchParams, Link, useNavigate } from "react-router-dom";
 import Hls from "hls.js";
 import {
@@ -3327,8 +3328,10 @@ export function WatchPage() {
         onClose={() => setDownloadMeta(null)}
       />
       {/* رفيق الأنمي — spoiler-safe AI companion drawer. keyed by episode so
-          its chat state resets per episode. */}
-      {companionOpen && currentEpNumber != null && (
+          its chat state resets per episode. In fullscreen only the player's
+          subtree is painted, so the drawer is portaled into it — otherwise the
+          control-bar button "did nothing" while fullscreen. */}
+      {companionOpen && currentEpNumber != null && createPortal(
         <CompanionPanel
           key={episodeUrl}
           title={companionCtx.title || meta.episodeTitle || t.companion}
@@ -3337,7 +3340,8 @@ export function WatchPage() {
           seasonNumber={companionCtx.season || undefined}
           altTitle={companionCtx.altTitle || undefined}
           onClose={() => setCompanionOpen(false)}
-        />
+        />,
+        (isFullscreen && playerRef.current) || document.body,
       )}
     </div>
   );
