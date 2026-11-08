@@ -13,7 +13,11 @@ import {
   fetchAnimeMal, fetchAnimeInfo, fetchAnimeRecommendations, peekMalRating,
   type AnimeInfoField, type RecItem,
 } from "../lib/malInfo";
-import { fetchAnimeRelations, type RelatedAnimeEntry } from "../lib/relations";
+import { fetchAnimeRelations, seasonNum, slugToTitle, type RelatedAnimeEntry } from "../lib/relations";
+import { getFillerData, peekFillerData, summarizeFiller, hoursSaved, isSkippable, type FillerData } from "../lib/filler";
+import { getSkipFiller, setSkipFiller } from "../lib/settings";
+import { bridgeIsShowable, getMangaBridge, type BridgeInfo } from "../lib/mangaBridge";
+import { MangaBridgeCard } from "../components/MangaBridgeCard";
 import { resolveSourceUrl } from "../lib/schedule";
 import { useCardLayout } from "../lib/cardLayout";
 import { MalScoreBadge, MalCardBadge } from "../components/MalRating";
@@ -449,6 +453,58 @@ export function AnimeDetailPage() {
   }, [autoPlay, playTarget, setsLoaded, lastWatchedLoaded, navigate, watchUrlFor]);
   useEffect(() => { autoPlayedRef.current = false; }, [animeHref]);
 
+  // Filler/canon data (animefillerlist / MAL) + the canon-only preference.
+  const [filler, setFiller] = useState<FillerData | null>(null);
+  const [canonOnly, setCanonOnly] = useState(false);
+  useEffect(() => { void getSkipFiller().then(setCanonOnly); }, []);
+  useEffect(() => {
+    const title = data?.title;
+    if (!title) { setFiller(null); return; }
+    let alive = true;
+    setFiller(peekFillerData(title) ?? null);
+    void getFillerData({ title, href: animeHref }).then((d) => { if (alive) setFiller(d); });
+    return () => { alive = false; };
+  }, [data?.title, animeHref]);
+  const toggleCanonOnly = useCallback(() => {
+    setCanonOnly((v) => {
+      void setSkipFiller(!v);
+      return !v;
+    });
+  }, []);
+  const fillerSummary = useMemo(
+    () => (filler ? summarizeFiller(filler.kinds, displayEpisodes.map((e) => e.number ?? 0)) : null),
+    [filler, displayEpisodes],
+  );
+  // Canon-only hides skippable episodes (filler/recap) from the grid, so
+  // playing through the grid never lands on filler.
+  const hideFiller = canonOnly && !!fillerSummary && fillerSummary.fillerCount > 0;
+  const shownEpisodes = useMemo(
+    () => (hideFiller && filler ? displayEpisodes.filter((e) => !isSkippable(filler.kinds[e.number ?? -1])) : displayEpisodes),
+    [hideFiller, filler, displayEpisodes],
+  );
+
+  // Anime → manga bridge ("continue from chapter N"). Runs after the page is
+  // up; a first-ever lookup for a season asks the AI once for everyone.
+  const [bridge, setBridge] = useState<BridgeInfo | null>(null);
+  const [bridgeTick, setBridgeTick] = useState(0);
+  useEffect(() => { setBridge(null); }, [animeHref]);
+  useEffect(() => {
+    if (!data?.title) return;
+    let cancelled = false;
+    const season = seasonNum(data.title) || seasonNum(animeHref) || 0;
+    const alt = slugToTitle(animeHref);
+    const timer = setTimeout(() => {
+      void getMangaBridge({
+        animeTitle: data.title,
+        altTitle: alt && alt.toLowerCase() !== data.title.toLowerCase() ? alt : undefined,
+        season,
+        totalEpisodes: data.totalEpisodes || null,
+        refresh: bridgeTick > 0,
+      }).then((info) => { if (!cancelled) setBridge(info); });
+    }, bridgeTick > 0 ? 0 : 700);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [data?.title, animeHref, data?.totalEpisodes, bridgeTick]);
+
   if (loading) {
     const provisionalTitle = titleFromSlug(animeHref);
     return (
@@ -650,6 +706,18 @@ export function AnimeDetailPage() {
       {/* Next-episode countdown — renders nothing unless currently airing */}
       <AiringCountdown title={data.title} lastEpisode={maxNum} />
 
+      {/* Continue the story in the source manga */}
+      {bridge && bridgeIsShowable(bridge.payload) && (
+        <div className="max-w-[720px]">
+          <MangaBridgeCard
+            key={bridge.key + bridge.votes.length + (bridge.mine ?? "")}
+            info={bridge}
+            animeTitle={data.title}
+            onVoted={() => setBridgeTick((n) => n + 1)}
+          />
+        </div>
+      )}
+
       <section className="space-y-4">
         {/* Editorial underline tabs — الحلقات / ذات صلة / قد يعجبك / تفاصيل */}
         <div className="sticky top-16 z-rail -mx-8 flex items-center gap-1.5 border-b border-white/[0.06] bg-bg/90 px-8 py-3 backdrop-blur-xl">
@@ -704,9 +772,38 @@ export function AnimeDetailPage() {
                   {t.goToEpisode}
                 </button>
                 {jumpError && <span className="text-xs font-semibold text-danger">{t.episodeNotFound}</span>}
+                {fillerSummary && fillerSummary.fillerCount > 0 && (
+                  <div className="ms-auto flex items-center gap-3">
+                    <div className="text-end">
+                      <p className="text-xs font-semibold text-white">
+                        {t.fillerSummary(fillerSummary.fillerCount)} · {t.fillerSaves(hoursSaved(fillerSummary.fillerCount))}
+                      </p>
+                      <p className="text-[10px] font-medium text-text-muted">
+                        {canonOnly ? t.canonOnlyOn : filler?.source === "afl" ? t.fillerSource : "MyAnimeList"}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={canonOnly}
+                      onClick={toggleCanonOnly}
+                      className={`flex h-10 items-center gap-1.5 rounded-full border px-4 text-xs font-bold transition ${
+                        canonOnly ? "border-transparent bg-mint text-on-accent" : "border-mint/30 bg-mint/10 text-mint hover:bg-mint/20"
+                      }`}
+                    >
+                      {canonOnly ? (
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M20 6 9 17l-5-5" /></svg>
+                      ) : (
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><circle cx="6" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M20 4 8.1 15.9M14.5 14.5 20 20M8.1 8.1 12 12" /></svg>
+                      )}
+                      {t.canonOnly}
+                    </button>
+                  </div>
+                )}
               </div>
               <div className="grid grid-cols-2 gap-x-3.5 gap-y-4 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
-              {displayEpisodes.map((ep) => {
+              {shownEpisodes.map((ep) => {
+                const kind = filler?.kinds[ep.number ?? -1];
                 // Cheap per-card check (no NFKD): href membership OR the precomputed
                 // cross-source episode-number set.
                 const isDone =
@@ -764,6 +861,13 @@ export function AnimeDetailPage() {
                             {sourceShortLabel(source)}
                           </span>
                         ))}
+                        {(kind === "filler" || kind === "recap" || kind === "mixed") && (
+                          <span className={`rounded-md px-1.5 py-0.5 text-[9px] font-bold ${
+                            kind === "mixed" ? "border border-white/20 bg-black/70 text-text-secondary" : "bg-gold/90 text-[#1A1400]"
+                          }`}>
+                            {kind === "filler" ? t.fillerBadge : kind === "recap" ? t.recapBadge : t.mixedBadge}
+                          </span>
+                        )}
                       </div>
                       <div className="absolute inset-x-1.5 bottom-1.5 flex items-center justify-between">
                         <span className="text-[13px] font-extrabold text-white drop-shadow">

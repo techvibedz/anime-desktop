@@ -32,6 +32,12 @@ const CACHE_PREFIXES = [
   "manga_detail_cache_v1:",
   "manga_merged_detail_v2:",
   "@manga_cover_fallback_v1:",
+  "@afl_shows_",
+  "@filler_",
+  "@ai_search_",
+  "@manga_bridge_",
+  "@manga_adapt_",
+  "@server_health_",
   "pantoufa_home_cache",
   "pantoufa_cache",
 ];

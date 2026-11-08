@@ -11,6 +11,9 @@ const LIB_KEY = "manga_library";
 const PROGRESS_KEY = "manga_progress";
 const READ_KEY = "manga_read";
 const SOURCE_KEY = "manga_source";
+/** Works the user dropped from "متابعة القراءة" → removal time. Keeps the
+ * account copy (pulled on every launch) from restoring them. */
+const REMOVED_KEY = "manga_progress_removed";
 
 export interface MangaLibraryEntry extends MangaCard {
   addedAt: number;
@@ -58,6 +61,7 @@ export function subscribeMangaStore(listener: Listener): () => void {
 let libCache: MangaLibraryEntry[] | null = null;
 let progressCache: Record<string, MangaProgress> | null = null;
 let readCache: Record<string, Record<string, true>> | null = null;
+let removedCache: Record<string, number> | null = null;
 
 async function loadJson<T>(key: string, fallback: T): Promise<T> {
   try {
@@ -187,18 +191,39 @@ export async function removeFromMangaLibrary(source: MangaSourceId, id: string):
 
 export async function saveMangaProgress(entry: Omit<MangaProgress, "updatedAt">): Promise<void> {
   if (!progressCache) progressCache = await loadJson<Record<string, MangaProgress>>(PROGRESS_KEY, {});
-  progressCache[mangaKey(entry.source, entry.id)] = { ...entry, updatedAt: Date.now() };
+  const key = mangaKey(entry.source, entry.id);
+  progressCache[key] = { ...entry, updatedAt: Date.now() };
   persistDebounced(PROGRESS_KEY, progressCache);
+  // Reading it again brings it back for good.
+  if (!removedCache) removedCache = await loadJson<Record<string, number>>(REMOVED_KEY, {});
+  if (removedCache[key]) {
+    delete removedCache[key];
+    void AsyncStorage.setItem(REMOVED_KEY, JSON.stringify(removedCache)).catch(() => {});
+  }
   emitProgressSoon();
 }
 
 /** Drop a work from "متابعة القراءة" (read by accident / don't want it back). */
 export async function removeMangaProgress(source: MangaSourceId, id: string): Promise<void> {
   if (!progressCache) progressCache = await loadJson<Record<string, MangaProgress>>(PROGRESS_KEY, {});
+  if (!removedCache) removedCache = await loadJson<Record<string, number>>(REMOVED_KEY, {});
   const key = mangaKey(source, id);
+  // Tombstone: the server row is only cleared by the next cloud push (seconds
+  // later); if the app is closed first, the launch pull would restore it.
+  removedCache[key] = Date.now();
+  const keys = Object.keys(removedCache);
+  if (keys.length > 500) {
+    for (const old of keys.sort((a, b) => removedCache![a] - removedCache![b]).slice(0, keys.length - 500)) {
+      delete removedCache[old];
+    }
+  }
+  void AsyncStorage.setItem(REMOVED_KEY, JSON.stringify(removedCache)).catch(() => {});
   if (!progressCache[key]) return;
   delete progressCache[key];
-  persistDebounced(PROGRESS_KEY, progressCache);
+  // Written now, not debounced — a removal must survive an immediate app quit.
+  const pending = persistTimers.get(PROGRESS_KEY);
+  if (pending) { clearTimeout(pending); persistTimers.delete(PROGRESS_KEY); }
+  void AsyncStorage.setItem(PROGRESS_KEY, JSON.stringify(progressCache)).catch(() => {});
   emit();
 }
 
@@ -236,6 +261,7 @@ export interface CloudMangaEntry {
 export async function mergeCloudManga(entries: CloudMangaEntry[]): Promise<boolean> {
   if (!libCache) libCache = await loadJson<MangaLibraryEntry[]>(LIB_KEY, []);
   if (!progressCache) progressCache = await loadJson<Record<string, MangaProgress>>(PROGRESS_KEY, {});
+  if (!removedCache) removedCache = await loadJson<Record<string, number>>(REMOVED_KEY, {});
   let libChanged = false;
   let progressChanged = false;
   const inLib = new Set(libCache.map((entry) => mangaKey(entry.source, entry.id)));
@@ -250,7 +276,9 @@ export async function mergeCloudManga(entries: CloudMangaEntry[]): Promise<boole
       inLib.add(key);
       libChanged = true;
     }
-    if (e.chapterNumber) {
+    // Removed from continue-reading after this server copy was written.
+    const removedAt = removedCache[key];
+    if (e.chapterNumber && !(removedAt && removedAt >= e.updatedAt)) {
       const local = progressCache[key];
       if (!local || local.updatedAt < e.updatedAt) {
         const sameChapter = local && local.chapterNumber === e.chapterNumber;
@@ -420,6 +448,7 @@ export async function resetLocalManga(): Promise<void> {
   libCache = [];
   progressCache = {};
   readCache = {};
-  await Promise.all([LIB_KEY, PROGRESS_KEY, READ_KEY].map((k) => AsyncStorage.removeItem(k).catch(() => {})));
+  removedCache = {};
+  await Promise.all([LIB_KEY, PROGRESS_KEY, READ_KEY, REMOVED_KEY].map((k) => AsyncStorage.removeItem(k).catch(() => {})));
   emit();
 }

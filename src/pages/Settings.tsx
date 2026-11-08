@@ -16,12 +16,18 @@ import {
   getNotificationScope,
   getNotificationsEnabled,
   getPrefetchNext,
+  getRecapOffers,
+  getShowReactions,
+  getSkipFiller,
   setAutoSkipIntro,
   setAutoplayNext,
   setDailyAnimeNotif,
   setNotificationScope,
   setNotificationsEnabled,
   setPrefetchNext,
+  setRecapOffers,
+  setShowReactions,
+  setSkipFiller,
   type NotificationScope,
 } from "../lib/settings";
 import { pullHistoryFromCloud } from "../lib/history";
@@ -29,7 +35,7 @@ import { storage } from "../lib/storage";
 
 type IconName =
   | "bell" | "globe" | "heart" | "send" | "playNext" | "skipIntro"
-  | "download" | "sparkles" | "trash" | "clock" | "cloudDown";
+  | "download" | "sparkles" | "trash" | "clock" | "cloudDown" | "filter" | "smile" | "recap";
 
 const ICONS: Record<IconName, string> = {
   bell: "M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9|M13.7 21a2 2 0 0 1-3.4 0",
@@ -43,6 +49,9 @@ const ICONS: Record<IconName, string> = {
   trash: "M4 6h16|M9 6V4h6v2|M6 6v14a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V6|M10 11v6|M14 11v6",
   clock: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z|M12 7v5l3 3",
   cloudDown: "M20 17.6A4.4 4.4 0 0 0 17.5 10h-1.3A7 7 0 1 0 5 16.7|M12 12v8|m8.5 16.5 3.5 3.5 3.5-3.5",
+  filter: "M3 5h18l-7 8v6l-4 2v-8L3 5Z",
+  smile: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z|M8 14s1.5 2 4 2 4-2 4-2|M9 9h.01|M15 9h.01",
+  recap: "M4 19.5A2.5 2.5 0 0 1 6.5 17H20|M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z|M9 7h7|M9 11h5",
 };
 
 function Icon({ name }: { name: IconName }) {
@@ -167,6 +176,9 @@ export function SettingsPage() {
   const [scope, setScope] = useState<NotificationScope>("all");
   const [prefetch, setPrefetch] = useState(true);
   const [dailyAnime, setDailyAnime] = useState(false);
+  const [skipFiller, setSkipFillerState] = useState(false);
+  const [showReactions, setShowReactionsState] = useState(true);
+  const [recapOffers, setRecapOffersState] = useState(true);
   const [testing, setTesting] = useState(false);
   const [testState, setTestState] = useState<TestState>("idle");
   const [checking, setChecking] = useState(false);
@@ -177,16 +189,20 @@ export function SettingsPage() {
   useEffect(() => {
     let alive = true;
     (async () => {
-      const [n, a, s, sc, p, d] = await Promise.all([
+      const [n, a, s, sc, p, d, f, r, rc] = await Promise.all([
         getNotificationsEnabled(),
         getAutoplayNext(),
         getAutoSkipIntro(),
         getNotificationScope(),
         getPrefetchNext(),
         getDailyAnimeNotif(),
+        getSkipFiller(),
+        getShowReactions(),
+        getRecapOffers(),
       ]);
       if (!alive) return;
       setNotifs(n); setAutoplay(a); setAutoSkip(s); setScope(sc); setPrefetch(p); setDailyAnime(d);
+      setSkipFillerState(f); setShowReactionsState(r); setRecapOffersState(rc);
     })();
     return () => { alive = false; };
   }, []);
@@ -214,6 +230,21 @@ export function SettingsPage() {
   const togglePrefetch = useCallback((value: boolean) => {
     setPrefetch(value);
     void setPrefetchNext(value);
+  }, []);
+
+  const toggleSkipFiller = useCallback((value: boolean) => {
+    setSkipFillerState(value);
+    void setSkipFiller(value);
+  }, []);
+
+  const toggleShowReactions = useCallback((value: boolean) => {
+    setShowReactionsState(value);
+    void setShowReactions(value);
+  }, []);
+
+  const toggleRecapOffers = useCallback((value: boolean) => {
+    setRecapOffersState(value);
+    void setRecapOffers(value);
   }, []);
 
   const toggleDailyAnime = useCallback((value: boolean) => {
@@ -303,6 +334,9 @@ export function SettingsPage() {
         <ToggleRow icon="playNext" title={t.settingsAutoplay} desc={t.settingsAutoplayDesc} checked={autoplay} onChange={toggleAutoplay} />
         <ToggleRow icon="skipIntro" title={t.settingsAutoSkipIntro} desc={t.settingsAutoSkipIntroDesc} checked={autoSkip} onChange={toggleAutoSkip} />
         <ToggleRow icon="download" title={t.settingsPrefetchNext} desc={t.settingsPrefetchNextDesc} checked={prefetch} onChange={togglePrefetch} />
+        <ToggleRow icon="filter" title={t.settingsSkipFiller} desc={t.settingsSkipFillerDesc} checked={skipFiller} onChange={toggleSkipFiller} />
+        <ToggleRow icon="smile" title={t.settingsShowReactions} desc={t.settingsShowReactionsDesc} checked={showReactions} onChange={toggleShowReactions} />
+        <ToggleRow icon="recap" title={t.settingsRecapOffers} desc={t.settingsRecapOffersDesc} checked={recapOffers} onChange={toggleRecapOffers} />
         {notifs && (
           <ToggleRow icon="sparkles" title={t.settingsDailyAnime} desc={t.settingsDailyAnimeDesc} checked={dailyAnime} onChange={toggleDailyAnime} />
         )}

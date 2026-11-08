@@ -85,21 +85,32 @@ export function buildCompletedList(
   normalizeTitle: (value: string) => string,
 ): CompletedEntry[] {
   const out: CompletedEntry[] = [];
+  // Every identity key (anchor pages, primary title, the poster shown) already
+  // on the shelf. One anime has a record per source/legacy key; matching ANY
+  // of these keeps it to one card instead of one per copy.
   const seen = new Set<string>();
   const finished = records.filter((r) => r.finished).sort((a, b) => b.updatedAt - a.updatedAt);
   for (const rec of finished) {
-    const id = normalizeTitle(rec.titles[0] || "") || normalizeHref(rec.hrefs[0] || "") || rec.key;
-    if (seen.has(id)) continue;
-    seen.add(id);
+    const anchors = anchorKeys(rec, normalizeHref);
+    const primary = primaryTitleKey(rec, normalizeTitle);
+    const id = primary || anchors[0] || rec.key;
+    const strong = (p: { title: string; href: string }) =>
+      anchors.includes(normalizeHref(p.href || "")) || (!!primary && normalizeTitle(p.title || "") === primary);
     const hrefKeys = new Set(rec.hrefs.map(normalizeHref).filter(Boolean));
     const titleKeys = new Set(rec.titles.map(normalizeTitle).filter(Boolean));
-    const matches = (p: { title: string; href: string }) => {
+    const weak = (p: { title: string; href: string }) => {
       const t = normalizeTitle(p.title || "");
-      return hrefKeys.has(normalizeHref(p.href || "")) || (!!t && titleKeys.has(t));
+      // A hint may only lend a poster whose title agrees with this record.
+      return (hrefKeys.has(normalizeHref(p.href || "")) && (!primary || t === primary)) || (!!t && titleKeys.has(t) && t === primary);
     };
     // Some history rows carry no image; a later source (the record's own
     // poster, My List) that has one must win over an empty first match.
-    const poster = posters.find((p) => matches(p) && p.image) ?? posters.find(matches);
+    const poster = posters.find((p) => strong(p) && p.image) ?? posters.find(strong) ??
+      posters.find((p) => weak(p) && p.image) ?? posters.find(weak);
+    const keys = [id, ...anchors, primary,
+      poster ? normalizeHref(poster.href || "") : "", poster ? normalizeTitle(poster.title || "") : ""].filter(Boolean);
+    if (keys.some((k) => seen.has(k))) continue;
+    for (const k of keys) seen.add(k);
     out.push({
       key: id,
       title: poster?.title || rec.titles[0] || rec.key,
@@ -109,4 +120,108 @@ export function buildCompletedList(
     });
   }
   return out;
+}
+
+/* ── Identity: anchors + primary title ─────────────────────────────────────
+ * A record OWNS only its anchor page (its key / hrefs[0]) and its primary
+ * title (titles[0]). Its other hrefs/titles are hints and may be polluted:
+ * real data (2026-11-08) had «Mushoku Tensei III» and «One Piece: Heroines»
+ * carrying One Piece's links, so every One Piece write copied One Piece's
+ * state into them (false "completed" badges) and AniList's "Mushoku finished"
+ * answer was copied back onto every One Piece copy (3× One Piece in the
+ * completed shelf, although it is still airing). */
+
+export function anchorKeys(rec: { key: string; hrefs: string[] }, normalizeHref: (v: string) => string): string[] {
+  return [...new Set([normalizeHref(rec.key || ""), normalizeHref(rec.hrefs[0] || "")].filter(Boolean))];
+}
+
+export function primaryTitleKey(rec: { titles: string[] }, normalizeTitle: (v: string) => string): string {
+  return normalizeTitle(rec.titles[0] || "");
+}
+
+/** Whether a record could be the anime named by these title keys. */
+export function titleCompatible(
+  rec: { titles: string[] },
+  titleKeys: ReadonlySet<string>,
+  normalizeTitle: (v: string) => string,
+): boolean {
+  if (titleKeys.size === 0 || !primaryTitleKey(rec, normalizeTitle)) return true;
+  return rec.titles.some((t) => titleKeys.has(normalizeTitle(t)));
+}
+
+/**
+ * Records that ARE this anime: the page's own record (anchor = ownHrefKey),
+ * a record anchored on another of the page's hrefs whose titles agree, or a
+ * record whose primary title is one of the page's titles. A record that merely
+ * lists one of the hrefs as a secondary hint never matches.
+ */
+export function strictMatchingRecords<T extends CompletionLike & { key: string }>(
+  records: readonly T[],
+  ownHrefKey: string,
+  hrefKeys: ReadonlySet<string>,
+  titleKeys: ReadonlySet<string>,
+  normalizeHref: (value: string) => string,
+  normalizeTitle: (value: string) => string,
+): T[] {
+  const out: T[] = [];
+  for (const rec of records) {
+    const anchors = anchorKeys(rec, normalizeHref);
+    const primary = primaryTitleKey(rec, normalizeTitle);
+    if (
+      (ownHrefKey && anchors.includes(ownHrefKey)) ||
+      (anchors.some((a) => hrefKeys.has(a)) && titleCompatible(rec, titleKeys, normalizeTitle)) ||
+      (!!primary && titleKeys.has(primary))
+    ) out.push(rec);
+  }
+  return out;
+}
+
+export interface Decontamination {
+  /** Record key → its cleaned hrefs/titles (only records that changed). */
+  cleaned: Map<string, { hrefs: string[]; titles: string[]; foreignOwners: string[] }>;
+}
+
+/**
+ * Find hrefs inside a record that are ANOTHER anime's anchor page — an owner
+ * whose primary title differs and that doesn't list this record's primary
+ * title either — and the titles that came with them. Pure; the caller decides
+ * how to reset state.
+ */
+export function findContamination<T extends CompletionLike & { key: string }>(
+  records: readonly T[],
+  normalizeHref: (value: string) => string,
+  normalizeTitle: (value: string) => string,
+): Decontamination {
+  const owners = new Map<string, T[]>();
+  for (const rec of records) {
+    for (const a of anchorKeys(rec, normalizeHref)) {
+      const list = owners.get(a);
+      if (list) list.push(rec);
+      else owners.set(a, [rec]);
+    }
+  }
+  const cleaned: Decontamination["cleaned"] = new Map();
+  for (const rec of records) {
+    const primary = primaryTitleKey(rec, normalizeTitle);
+    if (!primary) continue;
+    const own = new Set(anchorKeys(rec, normalizeHref));
+    const foreignOwners = new Map<string, T>();
+    const keptHrefs: string[] = [];
+    rec.hrefs.forEach((h, i) => {
+      const k = normalizeHref(h);
+      if (i === 0 || !k || own.has(k)) { keptHrefs.push(h); return; }
+      const others = (owners.get(k) || []).filter((o) => o.key !== rec.key);
+      const foreign = others.length > 0 && others.every((o) => {
+        const p = primaryTitleKey(o, normalizeTitle);
+        return !!p && p !== primary && !o.titles.some((t) => normalizeTitle(t) === primary);
+      });
+      if (foreign) for (const o of others) foreignOwners.set(o.key, o);
+      else keptHrefs.push(h);
+    });
+    if (foreignOwners.size === 0) continue;
+    const foreignTitles = new Set([...foreignOwners.values()].map((o) => primaryTitleKey(o, normalizeTitle)));
+    const keptTitles = rec.titles.filter((t, i) => i === 0 || !foreignTitles.has(normalizeTitle(t)) || normalizeTitle(t) === primary);
+    cleaned.set(rec.key, { hrefs: keptHrefs, titles: keptTitles, foreignOwners: [...foreignOwners.keys()] });
+  }
+  return { cleaned };
 }

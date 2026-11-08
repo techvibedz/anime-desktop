@@ -120,6 +120,11 @@ const ROOT_PATHS = new Set(["/", "/search", "/schedule", "/seasons", "/upcoming"
 export function Layout() {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
+  // Shared-moment deep link (pantoufa://moment/<id>) → open the player there.
+  useEffect(() => window.pantoufa?.onAuthCallback?.((url) => {
+    const m = /^pantoufa:\/\/moment\/([A-Za-z0-9]{6,12})/i.exec(url);
+    if (m) navigate(`/moment/${m[1]}`);
+  }), [navigate]);
   const location = useLocation();
   const [showMenu, setShowMenu] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);

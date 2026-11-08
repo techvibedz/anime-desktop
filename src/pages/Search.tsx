@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { fetchAllAnime, fetchGenre, searchAnimeStream, type SearchResult } from "../lib/api";
 import { AnimeCard } from "../components/AnimeCard";
 import { CardLayoutControl } from "../components/CardLayoutControl";
@@ -74,6 +74,7 @@ function SearchRowCard({ item }: { item: SearchResult }) {
 
 export function SearchPage() {
   const [params, setParams] = useSearchParams();
+  const navigate = useNavigate();
   const [q, setQ] = useState(params.get("q") ?? "");
   const [activeGenre, setActiveGenre] = useState("All");
   // Live streaming search (unchanged).
@@ -345,7 +346,19 @@ export function SearchPage() {
           <h1 className="text-[32px] font-extrabold text-white">{t.discover}</h1>
           <p className="mt-1 text-sm font-semibold text-text-muted">{t.searchSub}</p>
         </div>
-        <CardLayoutControl layout={cards.layout} onChange={cards.setLayout} />
+        <div className="flex items-center gap-2">
+          {/* Smart (AI) search lives on its own page; carries the typed text over. */}
+          <button
+            type="button"
+            onClick={() => navigate(q.trim().length >= 2 ? `/smart-search?q=${encodeURIComponent(q.trim())}` : "/smart-search")}
+            title={t.aiSearchTitle}
+            className="flex h-10 items-center gap-1.5 rounded-full border border-accent/40 bg-accent/10 px-4 text-sm font-bold text-accent transition hover:bg-accent/20"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden><path d="M12 2l1.9 5.7L19.6 9.6l-5.7 1.9L12 17.2l-1.9-5.7L4.4 9.6l5.7-1.9L12 2zm6.5 12l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6z" /></svg>
+            {t.aiSearchTitle}
+          </button>
+          <CardLayoutControl layout={cards.layout} onChange={cards.setLayout} />
+        </div>
       </div>
 
       <form onSubmit={submit} className="relative">

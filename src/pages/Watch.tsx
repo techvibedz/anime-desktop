@@ -32,11 +32,26 @@ import {
   type DownloadStatus, type DownloadMeta,
 } from "../lib/downloads";
 import { DownloadPicker } from "../components/DownloadPicker";
-import { CompanionPanel } from "../components/CompanionPanel";
+import { AnswerText, CompanionPanel } from "../components/CompanionPanel";
 import { t } from "../lib/i18n";
 import { useAuth } from "../lib/auth";
 import { useWatchPartySync, createRoom } from "../lib/watchParty";
-import { getAutoplayNext, getAutoSkipIntro, getPrefetchNext } from "../lib/settings";
+import { getAutoplayNext, getAutoSkipIntro, getPrefetchNext, getShowReactions, getSkipFiller } from "../lib/settings";
+import { askCompanion } from "../lib/companion";
+import { dismissRecapOffer, getRecapOffer, type RecapOffer } from "../lib/recap";
+import { bridgeIsShowable, getMangaBridge, type BridgeInfo } from "../lib/mangaBridge";
+import { MangaBridgeCard } from "../components/MangaBridgeCard";
+import { getFillerData, isSkippable, nextCanonEpisode, type EpKind } from "../lib/filler";
+import {
+  REACTIONS, addLocalReaction, bucketOf, fetchReactions, floatsForBucket, formatClock, glyphOf,
+  heatSegments, hottestBucket, postReaction, reactionAnimeKey, totalReactions,
+  type ReactionId, type ReactionMap,
+} from "../lib/reactions";
+import { createMoment } from "../lib/moments";
+import {
+  fastestKey, getServerHealth, healthBucket, healthKey, healthTier, peekServerHealth, reportServerResult, successRate,
+  type HealthStat,
+} from "../lib/serverHealth";
 import {
   getEpisodeSkipTimes, activeSkipInterval,
   type EpisodeSkipTimes, type ActiveSkip,
@@ -175,6 +190,10 @@ export function WatchPage() {
   const epParam = Number(params.get("ep"));
   const localParam = params.get("local") || "";
   const isOffline = localParam.startsWith("pantoufa-file:");
+  // Shared moment: start at this second (overrides saved progress) + who shared it.
+  const momentTParam = params.get("t") || "";
+  const momentSec = /^\d{1,5}$/.test(momentTParam) ? parseInt(momentTParam, 10) : null;
+  const momentFrom = params.get("from") || "";
 
   const [servers, setServers] = useState<ServerWithSource[]>([]);
   // Direct anime4up episode URL harvested off the witanime episode page by
@@ -309,6 +328,9 @@ export function WatchPage() {
   // never-started server (iframe fallback is acceptable) from a mid-watch
   // failure (keep the custom player and re-extract in place instead).
   const hasPlayedRef = useRef(false);
+  // Late-bound handlers used by earlier effects/callbacks (defined further down).
+  const finishAttemptRef = useRef<(ok: boolean) => void>(() => {});
+  const goNextRef = useRef<(auto: boolean) => void>(() => {});
   // True while the user has deliberately paused. The stall-recovery handler
   // uses it to avoid force-resuming a pause the user actually wanted (a pause
   // aborts the media fetch, which fires `stalled`).
@@ -395,14 +417,43 @@ export function WatchPage() {
     setPartyPanelOpen(true);
   }, [user]);
 
-  const sortedServers = useMemo(
-    () => sortVideoServers(servers
+  // Crowdsourced per-host reliability/speed (last 24h, all devices, shared
+  // with the mobile app).
+  const [serverHealth, setServerHealth] = useState<Map<string, HealthStat>>(() => peekServerHealth());
+  useEffect(() => {
+    let alive = true;
+    void getServerHealth().then((m) => { if (alive) setServerHealth(m); });
+    return () => { alive = false; };
+  }, []);
+  // Health order is frozen once playback was started on this episode: a late
+  // health refresh must never shift indexes under the active server.
+  const healthForSortRef = useRef<Map<string, HealthStat>>(serverHealth);
+  // Fold fresh crowd data into the ordering only until the user starts playback.
+  if (!userActivated) healthForSortRef.current = serverHealth;
+  const sortedServers = useMemo(() => {
+    const base = sortVideoServers(servers
       // Hide unrecognized witanime embeds (mega.nz etc.), but always keep
       // anime4up-sourced servers — their data-watch URLs often don't match
       // a known provider regex yet still play fine in an iframe.
-      .filter((s) => s.provider !== "generic" || s.source === "anime4up" || s.source === "offline" || /witanime\.site\/watch\/stream-gate\//i.test(s.iframeUrl))),
-    [servers],
-  );
+      .filter((s) => s.provider !== "generic" || s.source === "anime4up" || s.source === "offline" || /witanime\.site\/watch\/stream-gate\//i.test(s.iframeUrl)));
+    const stats = healthForSortRef.current;
+    if (stats.size === 0) return base;
+    const statOf = (s: ServerWithSource) => stats.get(healthKey(s.source, s.provider));
+    // Crowd says a host is failing today → bottom; otherwise coarse health
+    // buckets, then the provider/quality order above (stable).
+    return base
+      .map((s, i) => ({ s, i }))
+      .sort((a, b) => {
+        const ua = healthTier(statOf(a.s)) === "unstable" ? 1 : 0;
+        const ub = healthTier(statOf(b.s)) === "unstable" ? 1 : 0;
+        if (ua !== ub) return ua - ub;
+        const ha = healthBucket(statOf(a.s));
+        const hb = healthBucket(statOf(b.s));
+        if (ha !== hb) return hb - ha;
+        return a.i - b.i;
+      })
+      .map(({ s }) => s);
+  }, [servers, serverHealth]);
 
   const serverDiscoveryGuardRef = useRef(createGenerationGuard());
   const activeServerUrlRef = useRef<string | null>(null);
@@ -1096,6 +1147,7 @@ export function WatchPage() {
     // eligible and the walk looped back onto it.
     const failed = list.find((s) => s.iframeUrl === activeServerUrlRef.current)
       || list[activeIdxRef.current ?? -1];
+    finishAttemptRef.current(false);
     if (failed) {
       const key = serverFailureKey(failed);
       // Count consecutive failures (not scheduling churn): the walk's backoff
@@ -1960,10 +2012,12 @@ export function WatchPage() {
       // over saved progress (which only lands every 10s).
       const stepDownPos = stepDownSeekRef.current;
       stepDownSeekRef.current = 0;
+      // A shared moment opens at its timestamp (until playback really started).
+      const momentMs = momentSec != null && momentSec > 0 && !hasPlayedRef.current ? momentSec * 1000 : 0;
       getProgress(episodeUrl).then((p) => {
         if (cancelled || !v) return;
         const savedMs = p && p.positionMs >= 5000 ? p.positionMs : 0;
-        const targetMs = stepDownPos > 0 ? stepDownPos * 1000 : savedMs;
+        const targetMs = stepDownPos > 0 ? stepDownPos * 1000 : momentMs > 0 ? momentMs : savedMs;
         if (targetMs <= 0) return;
         const target = targetMs / 1000;
         // Only seek if metadata is available and the target is valid.
@@ -2286,7 +2340,7 @@ export function WatchPage() {
       // A sleep timer / manual pause that landed during the countdown wins.
       if (!userPausedRef.current && !partyClientRef.current) {
         const ep = nextEpisodeRef.current;
-        if (ep?.href) navTo(ep, true);
+        if (ep?.href) goNextRef.current(true);
       }
       return;
     }
@@ -2369,6 +2423,306 @@ export function WatchPage() {
     const altTitle = alt && alt.toLowerCase() !== base.toLowerCase() ? alt : "";
     return { title, season: seasonFromTitle || seasonFromHref || 0, altTitle };
   }, [animeParam, resolvedAnimeHref, titleParam, meta.animeTitle, animeTitleFromDetail, slugTitle, episodeUrl]);
+
+
+  /* ── Fan features (mobile 4.1 parity) ─────────────────────────────────── */
+  const fanTitle = titleParam || meta.animeTitle || animeTitleFromDetail || slugTitle || "";
+  const fanAnimeHref = animeParam || resolvedAnimeHref || "";
+
+  // ── Crowd server-health attempts ──
+  // One attempt = one report: ok (with time from pick to the clock really
+  // advancing) or fail (the walk marked it broken). Embeds expose no clock,
+  // so iframe playback is never reported either way.
+  const attemptRef = useRef<{ id: string; source?: string; provider?: string; t0: number; done: boolean; n: number } | null>(null);
+  const finishAttempt = useCallback((ok: boolean) => {
+    const a = attemptRef.current;
+    if (!a || a.done) return;
+    a.done = true;
+    reportServerResult({ attemptId: `${a.id}#${a.n}`, source: a.source, provider: a.provider, ok, startMs: ok ? Date.now() - a.t0 : null });
+  }, []);
+  finishAttemptRef.current = finishAttempt;
+  const activeForHealth = activeIdx !== null ? sortedServers[activeIdx] : null;
+  const activeHealthUrl = activeForHealth?.iframeUrl || "";
+  useEffect(() => {
+    if (!userActivated || !activeForHealth || isOffline || activeForHealth.provider === "local") return;
+    const id = `${episodeUrl}|${activeHealthUrl}`;
+    const cur = attemptRef.current;
+    if (cur?.id === id) {
+      if (cur.done) attemptRef.current = { ...cur, t0: Date.now(), done: false, n: cur.n + 1 };
+      return;
+    }
+    attemptRef.current = { id, source: activeForHealth.source, provider: activeForHealth.provider, t0: Date.now(), done: false, n: 0 };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userActivated, activeHealthUrl, retryNonce, episodeUrl, isOffline]);
+  useEffect(() => {
+    // Iframe/Dailymotion fallback: no clock to judge it by — drop the attempt silently.
+    if (resolved?.type === "iframe" || resolved?.type === "dailymotion") {
+      if (attemptRef.current) attemptRef.current.done = true;
+      return;
+    }
+    if (!resolved || status !== "playing") return;
+    let baseline: number | null = null;
+    const iv = window.setInterval(() => {
+      const a = attemptRef.current;
+      const v = videoRef.current;
+      if (!a || a.done) { window.clearInterval(iv); return; }
+      if (!v || v.paused || v.readyState < 3) return;
+      if (baseline == null) { baseline = v.currentTime; return; }
+      if (v.currentTime - baseline > 0.3) { finishAttempt(true); window.clearInterval(iv); }
+    }, 400);
+    return () => window.clearInterval(iv);
+  }, [resolved, status, finishAttempt]);
+  const fastestServerKey = useMemo(
+    () => fastestKey(sortedServers.map((s) => healthKey(s.source, s.provider)), serverHealth),
+    [sortedServers, serverHealth],
+  );
+  const healthBadge = (s: ServerWithSource) => {
+    const key = healthKey(s.source, s.provider);
+    const stat = serverHealth.get(key);
+    const tier = healthTier(stat);
+    if (tier === "unknown") return null;
+    if (key === fastestServerKey) {
+      return <span className="ms-1.5 rounded-md bg-mint/15 px-1.5 py-px text-[10px] font-bold text-mint">⚡ {t.healthFastest}</span>;
+    }
+    if (tier === "unstable") {
+      return <span className="ms-1.5 rounded-md bg-gold/15 px-1.5 py-px text-[10px] font-bold text-gold">{t.healthUnstable}</span>;
+    }
+    return <span className="ms-1.5 rounded-md bg-white/[0.08] px-1.5 py-px text-[10px] font-semibold text-white/70">{t.healthWorks(Math.round(successRate(stat) * 100))}</span>;
+  };
+
+  // ── Filler awareness (animefillerlist / MAL) ──
+  const [fillerKinds, setFillerKinds] = useState<Record<number, EpKind> | null>(null);
+  const [skipFillerPref, setSkipFillerPref] = useState(false);
+  useEffect(() => { void getSkipFiller().then(setSkipFillerPref); }, []);
+  useEffect(() => {
+    if (!fanTitle || isOffline) return;
+    let alive = true;
+    void getFillerData({ title: fanTitle, href: fanAnimeHref }).then((d) => { if (alive) setFillerKinds(d?.kinds ?? null); });
+    return () => { alive = false; };
+  }, [fanTitle, fanAnimeHref, isOffline]);
+  const currentEpKind: EpKind | undefined = fillerKinds && currentEpNumber != null ? fillerKinds[currentEpNumber] : undefined;
+  const nextCanonNum = useMemo(
+    () => (fillerKinds && currentEpNumber != null ? nextCanonEpisode(fillerKinds, currentEpNumber) : null),
+    [fillerKinds, currentEpNumber],
+  );
+  const siblingByNumber = useCallback(
+    (num: number) => siblings.find((e) => e.number === num && e.href) ?? null,
+    [siblings],
+  );
+  // Next episode — in canon-only mode a run of filler episodes is jumped over.
+  const goNextEpisode = useCallback((auto: boolean) => {
+    if (partyClientRef.current) return;
+    if (skipFillerPref && nextCanonNum != null && currentEpNumber != null && nextCanonNum > currentEpNumber + 1) {
+      const target = siblingByNumber(nextCanonNum);
+      if (target) {
+        setHudToast(t.fillerSkippedTo(nextCanonNum));
+        navTo(target, auto);
+        return;
+      }
+    }
+    const ep = nextEpisodeRef.current;
+    if (ep?.href) navTo(ep, auto);
+  }, [skipFillerPref, nextCanonNum, currentEpNumber, siblingByNumber, navTo]);
+  goNextRef.current = goNextEpisode;
+  const skipFillerNow = useCallback(() => {
+    if (nextCanonNum == null) return;
+    const target = siblingByNumber(nextCanonNum);
+    if (target) navTo(target);
+    else setHudToast(t.noServers);
+  }, [nextCanonNum, siblingByNumber, navTo]);
+
+  // ── "Previously on…" — AI recap offered before playback ──
+  const [recapOffer, setRecapOffer] = useState<RecapOffer | null>(null);
+  const [recapState, setRecapState] = useState<"idle" | "loading" | "done" | "error">("idle");
+  const [recapText, setRecapText] = useState("");
+  const [recapError, setRecapError] = useState("");
+  const recapGenRef = useRef(0);
+  useEffect(() => {
+    recapGenRef.current += 1;
+    setRecapOffer(null);
+    setRecapState("idle");
+    setRecapText("");
+    setRecapError("");
+  }, [episodeUrl]);
+  useEffect(() => {
+    // Auto-play hops are mid-binge by definition; offline files skip it too.
+    if (!episodeUrl || autoStart || isOffline || currentEpNumber == null) return;
+    const gen = recapGenRef.current;
+    void getRecapOffer({
+      animeHref: fanAnimeHref,
+      animeTitle: fanTitle || companionCtx.title,
+      episodeHref: episodeUrl,
+      epNum: currentEpNumber,
+    }).then((offer) => {
+      if (gen === recapGenRef.current) setRecapOffer((cur) => cur ?? offer);
+    });
+  }, [episodeUrl, autoStart, isOffline, currentEpNumber, fanAnimeHref, fanTitle, companionCtx.title]);
+  const loadRecap = useCallback(async () => {
+    if (currentEpNumber == null) return;
+    const gen = recapGenRef.current;
+    setRecapState("loading");
+    setRecapError("");
+    const res = await askCompanion({
+      mode: "recap",
+      animeTitle: companionCtx.title || t.companion,
+      epNum: currentEpNumber,
+      episodeTitle: meta.episodeTitle || undefined,
+      seasonNumber: companionCtx.season || undefined,
+      altTitle: companionCtx.altTitle || undefined,
+    });
+    if (gen !== recapGenRef.current) return; // episode changed mid-flight
+    if (res.ok) {
+      setRecapText(res.answer);
+      setRecapState("done");
+    } else {
+      setRecapError(
+        res.reason === "signin" ? t.companionSignIn
+          : res.reason === "unavailable" || res.reason === "offline" ? t.companionUnavailable
+          : t.companionError,
+      );
+      setRecapState("error");
+    }
+  }, [currentEpNumber, companionCtx, meta.episodeTitle]);
+  const dismissRecap = useCallback(() => {
+    setRecapOffer(null);
+    void dismissRecapOffer(fanTitle || companionCtx.title, fanAnimeHref);
+  }, [fanTitle, companionCtx.title, fanAnimeHref]);
+
+  // ── End of the season → continue in the manga ──
+  // Only the last available episode looks the bridge up (cached per season,
+  // shared with the detail page); the card shows once playback passes 90%.
+  const [nearEnd, setNearEnd] = useState(false);
+  const [endBridge, setEndBridge] = useState<BridgeInfo | null>(null);
+  const [endBridgeDismissed, setEndBridgeDismissed] = useState(false);
+  useEffect(() => { setNearEnd(false); setEndBridge(null); setEndBridgeDismissed(false); }, [episodeUrl]);
+  useEffect(() => {
+    if (!nearEnd && duration > 0 && currentTime / duration >= 0.9) setNearEnd(true);
+  }, [currentTime, duration, nearEnd]);
+  const isLastEpisode = !isOffline && siblings.length > 0 && !next && currentEpNumber != null;
+  useEffect(() => {
+    if (!isLastEpisode || !nearEnd || endBridge) return;
+    const title = fanTitle || companionCtx.title;
+    if (!title) return;
+    let alive = true;
+    void getMangaBridge({
+      animeTitle: title,
+      altTitle: companionCtx.altTitle || undefined,
+      season: companionCtx.season || 0,
+    }).then((info) => {
+      if (alive && info && bridgeIsShowable(info.payload) && info.view.continueChapter != null) setEndBridge(info);
+    });
+    return () => { alive = false; };
+  }, [isLastEpisode, nearEnd, endBridge, fanTitle, companionCtx]);
+
+  // ── Reactions (hype map) ──
+  // Everyone's reactions for this episode, bucketed per 5 s: a heat strip on
+  // the seek bar, a "hottest moment" jump, and floating emojis as playback
+  // passes busy moments. Direct playback only (embeds expose no clock).
+  const [showReactionsPref, setShowReactionsPref] = useState(true);
+  useEffect(() => { void getShowReactions().then(setShowReactionsPref); }, []);
+  const reactionKey = useMemo(() => reactionAnimeKey(fanTitle), [fanTitle]);
+  const [reactionMap, setReactionMap] = useState<ReactionMap>(() => new Map());
+  const lastFloatBucketRef = useRef(-1);
+  const nativeClock = !!resolved && resolved.type !== "iframe" && resolved.type !== "dailymotion";
+  useEffect(() => { setReactionMap(new Map()); lastFloatBucketRef.current = -1; }, [episodeUrl]);
+  useEffect(() => {
+    if (!userActivated || !reactionKey || currentEpNumber == null || isOffline) return;
+    let alive = true;
+    const load = () => { void fetchReactions(reactionKey, currentEpNumber).then((m) => { if (alive && m) setReactionMap(m); }); };
+    load();
+    const iv = window.setInterval(load, 120_000);
+    return () => { alive = false; window.clearInterval(iv); };
+  }, [userActivated, reactionKey, currentEpNumber, isOffline]);
+  const reducedMotion = useMemo(() => !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches, []);
+  const [floats, setFloats] = useState<{ id: number; glyph: string; x: number }[]>([]);
+  const floatSeqRef = useRef(0);
+  const spawnFloats = useCallback((ids: ReactionId[]) => {
+    if (reducedMotion || !ids.length) return;
+    const born = ids.map((id, i) => ({ id: ++floatSeqRef.current, glyph: glyphOf(id), x: 16 + Math.random() * 70 + i * 14 }));
+    setFloats((f) => [...f.slice(-9), ...born]);
+    window.setTimeout(() => setFloats((f) => f.filter((x) => !born.some((b) => b.id === x.id))), 2700);
+  }, [reducedMotion]);
+  // Float other viewers' reactions as playback enters each busy bucket.
+  useEffect(() => {
+    if (!showReactionsPref || reactionMap.size === 0 || !isPlaying || !nativeClock) return;
+    const b = bucketOf(currentTime);
+    if (b === lastFloatBucketRef.current) return;
+    lastFloatBucketRef.current = b;
+    spawnFloats(floatsForBucket(reactionMap.get(b)));
+  }, [showReactionsPref, reactionMap, isPlaying, nativeClock, currentTime, spawnFloats]);
+  const [trayOpen, setTrayOpen] = useState(false);
+  const [trayTouch, setTrayTouch] = useState(0);
+  useEffect(() => {
+    if (!trayOpen) return;
+    const timer = window.setTimeout(() => setTrayOpen(false), 6000);
+    return () => window.clearTimeout(timer);
+  }, [trayOpen, trayTouch]);
+  useEffect(() => { setTrayOpen(false); }, [episodeUrl]);
+  const react = useCallback(async (id: ReactionId) => {
+    if (!reactionKey || currentEpNumber == null) return;
+    setTrayTouch((n) => n + 1);
+    const sec = videoRef.current?.currentTime || 0;
+    const b = bucketOf(sec);
+    setReactionMap((m) => addLocalReaction(m, b, id));
+    lastFloatBucketRef.current = b; // don't re-float this bucket right away
+    spawnFloats([id]);
+    const res = await postReaction(reactionKey, currentEpNumber, sec, id);
+    if (res === "rate_limited") setHudToast(t.reactionsSlowDown);
+    else if (res === "error") setHudToast(t.reactionsFailed);
+  }, [reactionKey, currentEpNumber, spawnFloats]);
+  const reactionTotal = useMemo(() => totalReactions(reactionMap), [reactionMap]);
+  const hottest = useMemo(() => hottestBucket(reactionMap, 3), [reactionMap]);
+  const heat = useMemo(
+    () => (showReactionsPref && reactionTotal >= 3 && duration > 0 ? heatSegments(reactionMap, duration, 90) : null),
+    [showReactionsPref, reactionTotal, reactionMap, duration],
+  );
+  const jumpToHottest = useCallback(() => {
+    const v = videoRef.current;
+    if (!hottest || !v || partyClientRef.current) return;
+    // Land a few seconds before the peak so the moment plays out.
+    try { v.currentTime = Math.max(0, hottest.bucket * 5 - 4); } catch {}
+    setHudToast(t.reactionsHottestJump);
+  }, [hottest]);
+  const mineNow = reactionMap.get(bucketOf(currentTime))?.mine ?? [];
+
+  // ── Share this moment ──
+  const [sharingMoment, setSharingMoment] = useState(false);
+  const shareMoment = useCallback(async () => {
+    if (sharingMoment || !episodeUrl) return;
+    const sec = Math.round(videoRef.current?.currentTime || 0);
+    const title = fanTitle || meta.episodeTitle;
+    setSharingMoment(true);
+    setHudToast(t.momentCreating);
+    const meta2 = (user?.user_metadata ?? {}) as Record<string, string | undefined>;
+    const res = await createMoment({
+      episodeHref: episodeUrl,
+      animeHref: fanAnimeHref || null,
+      animeTitle: title,
+      epNum: currentEpNumber,
+      image: imgParam || posterFromDetail || null,
+      tSec: sec,
+      sharerName: meta2.custom_name || meta2.full_name || meta2.name || (user?.email ? user.email.split("@")[0] : ""),
+      url4up: up4Param || null,
+      url3rb: a3rbParam || null,
+    });
+    setSharingMoment(false);
+    if (!res.ok) {
+      setHudToast(res.reason === "rate_limited" ? t.momentRateLimited
+        : res.reason === "signin" ? t.companionSignIn
+        : res.reason === "invalid" ? t.momentUnavailable
+        : t.momentFailed);
+      return;
+    }
+    const label = currentEpNumber != null
+      ? `${title} — ${t.episode} ${currentEpNumber} · ${formatClock(sec)}`
+      : `${title} · ${formatClock(sec)}`;
+    try {
+      await navigator.clipboard.writeText(t.momentShareText(label, res.url));
+      setHudToast(t.momentCopied);
+    } catch {
+      setHudToast(res.url);
+    }
+  }, [sharingMoment, episodeUrl, fanTitle, meta.episodeTitle, fanAnimeHref, currentEpNumber, imgParam, posterFromDetail, user, up4Param, a3rbParam]);
 
   /* ── Silent next-episode prefetch (gated by Settings) ── */
   const prefetchTitle = meta.animeTitle || animeTitleFromDetail || slugTitle || titleParam;
@@ -2849,6 +3203,55 @@ export function WatchPage() {
               </button>
             )}
 
+            {/* Floating reactions (others as playback passes busy moments, mine on click) */}
+            {floats.length > 0 && (
+              <div className="pointer-events-none absolute bottom-24 right-0 z-30 h-64 w-36 overflow-visible">
+                {floats.map((f) => (
+                  <span key={f.id} className="absolute bottom-0 animate-reactionFloat text-3xl" style={{ right: f.x }}>
+                    {f.glyph}
+                  </span>
+                ))}
+              </div>
+            )}
+            {/* Reaction tray */}
+            {trayOpen && (
+              <div className="absolute bottom-24 left-1/2 z-40 flex -translate-x-1/2 items-center gap-1 rounded-full border border-white/15 bg-black/90 px-2 py-1.5 shadow-card backdrop-blur-md" onClick={(e) => e.stopPropagation()}>
+                {REACTIONS.map((r) => (
+                  <button
+                    key={r.id}
+                    onClick={() => void react(r.id)}
+                    aria-label={r.id}
+                    className={`flex h-11 w-11 items-center justify-center rounded-full text-2xl transition hover:scale-125 ${mineNow.includes(r.id) ? "bg-accent/25" : ""}`}
+                  >
+                    {r.glyph}
+                  </button>
+                ))}
+              </div>
+            )}
+            {/* Last episode, ≥90%: the story continues in the manga */}
+            {nearEnd && endBridge && !endBridgeDismissed && !isPartyClient && (
+              <div dir="rtl" className="absolute bottom-24 right-6 z-30 w-[min(380px,80%)]" onClick={(e) => e.stopPropagation()}>
+                <div className="relative">
+                  <MangaBridgeCard
+                    info={endBridge}
+                    animeTitle={fanTitle || companionCtx.title}
+                    compact
+                    beforeOpen={() => {
+                      try { videoRef.current?.pause(); } catch {}
+                      if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+                    }}
+                  />
+                  <button
+                    onClick={() => setEndBridgeDismissed(true)}
+                    aria-label={t.cancel}
+                    className="absolute -left-2.5 -top-2.5 flex h-7 w-7 items-center justify-center rounded-full border border-white/20 bg-black/85 text-white"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" aria-hidden><path d="M18 6 6 18M6 6l12 12" /></svg>
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Next-episode countdown card — appears at ~10s left instead of
                 hopping instantly. "Watch now" / ✕ clear it; the auto-advance
                 is already burned for this episode either way. */}
@@ -2865,7 +3268,7 @@ export function WatchPage() {
                   <p className="text-[11px] text-text-muted">{t.autoplayNextIn(nextCountdown)}</p>
                 </div>
                 <button
-                  onClick={() => { setNextCountdown(null); if (next) navTo(next, true); }}
+                  onClick={() => { setNextCountdown(null); if (next) goNextEpisode(true); }}
                   className="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs font-bold text-black transition hover:bg-accent-bright"
                 >
                   {t.watchNow}
@@ -2887,6 +3290,18 @@ export function WatchPage() {
               }`}
               onClick={(e) => e.stopPropagation()}
             >
+              {/* Hype map — everyone's reactions along the episode */}
+              {heat && (
+                <div className="pointer-events-none flex h-4 items-end gap-px" aria-label={t.reactionsHeat}>
+                  {heat.map((v, i) => (
+                    <div
+                      key={i}
+                      className="flex-1 rounded-sm bg-accent"
+                      style={{ height: `${2 + v * 14}px`, opacity: v > 0 ? 0.35 + v * 0.65 : 0.12 }}
+                    />
+                  ))}
+                </div>
+              )}
               {/* Seek bar — track thickens and thumb appears on hover */}
               <div className="group/seek relative flex items-center py-2">
                 <div className="pointer-events-none absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 overflow-hidden rounded-full bg-white/20 transition-all duration-150 group-hover/seek:h-1.5">
@@ -2929,7 +3344,7 @@ export function WatchPage() {
                   <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" /></svg>
                 </button>
                 <button
-                  onClick={() => next && navTo(next)}
+                  onClick={() => next && goNextEpisode(false)}
                   disabled={!next}
                   title="Next episode"
                   className="rounded-lg p-2 transition hover:bg-white/15 disabled:opacity-30 disabled:hover:bg-transparent"
@@ -2966,6 +3381,42 @@ export function WatchPage() {
                 </span>
 
                 <span className="flex-1" />
+
+                {/* Reactions: tray toggle + jump to the hottest moment */}
+                {reactionKey && currentEpNumber != null && !isOffline && (
+                  <button
+                    onClick={() => { setTrayOpen((o) => !o); showControls(); }}
+                    title={t.reactionsReact}
+                    className={`flex items-center gap-1 rounded-lg p-2 transition hover:bg-white/15 ${trayOpen ? "text-accent" : ""}`}
+                  >
+                    <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden><circle cx="12" cy="12" r="9" /><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01" /></svg>
+                    {reactionTotal > 0 && showReactionsPref && <span className="text-xs font-semibold tabular-nums">{reactionTotal}</span>}
+                  </button>
+                )}
+                {showReactionsPref && hottest && !isPartyClient && (
+                  <button
+                    onClick={jumpToHottest}
+                    title={t.reactionsHottest}
+                    className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-semibold transition hover:bg-white/15"
+                  >
+                    <span aria-hidden>{hottest.top ? glyphOf(hottest.top) : "🔥"}</span>
+                    {t.reactionsHottest}
+                  </button>
+                )}
+                {!isOffline && (
+                  <button
+                    onClick={shareMoment}
+                    disabled={sharingMoment}
+                    title={t.momentShare}
+                    className="rounded-lg p-2 transition hover:bg-white/15 disabled:opacity-50"
+                  >
+                    {sharingMoment ? (
+                      <span className="block h-[19px] w-[19px] animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                    ) : (
+                      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden><circle cx="18" cy="5" r="3" /><circle cx="6" cy="12" r="3" /><circle cx="18" cy="19" r="3" /><path d="m8.6 10.5 6.8-4M8.6 13.5l6.8 4" /></svg>
+                    )}
+                  </button>
+                )}
 
                 {/* Subtitle settings — only when a sidecar track exists
                     (anime4up servers). Size + vertical position, persisted. */}
@@ -3195,7 +3646,7 @@ export function WatchPage() {
             {t.episode} {prev?.number ?? ""}
           </button>
           <button
-            onClick={() => next && navTo(next)}
+            onClick={() => next && goNextEpisode(false)}
             disabled={!next}
             className="flex h-10 items-center gap-2 rounded-control bg-accent px-4 text-sm font-extrabold text-on-accent transition hover:bg-accent-bright disabled:bg-white/[0.06] disabled:text-white disabled:opacity-30"
           >
@@ -3228,6 +3679,81 @@ export function WatchPage() {
           )}
         </div>
       </div>
+
+      {/* Shared moment / "previously on…" recap / filler notice */}
+      {momentSec != null && (
+        <div className="flex items-center gap-2 rounded-xl border border-mint/30 bg-mint/10 px-3 py-2.5 text-xs font-semibold text-mint">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7" /><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" /></svg>
+          {t.momentOpenedFrom(momentFrom, formatClock(momentSec))}
+        </div>
+      )}
+      {recapOffer && !isPartyClient && (
+        <div className="rounded-2xl border border-accent/30 bg-accent/[0.08] p-4">
+          <div className="flex items-center gap-3">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-accent/15 text-accent">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden><path d="M12 2l1.9 5.7L19.6 9.6l-5.7 1.9L12 17.2l-1.9-5.7L4.4 9.6l5.7-1.9L12 2z" /></svg>
+            </span>
+            <div className="min-w-0 flex-1">
+              <p className="text-[15px] font-bold leading-6 text-white">
+                {recapOffer.kind === "gap" ? t.recapGapTitle(recapOffer.days) : t.recapJumpTitle(currentEpNumber ?? 0)}
+              </p>
+              <p className="text-xs text-text-muted">{t.recapSub}</p>
+            </div>
+            <button
+              type="button"
+              onClick={dismissRecap}
+              aria-label={t.cancel}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-text-muted transition hover:bg-white/10 hover:text-white"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" aria-hidden><path d="M18 6 6 18M6 6l12 12" /></svg>
+            </button>
+          </div>
+          {recapState === "idle" && (
+            <button
+              type="button"
+              onClick={loadRecap}
+              className="mt-3 flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-accent text-sm font-bold text-on-accent transition hover:bg-accent-bright"
+            >
+              {t.recapCta}
+            </button>
+          )}
+          {recapState === "loading" && (
+            <div className="mt-3 flex h-11 items-center justify-center gap-2 text-sm text-text-secondary">
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-accent border-t-transparent" />
+              {t.recapLoading}
+            </div>
+          )}
+          {recapState === "done" && (
+            <div className="mt-3 space-y-2 text-sm leading-7 text-text-secondary">
+              <AnswerText text={recapText} />
+              <p className="text-xs font-semibold text-accent">{t.recapReady}</p>
+            </div>
+          )}
+          {recapState === "error" && (
+            <div className="mt-3 flex items-center gap-3">
+              <p className="flex-1 text-xs text-text-secondary">{recapError}</p>
+              <button type="button" onClick={loadRecap} className="rounded-lg bg-white/10 px-3.5 py-2 text-xs font-bold text-white hover:bg-white/15">
+                {t.retry}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+      {isSkippable(currentEpKind) && (
+        <div className="flex items-center justify-between gap-3 rounded-2xl border border-gold/30 bg-gold/10 px-4 py-3">
+          <p className="text-[13px] font-semibold text-gold">{t.fillerThisEp}</p>
+          {nextCanonNum != null && !isPartyClient && (
+            <button
+              type="button"
+              onClick={skipFillerNow}
+              className="flex shrink-0 items-center gap-1.5 rounded-lg bg-gold px-3 py-2 text-xs font-bold text-bg transition hover:brightness-110"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden><path d="M6 18l8.5-6L6 6v12zM16 6h2v12h-2z" /></svg>
+              {t.fillerSkipTo(nextCanonNum)}
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Server picker */}
       <section className="space-y-2">
@@ -3284,6 +3810,7 @@ export function WatchPage() {
                   {s.source && (
                     <span className="ms-1.5 opacity-60">· {s.source === "anime4up" ? "4up" : s.source === "anime3rb" ? "3rb" : s.source === "offline" ? "offline" : "wit"}</span>
                   )}
+                  {activeIdx !== i && !broken && healthBadge(s)}
                 </button>
               );
             })}

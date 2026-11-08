@@ -55,6 +55,47 @@ export async function askCompanion(req: CompanionRequest): Promise<CompanionResu
   }
 }
 
+export type AiFailure = "offline" | "signin" | "unavailable" | "rate_limited" | "error";
+
+/**
+ * Raw call into the anime-companion function for the JSON modes ("search",
+ * "bridge"). Same failure mapping as the chat path; never throws.
+ */
+export async function invokeAiFunction<T>(
+  body: Record<string, unknown>,
+  timeoutMs = 30_000,
+): Promise<{ ok: true; data: T } | { ok: false; reason: AiFailure }> {
+  if (!isSupabaseConfigured) return { ok: false, reason: "offline" };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<{ ok: false; reason: AiFailure }>((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, reason: "error" }), timeoutMs + 4_000);
+  });
+  const run = (async (): Promise<{ ok: true; data: T } | { ok: false; reason: AiFailure }> => {
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (!sessionData?.session) return { ok: false, reason: "signin" };
+      const { data, error } = await supabase.functions.invoke("anime-companion", { body, timeout: timeoutMs });
+      if (error) {
+        const status = (error as { context?: { status?: number } })?.context?.status;
+        if (status === 404) return { ok: false, reason: "unavailable" };
+        return { ok: false, reason: status === 429 ? "rate_limited" : status === 401 ? "signin" : "error" };
+      }
+      const res = (data ?? {}) as { ok?: boolean; error?: string };
+      if (res.ok) return { ok: true, data: data as T };
+      if (res.error === "not_configured") return { ok: false, reason: "unavailable" };
+      if (res.error === "rate_limited") return { ok: false, reason: "rate_limited" };
+      return { ok: false, reason: "error" };
+    } catch {
+      return { ok: false, reason: "error" };
+    }
+  })();
+  try {
+    return await Promise.race([run, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function askOnce(req: CompanionRequest): Promise<CompanionResult> {
   try {
     const { data: sessionData } = await supabase.auth.getSession();

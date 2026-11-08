@@ -18,6 +18,7 @@ import {
   useReadChapters,
 } from "../../lib/manga/store";
 import { mangaReaderPath } from "../../lib/manga/nav";
+import { AnimeAdaptationRail } from "../../components/manga/AnimeAdaptationRail";
 import { ChapterRow, ICONS, MangaCover, MangaPage, MangaSkeleton, MangaState, MIcon } from "../../components/manga/MangaUI";
 
 const CHAPTER_PAGE = 120;
@@ -216,6 +217,11 @@ export function MangaDetailPage() {
                   </button>
                 )}
               </section>
+            )}
+
+            {/* Reverse bridge: this manga's anime adaptations */}
+            {detail && (
+              <AnimeAdaptationRail titles={[detail.title, titleParam].filter((x, i, a) => !!x && a.indexOf(x) === i)} />
             )}
 
             <div className="my-7 border-t border-m-line" />

@@ -12,7 +12,7 @@ type Msg = { role: "user" | "ai"; text: string };
 /** AI answer: renders the **bold** spans the companion uses for key names
  *  and terms (they showed up as raw asterisks). Bullets arrive as "• " lines
  *  and the bubble's whitespace-pre-line keeps the line breaks. */
-function AnswerText({ text }: { text: string }) {
+export function AnswerText({ text }: { text: string }) {
   const parts = text.split(/\*\*([^*\n]+)\*\*/g);
   return (
     <>

@@ -798,7 +798,15 @@ export function MangaReaderPage() {
           <MIcon d={ICONS.back} />
         </button>
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-bold">{titleText}</div>
+          {/* Title click → the manga's detail page. */}
+          <button
+            type="button"
+            onClick={() => navigate(mangaDetailPath({ source, id: mangaId, title: mangaTitle, cover: coverParam }))}
+            disabled={!mangaId}
+            className="block max-w-full truncate text-start text-sm font-bold hover:underline"
+          >
+            {titleText}
+          </button>
           <div className="text-xs text-m-night-muted">الفصل {chapterNumber}{total ? ` · ${index + 1} / ${total}` : ""}</div>
         </div>
         <button type="button" onClick={toggleFullscreen} title="ملء الشاشة (F)" className="flex h-10 w-10 items-center justify-center rounded-full hover:bg-white/10">

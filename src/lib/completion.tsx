@@ -20,7 +20,7 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { storage as AsyncStorage } from "./storage";
 import { normAnimeKey, animeTitleKey, getCompletedSets, subscribeHistory, getHistoryByAnime } from "./history";
-import { matchingRecords, sameSource, isBlobRecord, buildCompletedList, type CompletedEntry } from "./completionMatch";
+import { sameSource, isBlobRecord, buildCompletedList, strictMatchingRecords, findContamination, anchorKeys, primaryTitleKey, titleCompatible, type CompletedEntry } from "./completionMatch";
 import { supabase, isSupabaseConfigured, getSessionUser } from "./supabase";
 import { createRequestCache, withTimeout } from "./requestCache";
 
@@ -89,10 +89,12 @@ export async function getCompletionMap(): Promise<Record<string, AnimeCompletion
         const fixed = repairBlob(rec);
         if (fixed) { map[rec.key] = fixed; repaired.push(fixed); }
       }
+      const sanitized = sanitizeCompletionMap(map);
       completionCache = map;
-      if (repaired.length) {
+      if (repaired.length || sanitized.changed.length || sanitized.removed.length) {
         void saveCompletionMap(map);
-        for (const rec of repaired) pushToCloud(rec).catch(() => {});
+        for (const rec of [...repaired, ...sanitized.changed]) pushToCloud(rec).catch(() => {});
+        void deleteCloudKeys(sanitized.removed);
       }
     } catch {
       completionCache = {};
@@ -131,15 +133,111 @@ export async function resetLocalCompletion(): Promise<void> {
   notify();
 }
 
-/** All completion records for this anime, by any source href or folded title. */
+/**
+ * One-time repairs, run on load and after a cloud pull (idempotent):
+ *  1. Legacy full-URL keys ("https://witanime.you/anime/x") collapse into the
+ *     TLD-stable key ("witanime/anime/x") — they were the same anime twice.
+ *  2. Polluted records (another anime's anchor page among their hrefs) lose
+ *     those links. If their state equals the polluter's (same episode count),
+ *     it was copied from it → reset so the page / feed recompute it. Their
+ *     victims lose an inherited "finished" (AniList re-verifies it).
+ * Mutates `map`; returns records to push and legacy keys to delete remotely.
+ */
+function sanitizeCompletionMap(map: Record<string, AnimeCompletion>): { changed: AnimeCompletion[]; removed: string[] } {
+  const changed = new Map<string, AnimeCompletion>();
+  const removed: string[] = [];
+  for (const rec of Object.values(map)) {
+    if (!/^https?:\/\//i.test(rec.key)) continue;
+    const norm = normAnimeKey(rec.key);
+    if (!norm || norm === rec.key) continue;
+    const target = map[norm];
+    const merged: AnimeCompletion = target
+      ? {
+        ...(target.updatedAt >= rec.updatedAt ? target : { ...rec, key: norm }),
+        key: norm,
+        hrefs: uniq([...target.hrefs, ...rec.hrefs]),
+        titles: uniq([...target.titles, ...rec.titles]),
+        marked: !!target.marked || !!rec.marked,
+        image: target.image || rec.image,
+      }
+      : { ...rec, key: norm };
+    if (merged.marked) { merged.caughtUp = true; merged.finished = true; }
+    delete map[rec.key];
+    changed.delete(rec.key);
+    removed.push(rec.key);
+    map[norm] = merged;
+    changed.set(norm, merged);
+  }
+
+  const { cleaned } = findContamination(Object.values(map), normAnimeKey, animeTitleKey);
+  const now = Date.now();
+  for (const [key, fix] of cleaned) {
+    const rec = map[key];
+    if (!rec) continue;
+    const owners = fix.foreignOwners.map((k) => map[k]).filter(Boolean);
+    const copied = owners.some((o) => o.lastEpNum === rec.lastEpNum);
+    const marked = !!rec.marked;
+    const next: AnimeCompletion = copied
+      ? { ...rec, hrefs: fix.hrefs, titles: fix.titles, lastEpNum: 0, caughtUp: marked, finished: marked, updatedAt: now }
+      : { ...rec, hrefs: fix.hrefs, titles: fix.titles, updatedAt: now };
+    map[key] = next;
+    changed.set(key, next);
+    // The polluter's "finished" may have come from this record (AniList was
+    // asked about the polluted record's title) — drop it; recheck re-confirms.
+    if (!rec.finished) continue;
+    for (const o of owners) {
+      if (o.marked || !o.finished || o.lastEpNum !== rec.lastEpNum) continue;
+      const victimTitle = primaryTitleKey(o, animeTitleKey);
+      for (const sib of Object.values(map)) {
+        if (sib.marked || !sib.finished || primaryTitleKey(sib, animeTitleKey) !== victimTitle) continue;
+        map[sib.key] = { ...sib, finished: false, updatedAt: now };
+        changed.set(sib.key, map[sib.key]);
+      }
+    }
+  }
+  return { changed: [...changed.values()], removed };
+}
+
+async function deleteCloudKeys(keys: string[]) {
+  if (!keys.length || !isSupabaseConfigured) return;
+  try {
+    const user = await getSessionUser();
+    if (!user) return;
+    await supabase.from("anime_completion").delete().eq("user_id", user.id).in("anime_key", keys);
+  } catch {}
+}
+
+/**
+ * All completion records that ARE this anime (see strictMatchingRecords):
+ * the page's own record, same-titled copies on other sources, and records
+ * anchored on another of its hrefs whose titles agree. hrefs[0] is the page's
+ * own href. Records that merely list a href as a hint never match — that is
+ * how one anime's state leaked into another's badge.
+ */
 function matchCompletionRecords(
   map: Record<string, AnimeCompletion>,
   hrefs: (string | null | undefined)[],
   titles: (string | null | undefined)[],
 ): AnimeCompletion[] {
   const hrefKeys = new Set((hrefs || []).filter(Boolean).map((h) => normAnimeKey(h!)));
-  const titleKeys = new Set((titles || []).filter(Boolean).map((t) => animeTitleKey(t!)));
-  return matchingRecords(Object.values(map), hrefKeys, titleKeys, normAnimeKey, animeTitleKey);
+  const titleKeys = new Set((titles || []).filter(Boolean).map((t) => animeTitleKey(t!)).filter(Boolean));
+  const own = normAnimeKey((hrefs || []).find(Boolean) || "");
+  return strictMatchingRecords(Object.values(map), own, hrefKeys, titleKeys, normAnimeKey, animeTitleKey);
+}
+
+/** Drop page hrefs that are the anchor of a record for a DIFFERENT anime
+ *  (e.g. the anime4up lookup resolved a sequel page to season 1). The page's
+ *  own href (first) is always kept. */
+function ownHrefs(map: Record<string, AnimeCompletion>, hrefs: string[], titles: string[]): string[] {
+  const titleKeys = new Set(titles.map((t) => animeTitleKey(t)).filter(Boolean));
+  if (titleKeys.size === 0) return hrefs;
+  const records = Object.values(map);
+  return hrefs.filter((h, i) => {
+    if (i === 0) return true;
+    const k = normAnimeKey(h);
+    const owners = records.filter((r) => anchorKeys(r, normAnimeKey).includes(k));
+    return owners.length === 0 || owners.some((o) => titleCompatible(o, titleKeys, animeTitleKey));
+  });
 }
 
 /** Push one record to Supabase (fire-and-forget; logs on failure). */
@@ -178,12 +276,13 @@ export async function recordAnimeCompletion(rec: {
    *  aged out of the capped local history, which must not erase the badge. */
   lastTracked?: boolean;
 }): Promise<void> {
-  const hrefs = uniq(rec.hrefs);
+  let hrefs = uniq(rec.hrefs);
   const titles = uniq(rec.titles);
   // ponytail: TLD-stable key. Records written under the old full-URL scheme keep
   // resolving via buildLookup (it re-indexes hrefs by normAnimeKey), so badges
   // still show; a stale old-key record may briefly co-exist until it's re-written.
   const map = await getCompletionMap();
+  hrefs = ownHrefs(map, hrefs, titles);
   // Reuse any record this anime already has under ANOTHER source URL/title.
   // Keying purely off the incoming href used to mint a second record (witanime
   // vs anime4up, "III" vs "Ⅲ") with its own caughtUp state — a card resolving
@@ -271,11 +370,12 @@ export async function setAnimeMarkedCompleted(opts: {
   caughtUp: boolean;
   lastTracked?: boolean;
 }): Promise<void> {
-  const hrefs = uniq(opts.hrefs);
+  let hrefs = uniq(opts.hrefs);
   const titles = uniq(opts.titles);
   const key = normAnimeKey(hrefs[0] || "") || animeTitleKey(titles[0]);
   if (!key) return;
   const map = await getCompletionMap();
+  hrefs = ownHrefs(map, hrefs, titles);
   let targets = matchCompletionRecords(map, hrefs, titles);
   if (targets.length === 0) {
     targets = [{ key, hrefs, titles, lastEpNum: opts.lastEpNum, caughtUp: false, finished: false, updatedAt: 0 }];
@@ -353,8 +453,11 @@ export async function pullCompletionFromCloud(): Promise<void> {
       };
     }
   }
+  const sanitized = sanitizeCompletionMap(map);
   await saveCompletionMap(map);
   notify();
+  for (const rec of sanitized.changed) pushToCloud(rec).catch(() => {});
+  void deleteCloudKeys(sanitized.removed);
 }
 
 /**
@@ -414,18 +517,21 @@ export async function reconcileCompletionFromEpisodes(
   // Index once: reconciling N records must not scan all N for each item.
   const byHref = new Map<string, Set<string>>();
   const byTitle = new Map<string, Set<string>>();
+  // Index each record by what it OWNS (anchor pages + primary title), not by
+  // its hint hrefs/titles: a polluted hint let another anime's new episode
+  // flip this record's badge.
+  const add = (lookup: Map<string, Set<string>>, key: string, recKey: string) => {
+    if (!key) return;
+    let keys = lookup.get(key);
+    if (!keys) { keys = new Set(); lookup.set(key, keys); }
+    keys.add(recKey);
+  };
+  const primaryOf = new Map<string, string>();
   const index = (rec: AnimeCompletion) => {
-    for (const [values, lookup, normalize] of [
-      [rec.hrefs, byHref, normAnimeKey], [rec.titles, byTitle, animeTitleKey],
-    ] as const) {
-      for (const value of values) {
-        const key = normalize(value);
-        if (!key) continue;
-        let keys = lookup.get(key);
-        if (!keys) { keys = new Set(); lookup.set(key, keys); }
-        keys.add(rec.key);
-      }
-    }
+    for (const a of anchorKeys(rec, normAnimeKey)) add(byHref, a, rec.key);
+    const primary = primaryTitleKey(rec, animeTitleKey);
+    primaryOf.set(rec.key, primary);
+    add(byTitle, primary, rec.key);
   };
   for (const rec of Object.values(map)) index(rec);
 
@@ -434,11 +540,16 @@ export async function reconcileCompletionFromEpisodes(
   let changed = false;
   for (const it of items) {
     if (it.epNum == null || it.epNum <= 0) continue;
+    const itemTitle = animeTitleKey(it.animeTitle);
+    const itemTitleKeys = new Set([itemTitle].filter(Boolean));
     const keys = new Set([
-      ...(byHref.get(normAnimeKey(it.animeHref || "")) || []),
-      ...(byTitle.get(animeTitleKey(it.animeTitle)) || []),
+      ...[...(byHref.get(normAnimeKey(it.animeHref || "")) || [])].filter((k) => {
+        const primary = primaryOf.get(k);
+        return !!map[k] && (!itemTitle || !primary || primary === itemTitle || titleCompatible(map[k], itemTitleKeys, animeTitleKey));
+      }),
+      ...(byTitle.get(itemTitle) || []),
     ]);
-    let recs = [...keys].map((key) => map[key]);
+    let recs = [...keys].map((key) => map[key]).filter(Boolean);
     if (recs.length === 0) {
       const key = normAnimeKey(it.animeHref || "") || animeTitleKey(it.animeTitle);
       if (!key) continue;

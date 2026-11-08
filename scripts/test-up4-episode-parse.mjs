@@ -34,8 +34,10 @@ const js = ts.transpileModule(source, {
 }).outputText;
 vm.runInContext(js, sandbox);
 
-const { findUp4EpisodeAcrossPages } = mod.exports;
-const probe = await fetchHtml("https://w1.anime4up.rest/anime/mirai-nikki/");
+const { findUp4EpisodeAcrossPages, scrapeAnime4upEpisodesDirect } = mod.exports;
+// anime4up rotates mirrors; override with UP4_HOST=https://<mirror> when w1 is down.
+const HOST = (process.env.UP4_HOST || "https://w1.anime4up.rest").replace(/\/+$/, "");
+const probe = await fetchHtml(`${HOST}/anime/mirai-nikki/`);
 if (!probe) {
   console.log("SKIP: anime4up unreachable (network/geo) — parser not exercised");
   process.exit(0);
@@ -43,8 +45,8 @@ if (!probe) {
 
 let failed = 0;
 const cases = [
-  ["single-page list finds ep 3", "https://w1.anime4up.rest/anime/mirai-nikki/", 3, "-الحلقة-3-"],
-  ["paginated list finds ep 1100", "https://w1.anime4up.rest/anime/one-piece-gfjgfh/", 1100, "-1100"],
+  ["single-page list finds ep 3", `${HOST}/anime/mirai-nikki/`, 3, "-الحلقة-3-"],
+  ["paginated list finds ep 1100", `${HOST}/anime/one-piece-gfjgfh/`, 1100, "-1100"],
 ];
 for (const [label, animeUrl, ep, needle] of cases) {
   try {
@@ -56,6 +58,18 @@ for (const [label, animeUrl, ep, needle] of cases) {
     failed++;
     console.error(`FAIL ${label}: ${error.message}`);
   }
+}
+// Full-list parse must walk every page: Black Clover's 170 episodes span 4
+// pages, and a page-1-only parse showed just 123–170 on the detail screen.
+try {
+  const eps = await scrapeAnime4upEpisodesDirect(`${HOST}/anime/black-clover-fgh/`);
+  const nums = new Set(eps.map((e) => e.number));
+  const missing = Array.from({ length: 170 }, (_, i) => i + 1).filter((n) => !nums.has(n));
+  if (missing.length === 0) console.log(`PASS full list spans pages: ${eps.length} episodes`);
+  else { failed++; console.error(`FAIL full list: ${eps.length} episodes, missing ${missing.slice(0, 10).join(",")}…`); }
+} catch (error) {
+  failed++;
+  console.error(`FAIL full list: ${error.message}`);
 }
 console.log(failed === 0 ? "ALL UP4 PARSE CHECKS PASSED" : `${failed} check(s) failed`);
 process.exit(failed === 0 ? 0 : 1);

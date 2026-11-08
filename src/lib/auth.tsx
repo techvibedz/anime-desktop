@@ -56,6 +56,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // OAuth callback handler — fires when the system browser redirects to
     // pantoufa://auth-callback and the main process forwards us the URL.
     const off = window.pantoufa?.onAuthCallback?.(async (url) => {
+      // pantoufa://moment/<id> shares the protocol — Layout routes those.
+      if (/^pantoufa:\/\/moment\//i.test(url)) return;
       try {
         const hash = url.split("#")[1] ?? "";
         const query = url.split("?")[1]?.split("#")[0] ?? "";

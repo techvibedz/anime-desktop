@@ -59,9 +59,9 @@ const HOME_CACHE_KEY = "@home_cache_v3";
 // background once older than HOME_FRESH_MS.
 const HOME_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
 const HOME_FRESH_MS = 5 * 60 * 1000;
-const DETAIL_CACHE_PREFIX = "@detail_v4:";
+const DETAIL_CACHE_PREFIX = "@detail_v5:";
 const DETAIL_CACHE_TTL = 30 * 60 * 1000;
-const UP4_CACHE_PREFIX = "@up4_eps_v2:";
+const UP4_CACHE_PREFIX = "@up4_eps_v3:";
 const UP4_CACHE_TTL = 24 * 60 * 60 * 1000;
 // Resolved Witanime ANIME pages per source title (see fetchCompleteVideoServers).
 // Remembers what a free-text search resolved to so later episodes of the same
@@ -457,7 +457,7 @@ async function fetchEpisodesFresh(animeUrl: string): Promise<EpisodesPayload> {
           (async () => {
             const title = titleFromSlug(animeUrl);
             const url = await searchAnime4upDirect(title);
-            const alternate = url ? await scrapeAnime4upDetailDirect(url) : null;
+            const alternate = url ? await scrapeAnime4upDetailDirect(url, true) : null;
             if (!alternate || fuzzyScore(title, alternate.title) < 0.75 || tm_seasonNum(title) !== tm_seasonNum(alternate.title))
               throw new Error("Matching anime details unavailable");
             return { ...alternate, up4Url: url };

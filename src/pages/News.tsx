@@ -4,7 +4,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { fetchNewsPage, resetNews, type NewsItem } from "../lib/news";
+import { fetchNewsPage, getCachedNewsFirstPage, resetNews, type NewsItem } from "../lib/news";
 import { useOnlineStatus } from "../lib/net";
 import { Shimmer } from "../components/Shimmer";
 import { t } from "../lib/i18n";
@@ -19,26 +19,40 @@ export function NewsPage() {
   const [loadingMore, setLoadingMore] = useState(false);
   const seenRef = useRef<Set<number>>(new Set());
   const sentinelRef = useRef<HTMLDivElement>(null);
+  const firstLoading = useRef(false); // page 0 in flight (cached page may be showing)
 
-  const loadFirst = useCallback(async () => {
-    setItems(null);
+  const loadFirst = useCallback(async (useCache = false) => {
     setPage(0);
     setHasMore(true);
     seenRef.current = new Set();
+    firstLoading.current = true;
+    let fresh = false;
+    if (useCache) {
+      // Instant paint from the last session's first page; replaced below.
+      void getCachedNewsFirstPage().then((cached) => {
+        if (cached && !fresh) setItems((prev) => prev ?? cached);
+      });
+    } else {
+      setItems(null);
+    }
     try {
       const { items: batch, hasMore: more } = await fetchNewsPage(0);
+      fresh = true;
       seenRef.current = new Set(batch.map((n) => n.id));
-      setItems(batch);
+      // Keep the cached page on screen if the network fetch came back empty.
+      setItems((prev) => (batch.length || !prev ? batch : prev));
       setHasMore(more);
     } catch {
-      setItems([]);
+      fresh = true;
+      setItems((prev) => prev ?? []);
     } finally {
+      firstLoading.current = false;
       setRefreshing(false);
     }
   }, []);
 
   const loadMore = useCallback(async () => {
-    if (loadingMore || !hasMore || items === null) return;
+    if (loadingMore || firstLoading.current || !hasMore || items === null) return;
     setLoadingMore(true);
     const next = page + 1;
     try {
@@ -56,7 +70,7 @@ export function NewsPage() {
   }, [page, hasMore, loadingMore, items]);
 
   useEffect(() => {
-    void loadFirst();
+    void loadFirst(true);
   }, [loadFirst]);
 
   useEffect(() => {

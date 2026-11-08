@@ -19,6 +19,9 @@ import { claimLocalData } from "./lib/accountData";
 // Route-level code splitting. Home stays eager (first paint); everything else
 // loads on demand — most importantly Watch, which pulls in hls.js.
 const SearchPage = lazy(() => import("./pages/Search").then((m) => ({ default: m.SearchPage })));
+const SmartSearchPage = lazy(() => import("./pages/SmartSearch").then((m) => ({ default: m.SmartSearchPage })));
+const WrappedPage = lazy(() => import("./pages/Wrapped").then((m) => ({ default: m.WrappedPage })));
+const MomentPage = lazy(() => import("./pages/Moment").then((m) => ({ default: m.MomentPage })));
 const MyListPage = lazy(() => import("./pages/MyList").then((m) => ({ default: m.MyListPage })));
 const AnimeDetailPage = lazy(() => import("./pages/AnimeDetail").then((m) => ({ default: m.AnimeDetailPage })));
 const WatchPage = lazy(() => import("./pages/Watch").then((m) => ({ default: m.WatchPage })));
@@ -189,6 +192,9 @@ export default function App() {
           <Route path="/" element={<Layout />}>
             <Route index element={<HomePage />} />
             <Route path="search" element={<SearchPage />} />
+            <Route path="smart-search" element={<SmartSearchPage />} />
+            <Route path="wrapped" element={<WrappedPage />} />
+            <Route path="moment/:id" element={<MomentPage />} />
             <Route path="mylist" element={<MyListPage />} />
             <Route path="anime/:id" element={<AnimeDetailPage />} />
             <Route path="watch/:episode" element={<WatchPage />} />

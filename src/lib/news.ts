@@ -1,23 +1,33 @@
 // Anime News feed — scraped straight from MyAnimeList's global news index
 // (https://myanimelist.net/news), which lists the LATEST articles across every
-// anime, newest-first, ~20 per page (?p=N). Ported from the mobile app.
+// anime, newest-first, ~20 per page (?p=N). This replaces the old Jikan
+// per-season aggregation, which could only ever surface news about a handful
+// of airing titles and routinely showed weeks-old items as "latest".
 //
-// Brand safety: a keyword guard on the English headline (isSafeNews) drops any
-// adult-content article before it is translated or displayed.
+// Brand safety: two layers drop adult (+18) articles before they are translated
+// or displayed — a keyword guard on the English headline (isSafeNews), and a
+// subject check (adultNewsIds): the work each headline quotes is looked up on
+// AniList (one batched request per index page) and adult / Hentai / Ecchi
+// subjects are dropped. Headlines use Japanese titles ("Killing Bites",
+// "Yumene Connect"), so the keyword guard alone let most of these through.
+//
+// Speed: the adult check and the Arabic translation run in parallel, and the
+// first page is cached on disk so the screen paints instantly on open
+// (getCachedNewsFirstPage) while the fresh feed loads behind it.
 //
 // Everything user-facing is Arabic: headlines, tag chips and article bodies are
 // translated lazily (only the visible page / the opened article) via
 // translateToArabic, which caches results on disk.
 //
-// The article DETAIL page wants the full body + inline images + trailer embeds.
-// MAL serves the article statically inside `<div class="… news-content-body">`
-// — fetchNewsArticle() scrapes it into ordered text/image/video blocks and
-// translates every text block, so the whole post reads in-app, in Arabic.
+// The article DETAIL (app/news/[id].tsx) wants the full body + inline images +
+// trailer embeds. MAL serves the article statically inside
+// `<div class="… news-content-body">` — fetchNewsArticle() scrapes it into
+// ordered text/image/video blocks and translates every text block, so the whole
+// post (trailers included) reads in-app, in Arabic.
 
+import { storage as AsyncStorage } from "./storage";
 import { translateToArabic } from "./translate";
-
-const MAL = "https://myanimelist.net";
-const PAGE_SIZE = 20; // == MAL index page size, so one app page == one GET
+import { anilistPost } from "./malInfo";
 
 // Cross-origin fetch lives in the main process; no CORS in the renderer.
 function fetchHtml(url: string, referer?: string): Promise<string | null> {
@@ -25,6 +35,9 @@ function fetchHtml(url: string, referer?: string): Promise<string | null> {
     window.pantoufa.fetchHtml?.(url, referer).catch(() => null) ?? Promise.resolve(null)
   );
 }
+
+const MAL = "https://myanimelist.net";
+const PAGE_SIZE = 20; // == MAL index page size, so one app page == one GET
 
 export interface NewsItem {
   /** MAL news post id — stable list key + de-dupe. */
@@ -48,6 +61,111 @@ const NSFW_RE = /(\bhentai\b|\becchi\b|\bnsfw\b|18\s*\+|\br-?18\b|\beroge\b|\bpo
 
 export function isSafeNews(title: string): boolean {
   return !NSFW_RE.test(title);
+}
+
+/* ── Adult-subject filter ───────────────────────
+ * MAL headlines quote the work they're about ('Killing Bites', 'Hagure Idol:
+ * Jigoku-hen'). All quoted titles of an index page are searched on AniList in
+ * ONE batched GraphQL request (~0.5s); for each title the most popular entry
+ * whose romaji/english/synonym EXACTLY matches decides — isAdult or a
+ * Hentai/Ecchi genre drops the article. Exact + most-popular matching avoids
+ * false hits on lookalike titles ('Magi' vs an adult 'Magi Magic').
+ * Verdicts are permanent per post, so they're cached on disk; network failures
+ * fail OPEN (not cached) so an AniList outage can't empty the feed — the
+ * headline keyword guard still applies. */
+
+const BLOCKED_GENRES = ["Hentai", "Ecchi"];
+const VERDICT_KEY = "news-adult-verdicts-v2";
+const VERDICT_MAX = 600;
+let verdicts: Record<string, 0 | 1> | null = null;
+
+async function loadVerdicts(): Promise<Record<string, 0 | 1>> {
+  if (verdicts) return verdicts;
+  try { verdicts = JSON.parse((await AsyncStorage.getItem(VERDICT_KEY)) || "{}") || {}; }
+  catch { verdicts = {}; }
+  return verdicts!;
+}
+function saveVerdicts(): void {
+  if (!verdicts) return;
+  const keys = Object.keys(verdicts);
+  if (keys.length > VERDICT_MAX) {
+    // Keep the newest posts (MAL ids grow over time).
+    const keep = keys.sort((a, b) => Number(b) - Number(a)).slice(0, VERDICT_MAX);
+    verdicts = Object.fromEntries(keep.map((k) => [k, verdicts![k]]));
+  }
+  AsyncStorage.setItem(VERDICT_KEY, JSON.stringify(verdicts)).catch(() => {});
+}
+
+/** Exported for the self-check: the work titles a headline quotes ('…'). */
+export function quotedTitles(headline: string): string[] {
+  const out: string[] = [];
+  const re = /['‘’]([^'‘’]{2,80})['‘’]/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(headline)) && out.length < 2) out.push(m[1].trim());
+  return out;
+}
+
+const normTitle = (s: string | null | undefined) =>
+  (s || "").toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "");
+
+interface AlMedia {
+  isAdult: boolean;
+  genres: string[] | null;
+  popularity: number | null;
+  synonyms: string[] | null;
+  title: { romaji: string | null; english: string | null } | null;
+}
+
+/** Returns the set of ids judged adult, or null when AniList couldn't answer. */
+async function anilistAdultCheck(queries: { id: number; q: string }[]): Promise<Set<number> | null> {
+  if (!queries.length) return new Set();
+  const vars: Record<string, string> = {};
+  const decl: string[] = [];
+  const body: string[] = [];
+  queries.forEach((x, i) => {
+    vars[`q${i}`] = x.q;
+    decl.push(`$q${i}:String`);
+    body.push(`r${i}:Page(perPage:6){media(search:$q${i}){isAdult genres popularity synonyms title{romaji english}}}`);
+  });
+  const query = `query(${decl.join(",")}){${body.join(" ")}}`;
+  try {
+    // Main-process POST (DoH, no CORS); capped so the feed never waits long on AniList.
+    const j = await Promise.race([
+      anilistPost(query, vars),
+      new Promise<null>((r) => setTimeout(() => r(null), 8000)),
+    ]);
+    if (!j?.data) return null;
+    const bad = new Set<number>();
+    queries.forEach((x, i) => {
+      const want = normTitle(x.q);
+      const media: AlMedia[] = j.data[`r${i}`]?.media || [];
+      const best = media
+        .filter((m) => [m.title?.romaji, m.title?.english, ...(m.synonyms || [])].some((s) => normTitle(s) === want))
+        .sort((a, b) => (b.popularity || 0) - (a.popularity || 0))[0];
+      if (best && (best.isAdult || (best.genres || []).some((g) => BLOCKED_GENRES.includes(g)))) bad.add(x.id);
+    });
+    return bad;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ids of articles whose subject is adult content. `titles` are the ENGLISH
+ * headlines (captured before translation mutates the items).
+ */
+async function adultNewsIds(titles: { id: number; title: string }[]): Promise<Set<number>> {
+  const v = await loadVerdicts();
+  const pending = titles.filter((n) => v[n.id] === undefined);
+  if (pending.length) {
+    const queries = pending.flatMap((n) => quotedTitles(n.title).map((q) => ({ id: n.id, q })));
+    const bad = await anilistAdultCheck(queries);
+    if (bad) {
+      for (const n of pending) v[n.id] = bad.has(n.id) ? 1 : 0;
+      saveVerdicts();
+    }
+  }
+  return new Set(titles.filter((n) => v[n.id] === 1).map((n) => n.id));
 }
 
 /* ── HTML helpers ─────────────────────────────── */
@@ -155,13 +273,21 @@ let feedInflight: Promise<void> | null = null;
 async function fetchNextIndexPage(): Promise<void> {
   if (exhausted) return;
   const p = malPage + 1;
-  const html = await fetchHtml(`${MAL}/news${p > 1 ? `?p=${p}` : ""}`, `${MAL}/`);
+  const html = await fetchHtml(`${MAL}/news${p > 1 ? `?p=${p}` : ""}`, `${MAL}/`).catch(() => null);
   if (!html) return; // transient failure — state untouched so a retry can succeed
   const batch = parseNewsIndex(html);
   if (!batch.length) { exhausted = true; return; }
   malPage = p;
   const seen = new Set(feed.map((n) => n.id));
-  for (const n of batch) if (!seen.has(n.id)) feed.push(n);
+  const fresh = batch.filter((n) => !seen.has(n.id));
+  // Capture the ENGLISH headlines before translateItem rewrites them, then run
+  // the adult check and the translations side by side.
+  const english = fresh.map((n) => ({ id: n.id, title: n.title }));
+  const [bad] = await Promise.all([adultNewsIds(english), mapLimit(fresh, 8, translateItem)]);
+  for (const n of fresh) {
+    if (bad.has(n.id)) registry.delete(n.id);
+    else feed.push(n);
+  }
 }
 
 // Translate a visible item to Arabic in place + register it for the detail page.
@@ -189,8 +315,30 @@ export async function fetchNewsPage(page: number): Promise<{ items: NewsItem[]; 
     if (feed.length === before) break; // fetch failed — don't spin
   }
   const slice = feed.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
-  await mapLimit(slice, 6, translateItem);
+  await mapLimit(slice, 8, translateItem); // no-op for already-translated items
+  if (page === 0 && slice.length) {
+    AsyncStorage.setItem(FEED_CACHE_KEY, JSON.stringify(slice)).catch(() => {});
+  }
   return { items: slice, hasMore: !exhausted || feed.length > (page + 1) * PAGE_SIZE };
+}
+
+const FEED_CACHE_KEY = "news-feed-first-page-v1";
+
+/**
+ * Last successfully loaded first page (already translated + filtered), for an
+ * instant first paint while fetchNewsPage(0) refreshes. Null if none cached.
+ */
+export async function getCachedNewsFirstPage(): Promise<NewsItem[] | null> {
+  try {
+    const raw = await AsyncStorage.getItem(FEED_CACHE_KEY);
+    if (!raw) return null;
+    const v = await loadVerdicts();
+    const items = (JSON.parse(raw) as NewsItem[]).filter((n) => n && n.id && v[n.id] !== 1);
+    for (const n of items) if (!registry.has(n.id)) registry.set(n.id, n);
+    return items.length ? items : null;
+  } catch {
+    return null;
+  }
 }
 
 /* ── Article detail (full body + images + trailers) ──────────
@@ -250,7 +398,8 @@ function parseArticle(inner: string): ArticleBlock[] {
     pushText(normalized.slice(last, m.index));
     if (m[1]) {
       // MAL bodies occasionally carry cleartext http:// (or protocol-relative
-      // //) image URLs — upgrade everything to https so images always render.
+      // //) image URLs — Android blocks cleartext, so those images silently
+      // never render. Upgrade everything to https (the CDN serves it fine).
       let src = m[1];
       if (src.startsWith("//")) src = `https:${src}`;
       else if (src.startsWith("http://")) src = `https://${src.slice(7)}`;
@@ -277,9 +426,11 @@ export async function fetchNewsArticle(id: number): Promise<ArticleBlock[] | nul
   const cached = articleCache.get(id);
   if (cached) return cached;
 
+  // Safety net for deep links / stale screens: never render a blocked post.
+  if ((await loadVerdicts())[id] === 1) return null;
   const item = registry.get(id);
   const url = item?.url || `${MAL}/news/${id}`;
-  const html = await fetchHtml(url, `${MAL}/`);
+  const html = await fetchHtml(url, `${MAL}/`).catch(() => null);
   if (!html) return null;
 
   const inner = extractArticleDiv(html);
@@ -317,6 +468,8 @@ if (import.meta.env.DEV) {
   console.assert(isSafeNews("Uncensored Hentai OVA listed") === false, "news: hentai not filtered");
   console.assert(isSafeNews("Spring Ecchi roundup") === false, "news: ecchi keyword not filtered");
   console.assert(isSafeNews("Top 10 of 2026") === true, "news: clean item wrongly rejected");
+  console.assert(quotedTitles("Manga 'Hagure Idol: Jigoku-hen' Gets TV Anime").join() === "Hagure Idol: Jigoku-hen", "news: quoted title parse broke");
+  console.assert(quotedTitles("Voice Actress Announces Marriage").length === 0, "news: phantom quoted title");
   // Date parser: a yearless date must land in the recent past, not the future.
   const iso = parseMalDate("Jul 15, 2:48 AM");
   console.assert(!!iso && new Date(iso).getTime() <= Date.now(), "news: yearless date in future");

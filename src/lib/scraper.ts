@@ -663,20 +663,56 @@ function parseUp4Episodes(
   return out;
 }
 
+// Full episode list across anime4up's pagination (~48 per page, newest-first).
+// Page 1 alone is only the newest chunk: Black Clover's 170 episodes span four
+// pages, so a page-1 parse showed just 123–170 — and because the detail screen
+// races this static parse against the witanime scrape, that truncated list won
+// whenever anime4up answered first. Returns `complete: false` when any page
+// failed to load or parse, so a caller can refuse a partial list.
+async function parseUp4AllPages(
+  animeUrl: string,
+  firstPageHtml: string,
+): Promise<{ episodes: ReturnType<typeof parseUp4Episodes>; complete: boolean }> {
+  const first = parseUp4Episodes(firstPageHtml);
+  const maxPage = Math.min(up4MaxPage(firstPageHtml), 60);
+  if (maxPage <= 1 || first.length === 0) return { episodes: first, complete: first.length > 0 };
+  const pages = Array.from({ length: maxPage - 1 }, (_, i) => i + 2);
+  const results: ReturnType<typeof parseUp4Episodes>[] = [];
+  let complete = true;
+  // A few at a time: One Piece is ~25 pages and anime4up throttles bursts.
+  for (let i = 0; i < pages.length; i += 4) {
+    const batch = await Promise.all(pages.slice(i, i + 4).map(async (page) => {
+      const html = await window.pantoufa.fetchHtml?.(up4PageUrl(animeUrl, page), UP4_BASE + "/").catch(() => null);
+      const eps = html ? parseUp4Episodes(html) : [];
+      if (eps.length === 0) complete = false;
+      return eps;
+    }));
+    results.push(...batch);
+  }
+  const byNumber = new Map<number, ReturnType<typeof parseUp4Episodes>[number]>();
+  for (const ep of [first, ...results].flat()) if (!byNumber.has(ep.number)) byNumber.set(ep.number, ep);
+  const episodes = [...byNumber.values()].sort((a, b) => a.number - b.number);
+  return { episodes, complete };
+}
+
 export async function scrapeAnime4upEpisodesDirect(
   animeUrl: string,
 ): Promise<{ title: string; number: number; type: string; screenshot: string; href: string }[]> {
   const html = await window.pantoufa.fetchHtml?.(animeUrl, UP4_BASE + "/");
   if (!html) return [];
-  return parseUp4Episodes(html);
+  return (await parseUp4AllPages(animeUrl, html)).episodes;
 }
 
-export async function scrapeAnime4upDetailDirect(animeUrl: string): Promise<RawDetail | null> {
+export async function scrapeAnime4upDetailDirect(animeUrl: string, requireComplete = false): Promise<RawDetail | null> {
   const html = await window.pantoufa.fetchHtml?.(animeUrl, UP4_BASE + "/", { attempts: 1, timeoutMs: 8000 });
   if (!html) return null;
   const doc = new DOMParser().parseFromString(html, "text/html");
   const title = doc.querySelector(".anime-details-title")?.textContent?.trim() || "";
   if (!title) return null;
+  // requireComplete: a partial list must not win the detail race (and get
+  // cached) over a full witanime scrape — report "unavailable" instead.
+  const { episodes, complete } = await parseUp4AllPages(animeUrl, html);
+  if (requireComplete && !complete) return null;
   const poster = doc.querySelector(".anime-thumbnail img")?.getAttribute("data-image")
     || doc.querySelector(".anime-thumbnail img")?.getAttribute("src") || "";
   return {
@@ -684,7 +720,7 @@ export async function scrapeAnime4upDetailDirect(animeUrl: string): Promise<RawD
     poster: poster ? up4AbsoluteUrl(poster) : "",
     synopsis: doc.querySelector(".anime-story")?.textContent?.trim() || "",
     genres: [...doc.querySelectorAll(".anime-genres a")].map((a) => a.textContent?.trim() || "").filter(Boolean),
-    episodes: parseUp4Episodes(html),
+    episodes,
   };
 }
 

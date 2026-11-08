@@ -343,6 +343,21 @@ export function ProfilePage() {
             </div>
           </div>
 
+          {/* Pantoufa Wrapped — the year in anime, shareable */}
+          <button
+            type="button"
+            onClick={() => navigate("/wrapped")}
+            className="flex w-full items-center gap-4 overflow-hidden rounded-[20px] border border-accent/35 p-4 text-start transition hover:brightness-110"
+            style={{ background: "linear-gradient(225deg, rgba(139,147,255,0.30), rgba(94,234,212,0.14))" }}
+          >
+            <span className="text-3xl" aria-hidden>🍿</span>
+            <span className="min-w-0 flex-1">
+              <span className="block text-base font-bold text-white">{t.wrappedEntry(new Date().getFullYear())}</span>
+              <span className="block text-xs text-text-secondary">{t.wrappedEntrySub}</span>
+            </span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" className="text-text-secondary" aria-hidden><path d="m15 18-6-6 6-6" /></svg>
+          </button>
+
           <div className="pt-3">
             <h2 className="text-lg font-bold text-white">{t.recentActivity}</h2>
             {stats.recent.length === 0 ? (

@@ -20,7 +20,7 @@ import { usePrefersReducedMotion } from "../lib/motion";
 import { canonTitle } from "../lib/relations";
 import { fetchAnimeRecommendations, pickTasteSeeds, rankRecommendations, type RankedRec, type RecItem } from "../lib/recommend";
 import { resolveSourceUrl } from "../lib/schedule";
-import { reconcileCompletionFromEpisodes, useCompletionLookup } from "../lib/completion";
+import { reconcileCompletionFromEpisodes, useCompletionLookup, type AnimeCompletion } from "../lib/completion";
 import { extractEpisodeNumber } from "../lib/episode-utils";
 import { checkOnline } from "../lib/net";
 import { storage } from "../lib/storage";
@@ -140,6 +140,7 @@ export function HomePage() {
     [history, completionLookup],
   );
 
+  const [continuePopup, setContinuePopup] = useState<WatchEntry | null>(null);
   const removeContinue = useCallback((href: string) => {
     setHistory((prev) => prev.filter((h) => h.episodeHref !== href));
     void dismissFromContinue(href).then(() => getContinueWatching().then(setHistory)).catch(() => {});
@@ -165,7 +166,7 @@ export function HomePage() {
           <SectionHeader title={t.continueWatching} />
           <Rail itemWidth={WIDE_W}>
             {continueItems.slice(0, 12).map((entry) => (
-              <ContinueCard key={entry.episodeHref} entry={entry} onRemove={removeContinue} />
+              <ContinueCard key={entry.episodeHref} entry={entry} onRemove={removeContinue} onOpen={setContinuePopup} />
             ))}
           </Rail>
         </section>
@@ -180,6 +181,21 @@ export function HomePage() {
       ))}
 
       <EpisodeActionModal episode={episodePopup} onClose={() => setEpisodePopup(null)} />
+      {/* Continue Watching tap → same sheet: resume or open the anime page. */}
+      <EpisodeActionModal
+        episode={continuePopup ? {
+          title: continueEpisodeLabel(continuePopup),
+          href: continuePopup.episodeHref,
+          image: continuePopup.image || "",
+          animeTitle: continuePopup.animeTitle || "",
+          animeHref: continueAnimeUrl(continuePopup),
+          isNew: false,
+        } : null}
+        epNum={continuePopup ? episodeNumberFor(continuePopup) : null}
+        watchTo={continuePopup ? continueHref(continuePopup) : undefined}
+        watchLabel={t.resume}
+        onClose={() => setContinuePopup(null)}
+      />
     </div>
   );
 }
@@ -386,10 +402,24 @@ function episodeNumberFor(entry: WatchEntry): number | null {
   return extractEpisodeNumber(entry.episodeHref, entry.episodeTitle);
 }
 
+function continueAnimeUrl(entry: WatchEntry): string {
+  const rawAnime = entry.animeHref || entry.episodeHref;
+  return rawAnime && /\/(anime|movie|titles)\//.test(rawAnime) && !isEpisodeUrl(rawAnime) ? rawAnime : toAnimeUrl(rawAnime) ?? "";
+}
+
+// Sheet heading: old rows stored the anime name as the episode title, so fall
+// back to "Episode N" rather than printing the name twice.
+function continueEpisodeLabel(entry: WatchEntry): string {
+  const raw = (entry.episodeTitle || "").trim();
+  const name = (entry.animeTitle || "").trim();
+  if (raw && raw.toLowerCase() !== name.toLowerCase()) return raw;
+  const n = episodeNumberFor(entry);
+  return n !== null ? `${t.episode} ${n}` : (raw || name);
+}
+
 function continueHref(entry: WatchEntry): string {
   const params = new URLSearchParams();
-  const rawAnime = entry.animeHref || entry.episodeHref;
-  const animeUrl = rawAnime && /\/(anime|movie|titles)\//.test(rawAnime) && !isEpisodeUrl(rawAnime) ? rawAnime : toAnimeUrl(rawAnime) ?? "";
+  const animeUrl = continueAnimeUrl(entry);
   if (animeUrl) params.set("anime", animeUrl);
   if (entry.image) params.set("img", entry.image);
   if (entry.url4up) params.set("up4", entry.url4up);
@@ -400,7 +430,7 @@ function continueHref(entry: WatchEntry): string {
   return `/watch/${encodeURIComponent(entry.episodeHref)}${q ? `?${q}` : ""}`;
 }
 
-const ContinueCard = memo(function ContinueCard({ entry, onRemove }: { entry: WatchEntry; onRemove: (href: string) => void }) {
+const ContinueCard = memo(function ContinueCard({ entry, onRemove, onOpen }: { entry: WatchEntry; onRemove: (href: string) => void; onOpen: (entry: WatchEntry) => void }) {
   const poster = usePosterImage(entry.image, entry.animeHref || entry.episodeHref);
   const pct = progressPercent(entry);
   const remainMin = Math.max(1, Math.round((entry.durationMs - entry.positionMs) / 60000));
@@ -416,7 +446,13 @@ const ContinueCard = memo(function ContinueCard({ entry, onRemove }: { entry: Wa
   const support = [epHasName ? (epNum != null ? `${t.episode} ${epNum}` : "") : epTitle, entry.durationMs > 0 ? t.minLeft(remainMin) : ""]
     .filter(Boolean).join(" · ");
   return (
-    <Link to={continueHref(entry)} className="group block outline-none" title={lead}>
+    // Tap → resume-or-details sheet (mobile parity); the href keeps middle-click / open-in-place working.
+    <Link
+      to={continueHref(entry)}
+      onClick={(e) => { if (e.button === 0 && !e.ctrlKey && !e.metaKey && !e.shiftKey) { e.preventDefault(); onOpen(entry); } }}
+      className="group block outline-none"
+      title={lead}
+    >
       <div className="relative aspect-video overflow-hidden rounded-card bg-surface shadow-card ring-1 ring-white/[0.04] transition duration-300 ease-out group-hover:-translate-y-1 group-hover:shadow-glow group-focus-visible:shadow-glow">
         {poster.src ? (
           <img
@@ -474,6 +510,34 @@ const ForYouRail = memo(function ForYouRail({ history }: { history: WatchEntry[]
   const [busyId, setBusyId] = useState<number | null>(null);
   const itemsRef = useRef(items);
   itemsRef.current = items;
+  // Anime the user completed — by watching the finale OR with the detail
+  // page's ✓ "completed" mark (no watch history needed). They count as taste
+  // (seeds) and must never be suggested back.
+  const completion = useCompletionLookup();
+  const completedRecs = useMemo(() => {
+    const seen = new Set<string>();
+    const out: AnimeCompletion[] = [];
+    for (const rec of [...completion.byTitle.values(), ...completion.byHref.values()]) {
+      if (seen.has(rec.key) || !(rec.marked || rec.finished)) continue;
+      seen.add(rec.key);
+      out.push(rec);
+    }
+    return out;
+  }, [completion]);
+  const completedTitles = useMemo(() => {
+    const keys = new Set<string>();
+    const canons = new Set<string>();
+    for (const rec of completedRecs) {
+      for (const title of rec.titles) {
+        const k = animeTitleKey(title);
+        if (k) keys.add(k);
+        canons.add(canonTitle(title));
+      }
+    }
+    return { keys, canons };
+  }, [completedRecs]);
+  const completedTitlesRef = useRef(completedTitles);
+  completedTitlesRef.current = completedTitles;
 
   useEffect(() => {
     if (forYouMem) return;
@@ -496,8 +560,14 @@ const ForYouRail = memo(function ForYouRail({ history }: { history: WatchEntry[]
   }, [history]);
 
   const seeds = useMemo(
-    () => pickTasteSeeds((groups ?? []).map((g) => ({ animeTitle: g.animeTitle, animeHref: g.animeHref, watched: g.watched, updatedAt: g.updatedAt })), seedKeyOf, FOR_YOU_SEEDS),
-    [groups],
+    () => pickTasteSeeds([
+      ...(groups ?? []).map((g) => ({ animeTitle: g.animeTitle, animeHref: g.animeHref, watched: g.watched, updatedAt: g.updatedAt })),
+      // Hand-marked completions carry no history; weight them like a full season.
+      ...completedRecs.filter((r) => r.marked && r.titles[0]).map((r) => ({
+        animeTitle: r.titles[0], animeHref: r.hrefs[0] || "", watched: Math.max(12, r.lastEpNum || 0), updatedAt: r.updatedAt,
+      })),
+    ], seedKeyOf, FOR_YOU_SEEDS),
+    [groups, completedRecs],
   );
   const seedKey = groups === null ? null : seeds.map((s) => s.animeTitle).join("|");
   const seedsRef = useRef(seeds);
@@ -524,6 +594,8 @@ const ForYouRail = memo(function ForYouRail({ history }: { history: WatchEntry[]
       };
       for (const g of groupsRef.current ?? []) remember(g.animeTitle);
       for (const f of favorites) remember(f.title);
+      for (const k of completedTitlesRef.current.keys) keys.add(k);
+      for (const c of completedTitlesRef.current.canons) canons.add(c);
       const excluded = (item: RecItem) =>
         [item.title, item.titleEnglish].some((title) => !!title && (keys.has(animeTitleKey(title)) || canons.has(canonTitle(title))));
       const weights = picked.map((s) => s.weight);
@@ -558,7 +630,14 @@ const ForYouRail = memo(function ForYouRail({ history }: { history: WatchEntry[]
     }
   };
 
-  if (items.length === 0) return null;
+  // Filter at render too: a cached rail (or one computed before the ✓ mark)
+  // drops the anime the moment it is marked completed.
+  const visible = useMemo(() => items.filter((item) =>
+    ![item.title, item.titleEnglish].some((title) =>
+      !!title && (completedTitles.keys.has(animeTitleKey(title)) || completedTitles.canons.has(canonTitle(title))))),
+  [items, completedTitles]);
+
+  if (visible.length === 0) return null;
   return (
     <section className="lazy-section">
       <SectionHeader
@@ -566,7 +645,7 @@ const ForYouRail = memo(function ForYouRail({ history }: { history: WatchEntry[]
         icon={<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" className="text-mint" aria-hidden><path d="M12 2l1.9 5.6L19.5 9l-4.6 3.4L16.4 18 12 14.8 7.6 18l1.5-5.6L4.5 9l5.6-1.4z" /></svg>}
       />
       <Rail itemWidth={POSTER_W}>
-        {items.map((item) => (
+        {visible.map((item) => (
           <button
             key={item.anilistId}
             type="button"

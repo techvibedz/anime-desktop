@@ -9,9 +9,16 @@ import { t } from "../lib/i18n";
 export function EpisodeActionModal({
   episode,
   onClose,
+  watchTo,
+  watchLabel,
+  epNum,
 }: {
   episode: EpisodeItem | null;
   onClose: () => void;
+  /** Continue Watching overrides the play action with a resume route. */
+  watchTo?: string;
+  watchLabel?: string;
+  epNum?: number | null;
 }) {
   const navigate = useNavigate();
 
@@ -23,7 +30,7 @@ export function EpisodeActionModal({
   }, [episode, onClose]);
 
   if (!episode) return null;
-  const num = extractEpisodeNumber(episode.href, episode.title);
+  const num = epNum ?? extractEpisodeNumber(episode.href, episode.title);
   // Cached payloads sometimes carry an episode URL in animeHref; normalize so
   // we always land on the real anime page.
   const raw = episode.animeHref || episode.href;
@@ -31,6 +38,7 @@ export function EpisodeActionModal({
 
   const watch = () => {
     onClose();
+    if (watchTo) { navigate(watchTo); return; }
     const params = new URLSearchParams();
     if (episode.image) params.set("img", episode.image);
     if (animeUrl) params.set("anime", animeUrl);
@@ -84,7 +92,7 @@ export function EpisodeActionModal({
               className="flex h-12 w-full items-center justify-center gap-2 rounded-control bg-accent text-[15px] font-extrabold text-on-accent transition-colors hover:bg-accent-bright"
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden><path d="M8 5v14l11-7z" /></svg>
-              {t.watchEpisode}
+              {watchLabel || t.watchEpisode}
             </button>
             <button
               type="button"

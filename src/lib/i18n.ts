@@ -723,6 +723,138 @@ export const ar = {
   unmarkedCompleted: "أُزيل من المكتملة",
   completedFromHistory: "مكتمل حسب سجل مشاهدتك",
   completedShelf: "مكتملة",
+
+  // ── Fan features (2026-11) ──
+  // Crowd server health
+  healthFastest: "الأسرع الآن",
+  healthUnstable: "غير مستقر الآن",
+  healthWorks: (pct: number) => `يعمل ${pct}%`,
+  // Settings
+  settingsSkipFiller: "المحتوى الأصلي فقط",
+  settingsSkipFillerDesc: "إخفاء حلقات الفلر وتخطّيها تلقائيًا عند تشغيل الحلقة التالية",
+  settingsShowReactions: "تفاعلات المشاهدين",
+  settingsShowReactionsDesc: "عرض تفاعلات الآخرين وخريطة أقوى اللحظات أثناء المشاهدة",
+  settingsRecapOffers: "ملخص ما سبق",
+  settingsRecapOffersDesc: "اقتراح ملخص ذكي لما حدث عند العودة لأنمي بعد انقطاع",
+  // Filler / canon
+  fillerBadge: "فلر",
+  mixedBadge: "مختلط",
+  recapBadge: "ملخص",
+  fillerSummary: (n: number) => `${n} حلقة فلر`,
+  fillerSaves: (h: number) => `يوفّر ${h} ساعة`,
+  canonOnly: "الأصلي فقط",
+  canonOnlyOn: "يتم إخفاء الفلر",
+  fillerThisEp: "هذه حلقة فلر لا تؤثر على القصة",
+  fillerSkipTo: (n: number) => `تخطَّ إلى الحلقة ${n}`,
+  fillerSkippedTo: (n: number) => `تم تخطّي الفلر — الحلقة ${n}`,
+  fillerSource: "المصدر: Anime Filler List",
+  // "Previously on…" recap
+  recapGapTitle: (days: number) => `مرّت ${days} ${days >= 3 && days <= 10 ? "أيام" : "يومًا"} منذ آخر مشاهدة`,
+  recapJumpTitle: (ep: number) => `تبدأ من الحلقة ${ep}؟`,
+  recapSub: "ملخص ذكي لما حدث قبل هذه الحلقة، بلا حرق",
+  recapCta: "ذكّرني بما سبق",
+  recapLoading: "يجهّز لك الملخص…",
+  recapReady: "جاهز؟ اختر سيرفرًا بالأسفل وتابع المشاهدة",
+  // AI search
+  aiSearchTitle: "بحث ذكي",
+  aiSearchSuggest: (q: string) => `اسأل الذكاء عن: «${q.length > 40 ? q.slice(0, 40) + "…" : q}»`,
+  aiSearchThinking: "يفهم طلبك ويبحث…",
+  aiSearchResults: "اقتراحات ذكية",
+  aiSearchEmpty: "لم أجد ما يطابق وصفك، جرّب وصفًا آخر",
+  aiSearchTry: "جرّب البحث الذكي",
+  smartSearchShort: "ذكي",
+  smartSearchIntro: "صف ما تريد مشاهدته بكلماتك أو بلهجتك، وسيقترح عليك الذكاء أنميات تناسبك.",
+  smartSearchPlaceholder: "مثال: أنمي فيه بطل ذكي يخطط لكل شيء وقصة مشوقة…",
+  smartSearchRun: "ابحث بذكاء",
+  smartSearchExamples: "جرّب أحد هذه الأوصاف",
+  // Anime → manga bridge
+  bridgeTitle: "أكمل القصة في المانجا",
+  bridgeNovelTitle: "مقتبس من رواية خفيفة",
+  bridgeEndsAt: (ch: number) => `الأنمي ينتهي عند الفصل ${ch}`,
+  bridgeEndsAtVolume: (v: number) => `يتوقف عند المجلد ${v} من الرواية`,
+  bridgeContinueFrom: (ch: number) => `تابع من الفصل ${ch}`,
+  bridgeReadFrom: (ch: number) => `اقرأ من الفصل ${ch}`,
+  bridgeRead: "اقرأ الآن",
+  bridgeCoversAll: (ch: number) => `الأنمي غطّى المانجا كاملة (${ch} فصلًا)`,
+  bridgeOpenManga: "افتح المانجا",
+  bridgeUnknown: "لا نعرف بعد أين ينتهي هذا الموسم في المانجا — ساعدنا",
+  bridgeAnimeEnded: "انتهى الأنمي هنا — القصة مستمرة في المانجا",
+  bridgeConfirmed: (n: number) => `أكّده ${n} من المشاهدين`,
+  bridgeEstimate: "تقديري",
+  bridgeAiring: "يتحدّث مع كل حلقة",
+  bridgeFix: "صحّح الفصل",
+  bridgeYourVote: (ch: number) => `تصحيحك: ${ch}`,
+  bridgeChapterPlaceholder: "آخر فصل يغطيه الأنمي",
+  bridgeSend: "إرسال",
+  bridgeThanks: "شكرًا! تم تسجيل تصحيحك",
+  bridgeInvalid: "اكتب رقم فصل صحيح",
+  bridgeSearching: "جارٍ البحث…",
+  bridgeNotFound: "لم نجد هذه المانجا في مصادرنا بعد",
+  bridgeChapterMissing: (ch: number) => `الفصل ${ch} غير متوفر بعد — فتحنا صفحة المانجا`,
+  adaptedAsAnime: "مقتبسة كأنمي — شاهدها",
+  adaptationUpTo: (ch: number) => `حتى الفصل ${ch}`,
+  // Reactions (hype map)
+  reactionsReact: "تفاعل",
+  reactionsHottest: "أقوى لحظة",
+  reactionsHottestJump: "انتقلت إلى أقوى لحظة في الحلقة",
+  reactionsHeat: "خريطة تفاعل المشاهدين",
+  reactionsSlowDown: "مهلًا! تفاعلات كثيرة، انتظر قليلًا",
+  reactionsFailed: "تعذّر إرسال التفاعل",
+  // Shared moments
+  momentShare: "شارك هذه اللحظة",
+  momentCreating: "جارٍ إنشاء رابط اللحظة…",
+  momentFailed: "تعذّر إنشاء الرابط، حاول مرة أخرى",
+  momentRateLimited: "شاركت لحظات كثيرة، انتظر قليلًا",
+  momentUnavailable: "لا يمكن مشاركة هذه الحلقة",
+  momentShareText: (label: string, url: string) => `شوف هذه اللحظة على بانتوفة 👀\n${label}\n${url}`,
+  momentOpenedFrom: (who: string, at: string) => who ? `لحظة شاركها ${who} — تبدأ عند ${at}` : `لحظة مشتركة — تبدأ عند ${at}`,
+  momentOpening: "جارٍ فتح اللحظة…",
+  momentCopied: "تم نسخ رابط اللحظة — الصقه لمن تريد",
+  momentNotFound: "هذا الرابط غير صالح أو انتهت صلاحيته",
+  // Wrapped
+  wrappedTitle: "ملخصك السنوي",
+  wrappedEntry: (y: number) => `ملخص أنمي ${y} الخاص بك`,
+  wrappedEntrySub: "ساعاتك، أكثر ما شاهدت، وشخصيتك كمشاهد",
+  wrappedLoading: "نحسب سنتك في الأنمي…",
+  wrappedEmptyTitle: "لم تشاهد حلقات هذا العام بعد",
+  wrappedEmptyHint: "شاهد بعض الحلقات وارجع لترى ملخصك",
+  wrappedYou: "أنت",
+  wrappedHours: "ساعة من الأنمي",
+  wrappedMinutes: "دقيقة من الأنمي",
+  wrappedEpisodes: "حلقة",
+  wrappedAnime: "أنمي",
+  wrappedCompleted: "مكتمل",
+  wrappedStreak: "أيام متتالية",
+  wrappedTop: "الأكثر مشاهدة",
+  wrappedPersonality: {
+    night_owl: "بومة الليل",
+    marathoner: "ماراثوني",
+    completer: "المُكمِل",
+    explorer: "المستكشف",
+    loyal: "المخلص",
+    weekend: "بطل العطلة",
+    fan: "عاشق الأنمي",
+  } as Record<string, string>,
+  wrappedPersonalityDesc: (
+    p: string,
+    s: { nightPct: number; bestDay: { episodes: number } | null; completedAnime: number; animeCount: number; top: { title: string }[] },
+  ) => {
+    switch (p) {
+      case "night_owl": return `${s.nightPct}% من حلقاتك بعد منتصف الليل`;
+      case "marathoner": return `شاهدت ${s.bestDay?.episodes ?? 0} حلقات في يوم واحد`;
+      case "completer": return `أنهيت ${s.completedAnime} أنمي — تكمل ما تبدأه`;
+      case "explorer": return `جرّبت ${s.animeCount} أنمي مختلفًا هذا العام`;
+      case "loyal": return `قلبك مع ${s.top[0]?.title ?? "أنميك المفضل"}`;
+      case "weekend": return "عطلتك = أنمي";
+      default: return "كل حلقة خطوة في رحلتك";
+    }
+  },
+  wrappedShareImage: "مشاركة كصورة",
+  wrappedShareLink: "مشاركة الرابط",
+  wrappedShareFailed: "تعذّر إنشاء رابط المشاركة",
+  wrappedShareText: (y: number, h: number, url: string) => `سنتي في الأنمي ${y}: ${h} ساعة على بانتوفة 🍿\n${url}`,
+  wrappedImageNeedsUpdate: "المشاركة كصورة تحتاج آخر إصدار من التطبيق",
+  wrappedPrivacy: "يُحسب الملخص على جهازك، ولا يُنشر إلا عند المشاركة",
 };
 
 export const t = ar;

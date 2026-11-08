@@ -11,6 +11,9 @@ const KEYS = {
   autoSkipIntro: "@settings_auto_skip_intro",
   prefetchNext: "@settings_prefetch_next",
   dailyAnimeNotif: "@settings_daily_anime_notif",
+  skipFiller: "@settings_skip_filler",
+  showReactions: "@settings_show_reactions",
+  recapOffers: "@settings_recap_offers",
 } as const;
 
 /** Which anime trigger new-episode notifications. */
@@ -47,6 +50,18 @@ export const setAutoSkipIntro = (v: boolean) => setBool(KEYS.autoSkipIntro, v);
 /** Silent pre-buffer of the next episode while one plays (default on). */
 export const getPrefetchNext = () => getBool(KEYS.prefetchNext, true);
 export const setPrefetchNext = (v: boolean) => setBool(KEYS.prefetchNext, v);
+
+/** Canon-only mode: hide filler in episode lists and skip it on autoplay (default off). */
+export const getSkipFiller = () => getBool(KEYS.skipFiller, false);
+export const setSkipFiller = (v: boolean) => setBool(KEYS.skipFiller, v);
+
+/** Show other viewers' floating reactions + the hype map in the player (default on). */
+export const getShowReactions = () => getBool(KEYS.showReactions, true);
+export const setShowReactions = (v: boolean) => setBool(KEYS.showReactions, v);
+
+/** Offer an AI "previously on" recap after a break (default on). */
+export const getRecapOffers = () => getBool(KEYS.recapOffers, true);
+export const setRecapOffers = (v: boolean) => setBool(KEYS.recapOffers, v);
 
 /** Daily "anime of the day" local notification (default off — opt-in). */
 export const getDailyAnimeNotif = () => getBool(KEYS.dailyAnimeNotif, false);
