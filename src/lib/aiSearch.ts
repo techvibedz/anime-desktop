@@ -30,9 +30,21 @@ async function aniListBatch(suggestions: { title: string; reason: string }[]): P
   return parseAniListBatch(json, suggestions);
 }
 
-export async function aiSearch(query: string): Promise<AiSearchResult> {
-  const key = aiQueryKey(query);
-  if (key.length < 2) return { ok: false, reason: "empty" };
+/** Max pages of 10 (mirrors SEARCH_MAX_PAGE in the edge function). */
+export const AI_SEARCH_MAX_PAGE = 5;
+
+/**
+ * Page 1 = the first 10 suggestions. Page N>1 ("show more") asks the AI for
+ * 10 NEW titles, excluding `exclude` (titles already on screen).
+ */
+export async function aiSearch(
+  query: string,
+  opts: { page?: number; exclude?: string[] } = {},
+): Promise<AiSearchResult> {
+  const page = Math.min(AI_SEARCH_MAX_PAGE, Math.max(1, Math.floor(opts.page ?? 1)));
+  const base = aiQueryKey(query);
+  if (base.length < 2) return { ok: false, reason: "empty" };
+  const key = page > 1 ? `${base}|p${page}` : base;
 
   const hit = mem.get(key);
   if (hit && Date.now() - hit.at < CACHE_TTL) return { ok: true, intent: hit.intent, items: hit.items };
@@ -48,7 +60,9 @@ export async function aiSearch(query: string): Promise<AiSearchResult> {
   } catch {}
 
   const res = await invokeAiFunction<{ intent?: string; results?: { title?: string; reason?: string }[] }>(
-    { mode: "search", query: query.trim().slice(0, 300) },
+    page > 1
+      ? { mode: "search", query: query.trim().slice(0, 300), page, exclude: (opts.exclude ?? []).slice(0, 60) }
+      : { mode: "search", query: query.trim().slice(0, 300) },
     32_000,
   );
   if (!res.ok) return res;

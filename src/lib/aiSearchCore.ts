@@ -1,26 +1,5 @@
 // Pure helpers for the AI ("describe what you want") search. No RN imports.
 
-/** Request/description cues in Arabic dialects, French and English. */
-const NATURAL_CUES = [
-  "بغيت", "نبغي", "أبغى", "ابغى", "ابي", "أبي", "ابغي", "عايز", "عاوز", "حاب", "نحب", "بدي", "بدّي", "اريد", "أريد",
-  "زي", "مثل", "متل", "يشبه", "شبيه", "تشبه", "كيف", "عن ", "فيه", "فيها", "قصير", "طويل", "مكتمل", "حزين", "مضحك",
-  "رومانسي", "رعب", "انتقام", "مدرسة", "سحر", "قوي", "ضعيف", "يتحول", "بطل", "بطله", "ترشيح", "رشح", "اقترح",
-  "like ", "similar", "recommend", "where the", "about ", "anime with", "comme ", "genre",
-];
-
-/**
- * True when the text reads like a description/request rather than a title —
- * those get the "smart search" suggestion. Titles are usually 1-3 words with
- * no request cues.
- */
-export function looksLikeNaturalQuery(q: string): boolean {
-  const text = (q || "").trim().toLowerCase();
-  if (text.length < 6) return false;
-  const words = text.split(/\s+/).filter(Boolean);
-  if (words.length >= 5) return true;
-  return words.length >= 2 && NATURAL_CUES.some((cue) => text.includes(cue));
-}
-
 /** Normalized cache key for a query. */
 export function aiQueryKey(q: string): string {
   return (q || "")

@@ -6,7 +6,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { aiSearch, type AiSearchEntry } from "../lib/aiSearch";
+import { AI_SEARCH_MAX_PAGE, aiSearch, type AiSearchEntry } from "../lib/aiSearch";
 import { resolveSourceUrl } from "../lib/schedule";
 import { t } from "../lib/i18n";
 
@@ -36,7 +36,19 @@ export function SmartSearchPage() {
   const [intent, setIntent] = useState("");
   const [error, setError] = useState("");
   const [busyId, setBusyId] = useState<number | null>(null);
+  // "Show more" paging: the query the results belong to, the last page
+  // loaded, and the footer state (idle / loading / exhausted / error).
+  const [page, setPage] = useState(1);
+  const [lastQuery, setLastQuery] = useState("");
+  const [more, setMore] = useState<"idle" | "loading" | "end" | "error">("idle");
   const seq = useRef(0);
+
+  const failText = (reason: string) =>
+    reason === "signin" ? t.companionSignIn
+      : reason === "rate_limited" ? t.companionRateLimited
+      : reason === "unavailable" ? t.companionUnavailable
+      : reason === "empty" ? t.aiSearchEmpty
+      : t.companionError;
 
   const run = useCallback(async (value?: string) => {
     const q = (value ?? text).trim();
@@ -45,6 +57,9 @@ export function SmartSearchPage() {
     const my = ++seq.current;
     setState("loading");
     setError("");
+    setMore("idle");
+    setPage(1);
+    setLastQuery(q);
     const res = await aiSearch(q);
     if (my !== seq.current) return;
     if (res.ok) {
@@ -53,16 +68,31 @@ export function SmartSearchPage() {
       setState(res.items.length ? "done" : "error");
       if (!res.items.length) setError(t.aiSearchEmpty);
     } else {
-      setError(
-        res.reason === "signin" ? t.companionSignIn
-          : res.reason === "rate_limited" ? t.companionRateLimited
-          : res.reason === "unavailable" ? t.companionUnavailable
-          : res.reason === "empty" ? t.aiSearchEmpty
-          : t.companionError,
-      );
+      setError(failText(res.reason));
       setState("error");
     }
   }, [text]);
+
+  const loadMore = useCallback(async () => {
+    if (state !== "done" || more === "loading" || more === "end" || !lastQuery) return;
+    if (page >= AI_SEARCH_MAX_PAGE) { setMore("end"); return; }
+    const my = seq.current;
+    const next = page + 1;
+    setMore("loading");
+    const res = await aiSearch(lastQuery, { page: next, exclude: items.map((it) => it.title) });
+    if (my !== seq.current) return;
+    if (!res.ok) {
+      setMore(res.reason === "empty" ? "end" : "error");
+      if (res.reason !== "empty") setError(failText(res.reason));
+      return;
+    }
+    const have = new Set(items.map((it) => it.anilistId));
+    const fresh = res.items.filter((it) => !have.has(it.anilistId));
+    setPage(next);
+    if (!fresh.length) { setMore("end"); return; }
+    setItems((prev) => [...prev, ...fresh]);
+    setMore(next >= AI_SEARCH_MAX_PAGE ? "end" : "idle");
+  }, [state, more, lastQuery, page, items]);
 
   // Opened from the search bar with a query → run it right away.
   useEffect(() => {
@@ -188,6 +218,26 @@ export function SmartSearchPage() {
                 </div>
               </button>
             ))}
+          </div>
+          <div className="flex flex-col items-center gap-2 pt-2">
+            {more === "end" ? (
+              <p className="text-xs font-medium text-text-muted">{t.aiSearchNoMore}</p>
+            ) : (
+              <>
+                {more === "error" && error && <p className="text-xs font-medium text-text-muted">{error}</p>}
+                <button
+                  type="button"
+                  onClick={() => void loadMore()}
+                  disabled={more === "loading"}
+                  className="flex h-11 w-full max-w-sm items-center justify-center gap-2 rounded-full border border-accent/35 bg-accent/10 text-sm font-bold text-accent transition hover:bg-accent/15 disabled:opacity-60"
+                >
+                  {more === "loading"
+                    ? <span className="h-4 w-4 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
+                    : <Sparkle />}
+                  {more === "loading" ? t.aiSearchMoreLoading : more === "error" ? t.retry : t.aiSearchMore}
+                </button>
+              </>
+            )}
           </div>
         </section>
       )}
