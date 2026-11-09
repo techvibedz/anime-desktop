@@ -189,6 +189,7 @@ function classifyProvider(url: string, name = ""): string {
   // witanime's current default hosts. Give them their own ids so they aren't
   // classified "generic" and dropped by the witanime-generic filter in
   // doFetchVideoServers — they play via the iframe fallback.
+  if (/drive\.google\.com|docs\.google\.com\/file|drive\.usercontent\.google\.com/.test(u)) return "gdrive";
   if (/luluvdo|lulustream|luluvid/.test(u)) return "luluvdo";
   if (/yonaplay/.test(u)) return "yonaplay";
   return "generic";
@@ -238,7 +239,7 @@ function parseUp4Servers(html: string): RawServer[] {
     // and the literal "&amp;" made every vk embed request fail.
     const src = normalizeEmbedUrl((m[1] || "").trim().replace(/&amp;/gi, "&").replace(/&#0?38;/g, "&"));
     if (!src || src.indexOf("http") !== 0 || seen.has(src)) continue;
-    if (/google|facebook|pyppo|popads|disqus/.test(src)) continue;
+    if (/google|facebook|pyppo|popads|disqus/.test(src) && !/\/\/(?:drive|docs)\.google\.com\//.test(src)) continue;
     try {
       const h = new URL(src).hostname.toLowerCase();
       if (!h || h === "undefined" || h === "null" || h.indexOf(".") < 0) continue;
@@ -303,7 +304,7 @@ function parseWitServers(html: string): RawServer[] {
   for (let i = 0; i < reg.length; i++) {
     const url = witDecodeServer(reg[i], cfg[i]);
     if (!url || url.indexOf("http") !== 0 || seen.has(url)) continue;
-    if (/google|facebook|pyppo|popads|disqus/.test(url)) continue;
+    if (/google|facebook|pyppo|popads|disqus/.test(url) && !/\/\/(?:drive|docs)\.google\.com\//.test(url)) continue;
     try {
       const h = new URL(url).hostname.toLowerCase();
       if (!h || h === "undefined" || h === "null" || h.indexOf(".") < 0) continue;

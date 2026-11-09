@@ -2398,6 +2398,66 @@ async function probeVid3rbEdge(src: string, headers: Record<string, string>): Pr
   return null;
 }
 
+// ── Google Drive (witanime's "google" server on older shows) ────────────────
+// The gate lands on drive.google.com/file/d/<id>/preview, whose player streams
+// are cookie-bound googlevideo URLs. The file's own download endpoint serves
+// the ORIGINAL upload (full quality, Range-seekable progressive MP4) with no
+// cookies — measured live: ~2s to resolve, ~1s first byte on a mid-file seek.
+// Mirrors mobile lib/scraper/direct.ts extractGoogleDrive.
+function googleDriveFileId(raw: string): string | null {
+  let url: URL;
+  try { url = new URL(raw); } catch { return null; }
+  if (!/(^|\.)(drive|docs)\.google\.com$|^drive\.usercontent\.google\.com$/i.test(url.hostname)) return null;
+  const id = url.pathname.match(/\/file\/(?:u\/\d+\/)?d\/([A-Za-z0-9_-]{10,})/)?.[1] ||
+    url.searchParams.get("id") || url.searchParams.get("docid") || "";
+  return /^[A-Za-z0-9_-]{10,}$/.test(id) ? id : null;
+}
+
+// Big files may answer with a "can't scan for viruses" page; its form carries
+// the one-time uuid that unlocks the file.
+function googleDriveConfirmUrl(html: string): string | null {
+  const form = html.match(/<form[^>]*id=["']download-form["'][^>]*>([\s\S]*?)<\/form>/i);
+  if (!form) return null;
+  let url: URL;
+  try { url = new URL(form[0].match(/action=["']([^"']+)["']/i)?.[1]?.replace(/&amp;/g, "&") || "", "https://drive.usercontent.google.com/"); } catch { return null; }
+  if (url.hostname !== "drive.usercontent.google.com") return null;
+  for (const input of form[1].match(/<input[^>]*>/gi) || []) {
+    const name = input.match(/name=["']([^"']+)["']/i)?.[1];
+    const value = input.match(/value=["']([^"']*)["']/i)?.[1];
+    if (name && value !== undefined) url.searchParams.set(name, value.replace(/&amp;/g, "&"));
+  }
+  return url.searchParams.get("id") ? url.toString() : null;
+}
+
+async function extractGoogleDrive(iframeUrl: string): Promise<{ url: string; type: "mp4" } | null> {
+  const id = googleDriveFileId(iframeUrl);
+  if (!id) return null;
+  let candidate = `https://drive.usercontent.google.com/download?id=${encodeURIComponent(id)}&export=download&confirm=t`;
+  for (let step = 0; step < 2; step++) {
+    try {
+      const res = await session.defaultSession.fetch(candidate, {
+        signal: AbortSignal.timeout(12000),
+        headers: { "User-Agent": VIDEO_UA, Range: "bytes=0-1", Accept: "*/*" },
+      });
+      const type = res.headers.get("content-type") || "";
+      if ((res.status === 206 || res.ok) && !/text\/html|json/i.test(type)) {
+        res.body?.cancel().catch(() => {});
+        return { url: candidate, type: "mp4" };
+      }
+      if (res.status === 404 || res.status === 410) { console.info("[gdrive] file gone", res.status); return null; }
+      const confirm = googleDriveConfirmUrl(await res.text().catch(() => ""));
+      // No form = quota exceeded / private file → renderer falls back to the
+      // Drive iframe player.
+      if (!confirm || confirm === candidate) { console.info("[gdrive] no direct file (quota/private)"); return null; }
+      candidate = confirm;
+    } catch (error) {
+      console.info("[gdrive] request failed", String(error));
+      return null;
+    }
+  }
+  return null;
+}
+
 // (the resolve cache is 90s) rather than when the server list is built.
 async function extractVid3rb(
   playerUrlWithHint: string,
@@ -3586,6 +3646,12 @@ app.whenReady().then(() => {
           // ok.ru embed Referer — not its own CDN domain.
           ref = "https://ok.ru/";
           ori = "https://ok.ru";
+        } else if (/^drive\.usercontent\.google\.com$/.test(host)) {
+          // Google Drive's download endpoint (the "google" server) is a plain
+          // cookieless file URL; a forged Referer/Origin buys nothing and a
+          // localhost/file one can only hurt, so send it bare.
+          bare = true;
+          force = true;
         } else if (/\.shop$/i.test(host) && /[?&]token=/.test(details.url)) {
           // Anime4up's featured-server CDN (cdnN.<edge>.shop/?token=…): the
           // signed URL is accepted without a Referer (the site fetches it with
@@ -3821,6 +3887,9 @@ app.whenReady().then(() => {
       if (opts.provider === "vid3rb") {
         return await extractVid3rb(opts.iframeUrl);
       }
+      if (opts.provider === "gdrive") {
+        return await extractGoogleDrive(opts.iframeUrl);
+      }
       // Providers whose player requests a real .m3u8/.mp4 URL. Try the cheap
       // static-HTML pass first (most of these inline the source in packed JS,
       // so it resolves in <1s); the generic headless capture engine is the
@@ -4015,6 +4084,8 @@ app.whenReady().then(() => {
         if (label.includes("videa")) return "videa";
         if (/vik(?:i|1)ngfile/.test(label)) return "vikingfile";
         if (label.includes("mega")) return "mega";
+        // Old shows (e.g. Hundred) carry a "google" row = a Drive /preview embed.
+        if (label.includes("google")) return "gdrive";
         return "generic";
       };
       // The player handshake must run INSIDE the witanime page: the gate token

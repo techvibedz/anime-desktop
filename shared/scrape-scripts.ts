@@ -687,13 +687,14 @@ function provider(url, name) {
   if (/vik(?:i|1)ngfile/.test(url)) return 'vikingfile';
   if (/mega\\.(?:nz|co\\.nz)/.test(url)) return 'mega';
   if (/vid3rb|anime3rb/.test(url)) return 'vid3rb';
+  if (/drive[.]google[.]com|docs[.]google[.]com[/]file|drive[.]usercontent[.]google[.]com/.test(url)) return 'gdrive';
   if (/luluvdo|lulustream|luluvid/.test(url)) return 'luluvdo';
   if (/yonaplay/.test(url)) return 'yonaplay';
   return 'generic';
 }
 function badIframe(src) {
   if (!src || src.indexOf('http') !== 0) return true;
-  if (/google|facebook|pyppo|popads|disqus/.test(src)) return true;
+  if (/google|facebook|pyppo|popads|disqus/.test(src) && !/(?:drive|docs)[.]google[.]com[/]/.test(src)) return true;
   // Reject malformed hosts. witanime's loadIframe() decode occasionally
   // fails and points the iframe at "https://undefined/<encoded>", which
   // then dies at playback with ERR_NAME_NOT_RESOLVED. A real provider host
@@ -764,6 +765,7 @@ if (currentPlayer) {
         if (label.indexOf('videas') >= 0) return 'videas';
         if (label.indexOf('videa') >= 0) return 'videa';
         if (label.indexOf('mega') >= 0) return 'mega';
+        if (label.indexOf('google') >= 0) return 'gdrive';
         return 'generic';
       }
       function witPriority(label) {

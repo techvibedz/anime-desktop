@@ -1766,6 +1766,9 @@ const CUSTOM_PLAYER_PROVIDERS = new Set([
   // directThenIframe but the resolver never even tried and always painted the
   // embed.
   "luluvdo", "vikingfile",
+  // witanime's "google" server: the main process resolves the Drive embed to
+  // the original upload (progressive MP4) — see extractGoogleDrive.
+  "gdrive",
   // anime3rb's first-party host: one static GET on the player page yields
   // direct tokenized .mp4 qualities, so extraction is near-instant and the
   // custom player is the normal path (iframe only as a last resort).

@@ -110,6 +110,10 @@ export const PROVIDER_POLICIES: Record<string, ProviderPolicy> = {
   vikingfile: { patterns: ["vik(?:i|1)ngfile"], rank: 8, resolution: "directThenIframe", failureMode: "failed", supported: true },
   mega: { patterns: ["mega\\.(?:nz|co\\.nz)"], rank: 12, resolution: "direct", failureMode: "failed", supported: true },
   vid3rb: { patterns: ["vid3rb", "anime3rb"], rank: -1, resolution: "direct", failureMode: "failed", supported: true, downloadable: true },
+  // witanime's "google" server: a Drive /preview embed. Direct = the original
+  // upload via drive.usercontent (progressive MP4, Range-seekable); the Drive
+  // iframe stays as the fallback when Google refuses the download (quota).
+  gdrive: { patterns: ["drive\\.google\\.com", "docs\\.google\\.com\\/file", "drive\\.usercontent\\.google\\.com"], rank: 6, resolution: "directThenIframe", failureMode: "iframe", supported: true, downloadable: true },
   luluvdo: { patterns: ["luluvdo", "lulustream", "luluvid"], rank: 9, resolution: "directThenIframe", failureMode: "failed", supported: true },
   yonaplay: { patterns: ["yonaplay"], rank: 99, resolution: "iframe", failureMode: "failed", supported: false },
   generic: { patterns: [], rank: 10, resolution: "iframe", failureMode: "iframe", supported: true },
@@ -379,6 +383,7 @@ export function validateMediaUrl(raw: string, provider = "generic"): boolean {
       return /\.(?:m3u8|mp4)$/i.test(url.pathname) || /^\/video\//i.test(url.pathname);
     }
     if (provider === "doodstream" && url.searchParams.has("token") && url.searchParams.has("expiry")) return true;
+    if (provider === "gdrive" && /^drive\.usercontent\.google\.com$/i.test(url.hostname)) return url.pathname === "/download" && url.searchParams.has("id");
     if (provider === "vikingfile") return /\.(?:mp4|mkv|webm|ogg)$/i.test(url.pathname);
     if (provider === "vk" && /(^|\.)(?:vkuser\.net|okcdn\.ru)$/i.test(url.hostname)) return url.searchParams.has("sig") && url.searchParams.has("expires");
     if (provider === "dailymotion" && /(^|\.)(?:dailymotion\.com|dmcdn\.net)$/i.test(url.hostname)) return true;
