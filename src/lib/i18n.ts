@@ -857,6 +857,45 @@ export const ar = {
   wrappedShareText: (y: number, h: number, url: string) => `سنتي في الأنمي ${y}: ${h} ساعة على بانتوفة 🍿\n${url}`,
   wrappedImageNeedsUpdate: "المشاركة كصورة تحتاج آخر إصدار من التطبيق",
   wrappedPrivacy: "يُحسب الملخص على جهازك، ولا يُنشر إلا عند المشاركة",
+  // Taste-based recommendations
+  tasteTitle: "مقترح لك حسب ذوقك",
+  tasteSubtitle: "مبني على ما أنهيته وما تركته، لا على الأكثر شهرة",
+  tasteSeeAll: "عرض الكل",
+  tasteFilterAll: "الكل",
+  tasteFilterShort: "قصير",
+  tasteFilterFinished: "مكتمل",
+  tasteFilterMovie: "أفلام",
+  tasteFilterAiring: "يُعرض الآن",
+  tastePhase: (p: string) =>
+    p === "reading" ? "نقرأ سجل مشاهدتك…" : p === "resolving" ? "نحلل الأنميات التي شاهدتها…" : "نبحث عمّا يناسب ذوقك…",
+  tasteFirstRunHint: "أول تحليل يأخذ بضع ثوانٍ، وبعدها يفتح فورًا",
+  tasteUpdating: "نحدّث اقتراحاتك…",
+  tasteEmptyTitle: "شاهد قليلًا أولًا",
+  tasteEmptyHint: "نحتاج أنميين على الأقل في سجلك لنفهم ذوقك",
+  tasteNoMatch: "لا توجد اقتراحات بهذا الفلتر",
+  tasteDnaTitle: "بصمة ذوقك",
+  tasteDnaBasis: (n: number) => `من ${n} أنمي شاهدته`,
+  tasteFactCompletion: (pct: number, n: number) => `تُنهي ${pct}% مما تبدأه (${n} مكتمل)`,
+  tasteFactDropAt: (ep: number) => `عادةً تترك الأنمي الذي لا يعجبك عند الحلقة ${ep}`,
+  tasteFactPace: (pace: number) => `تشاهد بمعدل ${pace} حلقة في يوم المشاهدة`,
+  tasteFactLength: (b: string) =>
+    b === "short" ? "تُفضّل الأنميات القصيرة (13 حلقة أو أقل)" : b === "medium" ? "تُفضّل الموسمين (حوالي 24 حلقة)" : b === "long" ? "تحب السلاسل الطويلة" : "تحب الأفلام",
+  tasteFactAvoids: (g: string[]) => `تبتعد عن: ${g.join("، ")}`,
+  tasteMatch: (n: number) => `تطابق ${n}%`,
+  tasteBecause: (verdict: string, seed: string) =>
+    verdict === "binged" ? `لأنك شاهدت «${seed}» بنهم` :
+    verdict === "finished" ? `لأنك أنهيت «${seed}»` :
+    verdict === "watching" ? `لأنك تتابع «${seed}»` : `يشبه «${seed}» الذي أعجبك`,
+  tasteReasonGenres: (g: string[]) => `من أنواعك المفضلة: ${g.join(" · ")}`,
+  tasteReasonTheme: (theme: string) => `فيه ما تحبه: ${theme}`,
+  tasteReasonLength: (b: string) =>
+    b === "short" ? "قصير — من النوع الذي تُنهيه عادةً" : b === "movie" ? "فيلم — وأنت تحب الأفلام" : b === "long" ? "سلسلة طويلة — كما تحب" : "بطول يناسبك",
+  tasteReasonStudio: (s: string) => `من استوديو ${s} الذي تحب أعماله`,
+  tasteReasonAcclaimed: (score: string) => `تقييم عالٍ جدًا ★ ${score}`,
+  tasteNotInterested: "لست مهتمًا",
+  tasteHidden: "لن نقترحه مجددًا وسنتعلّم من ذلك",
+  tasteUndo: "تراجع",
+  tasteRefresh: "تحديث",
 };
 
 export const t = ar;

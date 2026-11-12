@@ -4,6 +4,7 @@ import { resetLocalFavorites } from "./favorites";
 import { resetLocalCompletion } from "./completion";
 import { resetLocalManga } from "./manga/store";
 import { resetLocalNotifications } from "./notifications";
+import { resetTaste } from "./taste";
 
 // Watch history, favorites, completion, manga and the notification center live
 // on the device and are MERGED into the account on sign-in. Sign-out used to
@@ -21,6 +22,7 @@ async function wipeAccountLocalData(): Promise<void> {
     resetLocalCompletion(),
     resetLocalManga(),
     resetLocalNotifications(),
+    resetTaste(),
   ].map((p) => p.catch(() => {})));
 }
 

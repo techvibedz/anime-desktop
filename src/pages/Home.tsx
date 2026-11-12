@@ -19,6 +19,7 @@ import { usePosterImage } from "../lib/posters";
 import { usePrefersReducedMotion } from "../lib/motion";
 import { canonTitle } from "../lib/relations";
 import { fetchAnimeRecommendations, pickTasteSeeds, rankRecommendations, type RankedRec, type RecItem } from "../lib/recommend";
+import { computeTaste, readTasteBundle, viewFromBundle, type TasteBundle } from "../lib/taste";
 import { resolveSourceUrl } from "../lib/schedule";
 import { reconcileCompletionFromEpisodes, useCompletionLookup, type AnimeCompletion } from "../lib/completion";
 import { extractEpisodeNumber } from "../lib/episode-utils";
@@ -630,18 +631,48 @@ const ForYouRail = memo(function ForYouRail({ history }: { history: WatchEntry[]
     }
   };
 
+  // Taste engine (lib/taste): when it has a ranking, the rail shows its top
+  // picks (learned from finished AND dropped shows). Refreshed in the
+  // background; the AniList-recs ranking above is the fallback.
+  const [tasteItems, setTasteItems] = useState<RankedRec[] | null>(null);
+  const applyTaste = useCallback(async (b: TasteBundle | null) => {
+    if (!b) return;
+    const v = await viewFromBundle(b, "all", 15);
+    if (!v.ranked.length) return;
+    setTasteItems(v.ranked.map((sc) => ({
+      anilistId: sc.media.id,
+      title: sc.media.title,
+      titleEnglish: sc.media.titleEnglish,
+      image: sc.media.image,
+      format: sc.media.format,
+      seasonYear: sc.media.seasonYear,
+      rating: sc.match,
+      score: sc.score,
+    })));
+  }, []);
+  useEffect(() => {
+    if (seedKey === null) return;
+    let alive = true;
+    void readTasteBundle().then((b) => { if (alive) void applyTaste(b); });
+    const timer = setTimeout(() => {
+      void computeTaste().then((b) => { if (alive) void applyTaste(b); }).catch(() => {});
+    }, 8000);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [seedKey, applyTaste]);
+
   // Filter at render too: a cached rail (or one computed before the ✓ mark)
   // drops the anime the moment it is marked completed.
-  const visible = useMemo(() => items.filter((item) =>
+  const visible = useMemo(() => (tasteItems ?? items).filter((item) =>
     ![item.title, item.titleEnglish].some((title) =>
       !!title && (completedTitles.keys.has(animeTitleKey(title)) || completedTitles.canons.has(canonTitle(title))))),
-  [items, completedTitles]);
+  [items, tasteItems, completedTitles]);
 
   if (visible.length === 0) return null;
   return (
     <section className="lazy-section">
       <SectionHeader
         title={t.recsForYou}
+        to="/for-you"
         icon={<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" className="text-mint" aria-hidden><path d="M12 2l1.9 5.6L19.5 9l-4.6 3.4L16.4 18 12 14.8 7.6 18l1.5-5.6L4.5 9l5.6-1.4z" /></svg>}
       />
       <Rail itemWidth={POSTER_W}>

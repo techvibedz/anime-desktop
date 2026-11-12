@@ -33,6 +33,7 @@ type NavEntry = { to: string; label: string; end?: boolean; d: string; badge?: b
 const NAV_BROWSE: NavEntry[] = [
   { to: "/", label: t.home, end: true, d: "M3 10.5 12 3l9 7.5|M5 9.5V21h14V9.5|M9 21v-6h6v6" },
   { to: "/search", label: t.search, d: ICONS.search },
+  { to: "/for-you", label: t.tasteTitle, d: "M12 11c0 3.5-.5 6.5-2 9|M8 6.8A6 6 0 0 1 18 11c0 1.5-.1 3-.4 4.4|M6 9.5A6 6 0 0 0 6 11c0 2-.4 3.8-1.2 5.3|M12 7a4 4 0 0 0-4 4c0 1.3-.1 2.6-.4 3.8|M16 11a4 4 0 0 0-1.3-2.9" },
   { to: "/schedule", label: t.scheduleTitle, d: "M8 2v4|M16 2v4|M3 8h18|M5 4h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z" },
   { to: "/seasons", label: t.seasonsTitle, d: "M12 3v2|M12 19v2|M3 12h2|M19 12h2|M5.6 5.6l1.4 1.4|M17 17l1.4 1.4|M5.6 18.4 7 17|M17 7l1.4-1.4|M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10Z" },
   { to: "/upcoming", label: t.upcomingTitle, d: "M12 8v4l3 3|M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z" },
@@ -115,7 +116,7 @@ function NavGroup({ label, items, unread, collapsed }: { label: string; items: N
 
 // Top-level routes have no "back"; everything else gets one, since the app has
 // no browser chrome to go back with.
-const ROOT_PATHS = new Set(["/", "/search", "/schedule", "/seasons", "/upcoming", "/manga", "/mylist", "/downloads", "/watch-party", "/news", "/notifications", "/chat", "/report", "/settings", "/profile"]);
+const ROOT_PATHS = new Set(["/", "/search", "/for-you", "/schedule", "/seasons", "/upcoming", "/manga", "/mylist", "/downloads", "/watch-party", "/news", "/notifications", "/chat", "/report", "/settings", "/profile"]);
 
 export function Layout() {
   const { user, signOut } = useAuth();

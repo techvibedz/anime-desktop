@@ -20,6 +20,7 @@ import { claimLocalData } from "./lib/accountData";
 // loads on demand — most importantly Watch, which pulls in hls.js.
 const SearchPage = lazy(() => import("./pages/Search").then((m) => ({ default: m.SearchPage })));
 const SmartSearchPage = lazy(() => import("./pages/SmartSearch").then((m) => ({ default: m.SmartSearchPage })));
+const ForYouPage = lazy(() => import("./pages/ForYou").then((m) => ({ default: m.ForYouPage })));
 const WrappedPage = lazy(() => import("./pages/Wrapped").then((m) => ({ default: m.WrappedPage })));
 const MomentPage = lazy(() => import("./pages/Moment").then((m) => ({ default: m.MomentPage })));
 const MyListPage = lazy(() => import("./pages/MyList").then((m) => ({ default: m.MyListPage })));
@@ -193,6 +194,7 @@ export default function App() {
             <Route index element={<HomePage />} />
             <Route path="search" element={<SearchPage />} />
             <Route path="smart-search" element={<SmartSearchPage />} />
+            <Route path="for-you" element={<ForYouPage />} />
             <Route path="wrapped" element={<WrappedPage />} />
             <Route path="moment/:id" element={<MomentPage />} />
             <Route path="mylist" element={<MyListPage />} />
