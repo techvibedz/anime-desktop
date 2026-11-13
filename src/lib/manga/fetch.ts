@@ -16,7 +16,49 @@ export function looksLikeCfChallenge(html: string): boolean {
 // the same page at the same moment; both wait on the same browser trip.
 const renderInflight = new Map<string, Promise<string | null>>();
 
+// Per-host breaker (mobile parity, 2026-11-13): a source that is down (mangawy
+// backend 500s, hijala.com behind an interactive Turnstile) would otherwise
+// cost a ~25s hidden-window render plus a 28s scrape on EVERY search/detail/
+// match lookup. Two consecutive browser failures on a host suspend its browser
+// fallback for 10 min; the cheap direct GET still runs and any success resets.
+const BREAKER_THRESHOLD = 2;
+const BREAKER_COOLDOWN_MS = 10 * 60_000;
+const hostFailures = new Map<string, { count: number; openUntil: number }>();
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
+export function isMangaHostDown(url: string): boolean {
+  const state = hostFailures.get(hostOf(url));
+  return !!state && state.openUntil > Date.now();
+}
+
+export function markHostOk(url: string): void {
+  hostFailures.delete(hostOf(url));
+}
+
+export function markHostFailed(url: string): void {
+  const host = hostOf(url);
+  const state = hostFailures.get(host) ?? { count: 0, openUntil: 0 };
+  state.count += 1;
+  if (state.count >= BREAKER_THRESHOLD) state.openUntil = Date.now() + BREAKER_COOLDOWN_MS;
+  hostFailures.set(host, state);
+}
+
 async function fetchViaBrowser(url: string, marker: string, rawText = false): Promise<string | null> {
+  if (isMangaHostDown(url)) return null;
+  const html = await fetchViaBrowserOnce(url, marker, rawText);
+  if (html) markHostOk(url);
+  else markHostFailed(url);
+  return html;
+}
+
+async function fetchViaBrowserOnce(url: string, marker: string, rawText = false): Promise<string | null> {
   const key = `${rawText}|${marker}|${url}`;
   const existing = renderInflight.get(key);
   if (existing) return existing;
@@ -65,7 +107,10 @@ export async function fetchMangaHtml(
   } catch {
     direct = null;
   }
-  if (direct && !looksLikeCfChallenge(direct) && (!marker || direct.includes(marker))) return direct;
+  if (direct && !looksLikeCfChallenge(direct) && (!marker || direct.includes(marker))) {
+    markHostOk(url);
+    return direct;
+  }
   return fetchViaBrowser(url, marker);
 }
 
@@ -93,7 +138,10 @@ export async function fetchMangaRawText(url: string, referer?: string): Promise<
         ...(referer ? { Referer: referer } : {}),
       },
     });
-    if (text && !looksLikeCfChallenge(text)) return text;
+    if (text && !looksLikeCfChallenge(text)) {
+      markHostOk(url);
+      return text;
+    }
   } catch {
     // fall through to the browser
   }

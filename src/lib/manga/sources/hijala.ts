@@ -1,30 +1,28 @@
-// Hijala (الحجالة) manga source adapter — https://hijala.com
+// Hijala (الحجالة) manga source adapter — https://hijala.org
 //
-// WordPress + the Themesia "MangaReader" theme (not Madara): `.bsx` cover
-// cards, a `#chapterlist` `<li data-num>` list on the series page, and the
-// reader's images server-rendered inside `#readerarea`'s <noscript>. Every
-// page ships complete to a plain GET (no Cloudflare as of 2026-10-25), and
-// the REST API doesn't expose the manga post type (wp/v2/manga 404), so HTML
-// parsing covers all entry points. fetchMangaHtml still falls back to the
-// hidden WebView if a challenge ever appears.
+// 2026-11-13: Hijala moved off its old WordPress site (hijala.com, now locked
+// behind an interactive Cloudflare Turnstile the hidden WebView can't pass) to
+// a new Next.js app on hijala.org — no challenge, a JSON API, and the same
+// series slugs, so saved favorites/history keep working.
 //
-// Permalinks live at the site root: series `/{slug}/`, chapters
-// `/{slug}-{n}/`. IDs are those slugs, so URLs rebuild from the id alone.
+// Endpoints (verified live 2026-11-13):
+//   /api/series/search?q=&genre=Any&status=Any&type=Any&sort=Latest+Chapters
+//     → { series: [{ id: slug, title, image, type, genre: "A, B", rating,
+//          status, views, chapters: [latest 6 { id, num: "Chapter 62" }] }] }
+//     The WHOLE filtered catalog in one response (~310 works); genre/status/
+//     type filter server-side (English names), sort "A-Z" = title order.
+//   /api/home/popular?timeframe=Weekly → { popular: [{ id, title, image, ... }] }
+//   /series/{slug}            SSR; the RSC payload holds the series object
+//                             (synopsis, genre[], author, full chapter list)
+//   /series/{slug}/chapter-N  SSR; RSC `pageKeys` = ordered page image keys
+//                             under /hijala-cdn/ (no hot-link protection)
 //
-// Catalog is small (~320 works, mostly manhwa) — the point of this source is
-// filling chapter gaps in works the bigger sources also carry; the aggregator
-// unions chapters by number, so it never duplicates a work.
-//
-// Listing endpoints, verified live:
-//   /?s=q (10/page, /page/N/?s=q)  — plain title search
-//   /manga/?title=&status=&type=&genre[]=&order=&page=N (5/page) — filtered
-//   `genre[]` takes the site's numeric term ids and ANDs multiple values, so
-//   one id per request (lib/manga/genres.ts `hijala`).
+// IDs: manga id = slug; chapter id = chapter number ("62", "41.2"). Old
+// hijala.com chapter ids (`{slug}-{n}` or URLs) are still accepted.
 
-import { fetchMangaHtml } from "../fetch";
-import { hijalaGenreIds } from "../genres";
+import { fetchMangaHtml, fetchMangaRawText } from "../fetch";
+import { hijalaGenreName } from "../genres";
 import { joinColumnPages } from "../columns";
-import { absoluteUrl, attr, chapterImageUrl, decodeEntities, firstMatch, stripTags } from "../html";
 import type {
   MangaCard,
   MangaChapterInfo,
@@ -36,8 +34,13 @@ import type {
   MangaSource,
 } from "../types";
 
-const SITE = "https://hijala.com";
-const MARKER = "hijala";
+export const HIJALA_SITE = "https://hijala.org";
+const SITE = HIJALA_SITE;
+const CDN = `${SITE}/hijala-cdn/`;
+/** Every Next.js RSC page carries this — a valid SSR response, not a wall. */
+const RSC_MARKER = "self.__next_f";
+/** Client-side page size over the one-shot catalog response. */
+export const HIJALA_PAGE_SIZE = 30;
 
 const TYPE_LABELS: Record<string, string> = {
   manga: "مانجا",
@@ -45,10 +48,10 @@ const TYPE_LABELS: Record<string, string> = {
   manhua: "مانها",
 };
 
-const TYPE_SLUGS: Record<string, string> = {
-  مانجا: "manga",
-  مانهوا: "manhwa",
-  مانها: "manhua",
+const TYPE_PARAMS: Record<string, string> = {
+  مانجا: "Manga",
+  مانهوا: "Manhwa",
+  مانها: "Manhua",
 };
 
 const STATUS_LABELS: Record<string, string> = {
@@ -59,131 +62,221 @@ const STATUS_LABELS: Record<string, string> = {
   "on hold": "معلق",
 };
 
-const STATUS_SLUGS: Record<string, string> = {
-  مستمر: "ongoing",
-  مكتمل: "completed",
-  معلق: "hiatus",
+const STATUS_PARAMS: Record<string, string> = {
+  مستمر: "Ongoing",
+  مكتمل: "Completed",
+  معلق: "Hiatus",
 };
-
-/** Root-level paths that are site pages, not series. */
-const RESERVED = new Set([
-  "manga", "genres", "page", "blog", "bookmark", "call-us", "wp-content", "wp-admin",
-  "wp-json", "feed", "tag", "category", "author", "test",
-]);
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function region(html: string, from: string, to?: string): string {
-  const start = html.indexOf(from);
-  if (start < 0) return "";
-  const rest = html.slice(start);
-  if (to) {
-    const end = rest.indexOf(to, from.length);
-    if (end >= 0) return rest.slice(0, end);
+function str(value: unknown): string | null {
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : null;
+  if (typeof value !== "string") return null;
+  const s = value.trim();
+  // The site renders missing fields as an em dash ("author": "—").
+  return s && !/^[-—–]+$/.test(s) ? s : null;
+}
+
+/** Unrated works come back as 0 — no rating, not a zero score. */
+function rating(value: unknown): string | null {
+  const s = str(value);
+  const n = s ? Number(s) : NaN;
+  return Number.isFinite(n) && n > 0 ? String(Math.round(n * 10) / 10) : null;
+}
+
+function normalizeType(raw: unknown): string | null {
+  const s = str(raw);
+  return s ? TYPE_LABELS[s.toLowerCase()] ?? s : null;
+}
+
+function normalizeStatus(raw: unknown): string | null {
+  const s = str(raw);
+  return s ? STATUS_LABELS[s.toLowerCase()] ?? s : null;
+}
+
+/** "Chapter 62" / "62" / "41.2" → "41.2". */
+function chapterNum(raw: unknown): string | null {
+  const m = /(\d+(?:\.\d+)?)/.exec(str(raw) ?? "");
+  return m ? m[1] : null;
+}
+
+function latestLabel(raw: unknown): string | null {
+  const n = chapterNum(raw);
+  return n ? `الفصل ${n}` : null;
+}
+
+function cdnUrl(raw: unknown): string | null {
+  const s = str(raw);
+  if (!s) return null;
+  if (/^https?:\/\//i.test(s)) return s.replace(/^http:\/\//i, "https://");
+  return CDN + s.replace(/^\/+/, "").replace(/^hijala-cdn\//, "");
+}
+
+/** Series slug from a bare slug or a hijala.org / legacy hijala.com URL. */
+export function hijalaSlug(id: string): string | null {
+  let path = id.trim();
+  if (!path) return null;
+  if (/^https?:/i.test(path)) {
+    try {
+      const url = new URL(path);
+      if (!/(^|\.)hijala\.(org|com)$/i.test(url.hostname)) return null;
+      path = url.pathname;
+    } catch {
+      return null;
+    }
   }
-  return rest;
+  const parts = path.replace(/[?#].*$/, "").split("/").filter(Boolean);
+  const first = parts[0] === "series" ? parts[1] : parts[0];
+  if (!first) return null;
+  try {
+    return decodeURIComponent(first);
+  } catch {
+    return first;
+  }
 }
 
-function firstTag(html: string, tag: string): string | null {
-  const m = new RegExp(`<${tag}\\b[^>]*>`, "i").exec(html);
-  return m ? m[0] : null;
+/** Chapter number from any chapter id we ever produced: "62", "chapter-62",
+ * legacy hijala.com slugs "{slug}-62" / "{slug}-41-2", or full URLs. */
+export function hijalaChapterNum(chapterId: string, mangaId?: string): string | null {
+  let id = chapterId.trim().replace(/[?#].*$/, "").replace(/\/+$/, "");
+  if (/^https?:/i.test(id)) id = id.split("/").pop() ?? "";
+  try {
+    id = decodeURIComponent(id);
+  } catch {
+    // keep raw
+  }
+  if (/^\d+(?:\.\d+)?$/.test(id)) return id;
+  const chapter = /^chapter-(\d+(?:[.-]\d+)?)$/i.exec(id);
+  if (chapter) return chapter[1].replace("-", ".");
+  const slug = mangaId ? hijalaSlug(mangaId) : null;
+  if (slug && id.startsWith(`${slug}-`)) {
+    const rest = id.slice(slug.length + 1);
+    const m = /^(\d+)(?:[.-](\d+))?$/.exec(rest);
+    if (m) return m[2] ? `${m[1]}.${m[2]}` : m[1];
+  }
+  const tail = /(\d+(?:\.\d+)?)$/.exec(id);
+  return tail ? tail[1] : null;
 }
 
-function imgUrl(tag: string | null): string | null {
-  if (!tag) return null;
-  for (const name of ["data-src", "data-lazy-src", "src"]) {
-    const raw = attr(tag, name)?.trim();
-    const url = raw && !/^data:/i.test(raw) ? absoluteUrl(raw, SITE) : null;
-    if (url) return https(url);
+export function hijalaChapterUrl(mangaId: string, chapterId: string): string | null {
+  const slug = hijalaSlug(mangaId);
+  const num = hijalaChapterNum(chapterId, mangaId);
+  return slug && num ? `${SITE}/series/${encodeURIComponent(slug)}/chapter-${num}` : null;
+}
+
+/** Concatenated, unescaped Next.js flight payload (`self.__next_f.push`). */
+export function rscPayload(html: string): string {
+  let all = "";
+  for (const m of html.matchAll(/self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)/g)) {
+    try {
+      all += JSON.parse(`"${m[1]}"`) as string;
+    } catch {
+      // a malformed chunk only loses its own slice
+    }
+  }
+  return all;
+}
+
+/** The smallest JSON object enclosing the first occurrence of `key`. String
+ * contents are skipped so braces inside synopses don't unbalance the scan. */
+export function enclosingObject(payload: string, key: string): Record<string, unknown> | null {
+  const at = payload.indexOf(key);
+  if (at < 0) return null;
+  // Candidate starts walking backwards; the first one that parses as an object
+  // spanning past `key` wins.
+  for (let start = payload.lastIndexOf("{", at); start >= 0; start = payload.lastIndexOf("{", start - 1)) {
+    const end = objectEnd(payload, start);
+    if (end > at) {
+      try {
+        const value = JSON.parse(payload.slice(start, end)) as unknown;
+        if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+      } catch {
+        // not a real object boundary — keep walking out
+      }
+    }
+    if (at - start > 200_000) break;
   }
   return null;
 }
 
-/** Series/chapter slug from an absolute or relative URL (or a bare slug). */
-export function hijalaSlug(id: string): string | null {
-  let path = id.trim();
-  try {
-    if (/^https?:/i.test(path)) {
-      const url = new URL(path);
-      if (!/(^|\.)hijala\.com$/i.test(url.hostname)) return null;
-      path = url.pathname;
+function objectEnd(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (c === "\\") i++;
+      else if (c === '"') inString = false;
+      continue;
     }
-  } catch {
-    return null;
+    if (c === '"') inString = true;
+    else if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) return i + 1;
   }
-  const first = path.replace(/[?#].*$/, "").split("/").filter(Boolean)[0];
-  if (!first) return null;
-  let slug: string;
-  try {
-    slug = decodeURIComponent(first);
-  } catch {
-    slug = first;
-  }
-  return RESERVED.has(slug.toLowerCase()) ? null : slug;
-}
-
-function normalizeType(raw: string | null | undefined): string | null {
-  const s = (raw ?? "").trim();
-  return s ? TYPE_LABELS[s.toLowerCase()] ?? s : null;
-}
-
-function normalizeStatus(raw: string | null | undefined): string | null {
-  const s = stripTags(raw ?? "");
-  return s ? STATUS_LABELS[s.toLowerCase()] ?? s : null;
-}
-
-/** "فصل 154" / "الفصل.  35" / "14" → "الفصل 154". */
-function latestLabel(raw: string | null | undefined): string | null {
-  const n = firstMatch(stripTags(raw ?? ""), /([\d٠-٩]+(?:\.[\d٠-٩]+)?)/);
-  return n ? `الفصل ${n}` : null;
+  return -1;
 }
 
 // ── pure parsers (offline-testable) ──────────────────────────────────────────
 
-/** Every `.bsx` cover card in a page fragment (home rails, search, listing). */
-export function parseHijalaCards(html: string): MangaCard[] {
-  const out: MangaCard[] = [];
+function cardFrom(raw: unknown): MangaCard | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const id = str(r.id) ?? str(r.slug);
+  const title = str(r.title);
+  if (!id || !title || /^\d+$/.test(id) && !str(r.slug)) return null;
+  const chapters = Array.isArray(r.chapters) ? r.chapters : [];
+  const first = chapters[0] as Record<string, unknown> | undefined;
+  return {
+    source: "hijala",
+    id: str(r.slug) ?? id,
+    title,
+    cover: cdnUrl(r.image),
+    type: normalizeType(r.type),
+    status: normalizeStatus(r.status),
+    rating: rating(r.rating),
+    latest: latestLabel(first?.num),
+  };
+}
+
+/** `/api/series/search` and `/api/home/popular` bodies → cards. */
+export function parseHijalaCards(body: string | null): MangaCard[] {
+  if (!body) return [];
+  let json: unknown;
+  try {
+    json = JSON.parse(body);
+  } catch {
+    return [];
+  }
+  const rec = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
+  const list = Array.isArray(json) ? json : Array.isArray(rec.series) ? rec.series : Array.isArray(rec.popular) ? rec.popular : [];
   const seen = new Set<string>();
-  for (const chunk of html.split(/<div class="bsx">/).slice(1)) {
-    const a = firstTag(chunk, "a");
-    const id = hijalaSlug(attr(a ?? "", "href") ?? "");
-    if (!id || seen.has(id)) continue;
-    const img = firstTag(chunk, "img");
-    const title = stripTags(
-      attr(a ?? "", "title") ||
-        firstMatch(chunk, /<div class="tt">([\s\S]*?)<\/div>/i) ||
-        attr(img ?? "", "alt") ||
-        "",
-    );
-    if (!title) continue;
-    seen.add(id);
-    out.push({
-      source: "hijala",
-      id,
-      title,
-      cover: imgUrl(img),
-      type: normalizeType(firstMatch(chunk, /<span class="type ([^"]+)"/i)),
-      rating: firstMatch(chunk, /<div class="numscore">\s*([\d.]+)/i),
-      latest: latestLabel(
-        firstMatch(chunk, /<div class="epxs">([\s\S]*?)<\/div>/i) ??
-          firstMatch(chunk, /<span class="fivchap">([\s\S]*?)<\/span>/i),
-      ),
-    });
+  const out: MangaCard[] = [];
+  for (const raw of list) {
+    const card = cardFrom(raw);
+    if (card && !seen.has(card.id)) {
+      seen.add(card.id);
+      out.push(card);
+    }
   }
   return out;
 }
 
-export function parseHijalaHome(html: string): MangaHome | null {
-  // "الأعمال الرائجة" slider — scoped to the next section box.
-  const popular = parseHijalaCards(region(html, "popularslider", 'class="bixbox'));
-  // "أحدث الإصدارات" = the `styletere` latest-update cards.
-  const latest = parseHijalaCards(
-    html
-      .split(/<div class="bs styletere[^"]*">/)
-      .slice(1)
-      .map((chunk) => chunk.slice(0, chunk.indexOf("</ul>") + 5))
-      .join(""),
-  );
+/** Views for the client-side "popular" order (not on MangaCard). */
+function viewsById(body: string | null): Map<string, number> {
+  const out = new Map<string, number>();
+  try {
+    const json = JSON.parse(body ?? "") as { series?: { id?: string; views?: number }[] };
+    for (const s of json.series ?? []) if (s.id) out.set(s.id, Number(s.views) || 0);
+  } catch {
+    // no views → keep server order
+  }
+  return out;
+}
+
+export function parseHijalaHome(latestBody: string | null, popularBody: string | null): MangaHome | null {
+  const latest = parseHijalaCards(latestBody).slice(0, 24);
+  const popular = parseHijalaCards(popularBody);
   const sections: MangaHomeSection[] = [];
   if (latest.length) sections.push({ id: "latest", title: "أحدث الفصول", kind: "latest", items: latest });
   if (popular.length) sections.push({ id: "popular", title: "الأكثر قراءة", kind: "ranked", items: popular });
@@ -191,148 +284,98 @@ export function parseHijalaHome(html: string): MangaHome | null {
   return { featured: (popular.length ? popular : latest).slice(0, 6), sections };
 }
 
-/** `#chapterlist` rows, newest-first as served. */
-export function parseHijalaChapters(html: string): MangaChapterInfo[] {
-  // Bounded to the list itself — the footer menu is <li> links too.
-  const list = region(html, 'id="chapterlist"', "</ul>");
+/** Series RSC object chapters → newest-first list; locked (paid) chapters are
+ * left out — they can't be read, other sources fill those numbers. */
+export function parseHijalaChapters(rawChapters: unknown): MangaChapterInfo[] {
+  if (!Array.isArray(rawChapters)) return [];
   const out: MangaChapterInfo[] = [];
   const seen = new Set<string>();
-  for (const m of list.matchAll(/<li\b([^>]*)>([\s\S]*?)<\/li>/gi)) {
-    const block = m[2];
-    const id = hijalaSlug(attr(firstTag(block, "a") ?? "", "href") ?? "");
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
-    const label = stripTags(firstMatch(block, /<span class="chapternum">([\s\S]*?)<\/span>/i) ?? "");
-    const dataNum = attr(m[1], "data-num")?.trim();
-    const number = dataNum || firstMatch(label, /([\d.]+)/) || label || id;
-    out.push({
-      id,
-      number,
-      title: null,
-      date: stripTags(firstMatch(block, /<span class="chapterdate">([\s\S]*?)<\/span>/i) ?? "") || null,
-    });
+  for (const raw of rawChapters) {
+    if (!raw || typeof raw !== "object") continue;
+    const c = raw as Record<string, unknown>;
+    if (c.locked === true || (typeof c.coins === "number" && c.coins > 0)) continue;
+    const number = chapterNum(c.num);
+    if (!number || seen.has(number)) continue;
+    seen.add(number);
+    out.push({ id: number, number, title: str(c.sub), date: str(c.time) });
   }
-  return out;
-}
-
-function infoValue(html: string, label: string): string | null {
-  const m = new RegExp(`<div class="imptdt">\\s*${label}\\s*([\\s\\S]*?)<\\/div>`, "i").exec(html);
-  const value = m ? stripTags(m[1]) : "";
-  return value && value !== "-" ? value : null;
+  return out.sort((a, b) => Number(b.number) - Number(a.number));
 }
 
 export function parseHijalaDetail(html: string, id: string): MangaDetail | null {
-  const title = stripTags(firstMatch(html, /<h1 class="entry-title"[^>]*>([\s\S]*?)<\/h1>/i) ?? "");
+  const payload = rscPayload(html);
+  const series = enclosingObject(payload, '"synopsis":') ?? enclosingObject(payload, '"totalChapters":');
+  if (!series) return null;
+  const title = str(series.title);
   if (!title) return null;
-  const chapters = parseHijalaChapters(html);
-  const synopsis = stripTags(
-    firstMatch(html, /<div class="entry-content entry-content-single"[^>]*>([\s\S]*?)<\/div>/i) ?? "",
-  );
-  const genres = [...region(html, '<span class="mgen">', "</span>").matchAll(/<a\b[^>]*>([\s\S]*?)<\/a>/gi)]
-    .map((m) => stripTags(m[1]))
-    .filter(Boolean);
-  const year = firstMatch(infoValue(html, "سنة الإصدار") ?? infoValue(html, "سنة النشر") ?? "", /((?:19|20)\d{2})/);
+  const chapters = parseHijalaChapters(series.chapters);
+  const genres = Array.isArray(series.genre)
+    ? series.genre.map(str).filter((g): g is string => !!g)
+    : (str(series.genre) ?? "").split(",").map((g) => g.trim()).filter(Boolean);
+  const year = /((?:19|20)\d{2})/.exec(str(series.released) ?? "")?.[1] ?? null;
   return {
     source: "hijala",
-    id: hijalaSlug(id) ?? id,
+    id: str(series.slug) ?? hijalaSlug(id) ?? id,
     title,
-    cover: imgUrl(firstTag(region(html, 'class="thumb"'), "img")),
-    type: normalizeType(infoValue(html, "النوع")),
-    status: normalizeStatus(infoValue(html, "الحالة")),
-    rating: firstMatch(html, /itemprop="ratingValue"[^>]*content="([\d.]+)"/i),
-    synopsis: synopsis || null,
+    cover: cdnUrl(series.image),
+    type: normalizeType(series.type),
+    status: normalizeStatus(series.status),
+    rating: rating(series.rating),
+    synopsis: str(series.synopsis),
     genres,
     chapters,
-    author: infoValue(html, "المؤلف"),
+    author: str(series.author),
     year,
     latest: chapters.length ? latestLabel(chapters[0].number) : null,
   };
 }
 
-/** Older uploads are linked as http:// — Android blocks cleartext, and the
- * host serves the same files over https. */
-function https(url: string): string {
-  return url.replace(/^http:\/\/((?:[\w-]+\.)*hijala\.com)\//i, "https://$1/");
-}
-
-/** Reader pages: `#readerarea` images (the server-rendered <noscript> copy),
- * falling back to a `ts_reader.run({... "images": [...]})` payload. */
-export function parseHijalaChapter(html: string, base: string): MangaReaderData | null {
+/** Reader pages from a chapter page's RSC `pageKeys`. */
+export function parseHijalaChapter(html: string): MangaReaderData | null {
+  const payload = rscPayload(html);
+  const holder = enclosingObject(payload, '"pageKeys":');
+  const keys = holder && Array.isArray(holder.pageKeys) ? holder.pageKeys : [];
   const pages: string[] = [];
-  const area = region(html, 'id="readerarea"', 'id="readerarea-loading"');
-  for (const m of area.matchAll(/<img\b[^>]*>/gi)) {
-    const raw = chapterImageUrl(m[0], base || SITE);
-    const url = raw ? https(raw) : null;
-    if (url && !/\/themes\//.test(url) && !pages.includes(url)) pages.push(url);
-  }
-  if (!pages.length) {
-    const json = firstMatch(html, /"images"\s*:\s*(\[[^\]]*\])/);
-    if (json) {
-      try {
-        for (const raw of JSON.parse(json) as unknown[]) {
-          const abs = typeof raw === "string" ? absoluteUrl(raw, base || SITE) : null;
-          const url = abs ? https(abs) : null;
-          if (url && !pages.includes(url)) pages.push(url);
-        }
-      } catch {
-        // malformed payload — no pages
-      }
-    }
+  for (const key of keys) {
+    const url = cdnUrl(key);
+    if (url && !pages.includes(url)) pages.push(url);
   }
   if (!pages.length) return null;
-  const title = stripTags(firstMatch(html, /<h1 class="entry-title"[^>]*>([\s\S]*?)<\/h1>/i) ?? "");
+  const manga = holder?.manga as Record<string, unknown> | undefined;
+  const num = str(holder?.currentChapterNum);
+  const title = str(manga?.title);
   // Left/right halves of one page (`01_001` + `01_002`) → one page entry.
-  return { pages: joinColumnPages(pages), title: title || null };
+  return { pages: joinColumnPages(pages), title: title ? (num ? `${title} ${num}` : title) : null };
 }
 
 // ── request builders ─────────────────────────────────────────────────────────
 
-/** `/manga/` filtered listing URL (5 cards a page). */
-export function hijalaListingUrl(
-  options: MangaFilterOptions | undefined,
-  page: number,
-  extra: { title?: string; genreId?: number } = {},
-): string {
-  const params: string[] = [];
-  if (extra.title) params.push(`title=${encodeURIComponent(extra.title)}`);
-  if (extra.genreId) params.push(`genre%5B%5D=${extra.genreId}`);
-  const status = STATUS_SLUGS[options?.status?.trim() ?? ""];
-  if (status) params.push(`status=${status}`);
-  const type = TYPE_SLUGS[options?.type?.trim() ?? ""];
-  if (type) params.push(`type=${type}`);
-  const order = options?.sort === "title" ? "title" : options?.sort === "latest" ? "update" : extra.title ? "" : "popular";
-  if (order) params.push(`order=${order}`);
-  if (page > 1) params.push(`page=${page}`);
-  return `${SITE}/manga/${params.length ? `?${params.join("&")}` : ""}`;
+/** `/api/series/search` URL. One genre per request (the UI unions them). */
+export function hijalaSearchUrl(query: string, options?: MangaFilterOptions, genre?: string | null): string {
+  const params = new URLSearchParams({
+    q: query.trim(),
+    genre: genre || "Any",
+    status: STATUS_PARAMS[options?.status?.trim() ?? ""] ?? "Any",
+    type: TYPE_PARAMS[options?.type?.trim() ?? ""] ?? "Any",
+    sort: options?.sort === "title" ? "A-Z" : "Latest Chapters",
+  });
+  return `${SITE}/api/series/search?${params.toString()}`;
 }
 
-function hasServerFilters(options: MangaFilterOptions | undefined): boolean {
-  return !!(STATUS_SLUGS[options?.status?.trim() ?? ""] || TYPE_SLUGS[options?.type?.trim() ?? ""]);
+/** 1-based client-side page over the one-shot catalog. `popular` reorders by
+ * views (the API has no popularity sort). */
+export function hijalaPage(body: string | null, page: number, popular = false): MangaCard[] {
+  let cards = parseHijalaCards(body);
+  if (popular) {
+    const views = viewsById(body);
+    cards = [...cards].sort((a, b) => (views.get(b.id) ?? 0) - (views.get(a.id) ?? 0));
+  }
+  const start = (Math.max(1, page) - 1) * HIJALA_PAGE_SIZE;
+  return cards.slice(start, start + HIJALA_PAGE_SIZE);
 }
 
-/** `directOnly`: WordPress 404s search pages past the last one — that is the
- * end of the results, not a challenge worth a 28s WebView render. */
-async function listing(url: string, directOnly = false): Promise<MangaCard[]> {
-  const html = directOnly
-    ? ((await window.pantoufa.fetchHtml?.(url, `${SITE}/`, { attempts: 2, timeoutMs: 8000 }).catch(() => null)) ?? null)
-    : await fetchMangaHtml(url, `${SITE}/`, MARKER);
-  return html ? parseHijalaCards(region(html, 'class="listupd"') || html) : [];
-}
-
-/** One request per genre term id (the site ANDs `genre[]`), merged in order. */
-async function genreListing(
-  label: string,
-  page: number,
-  options: MangaFilterOptions | undefined,
-  title?: string,
-): Promise<MangaCard[]> {
-  const ids = hijalaGenreIds(label);
-  if (!ids.length) return [];
-  const lists = await Promise.all(
-    ids.map((genreId) => listing(hijalaListingUrl(options, page, { title, genreId })).catch(() => [])),
-  );
-  const seen = new Set<string>();
-  return lists.flat().filter((card) => !seen.has(card.id) && !!seen.add(card.id));
+async function listing(url: string, page: number, popular = false): Promise<MangaCard[]> {
+  return hijalaPage(await fetchMangaRawText(url, `${SITE}/series`), page, popular);
 }
 
 // ── network ──────────────────────────────────────────────────────────────────
@@ -342,39 +385,43 @@ export const hijalaSource: MangaSource = {
   label: "الحجالة",
 
   async home() {
-    const html = await fetchMangaHtml(`${SITE}/`, `${SITE}/`, MARKER);
-    if (!html) throw new Error("hijala: home fetch failed");
-    const home = parseHijalaHome(html);
-    if (!home) throw new Error("hijala: home parse found no manga");
+    const [latest, popular] = await Promise.all([
+      fetchMangaRawText(hijalaSearchUrl(""), `${SITE}/`),
+      fetchMangaRawText(`${SITE}/api/home/popular?timeframe=Weekly`, `${SITE}/`),
+    ]);
+    const home = parseHijalaHome(latest, popular);
+    if (!home) throw new Error("hijala: home fetch failed");
     return home;
   },
 
   async search(query, options) {
-    const q = query.trim();
     const page = options?.page ?? 1;
-    const genres = options?.genres ?? [];
+    const genres = (options?.genres ?? []).map(hijalaGenreName);
     if (genres.length) {
-      return (await Promise.all(genres.map((g) => genreListing(g, page, options, q)))).flat();
+      // A genre this source doesn't carry → no results here, not "everything".
+      const known = genres.filter((g): g is string => !!g);
+      if (!known.length) return [];
+      const lists = await Promise.all(known.map((g) => listing(hijalaSearchUrl(query, options, g), page)));
+      const seen = new Set<string>();
+      return lists.flat().filter((card) => !seen.has(card.id) && !!seen.add(card.id));
     }
-    if (hasServerFilters(options) || options?.sort === "title") {
-      return listing(hijalaListingUrl(options, page, { title: q }));
-    }
-    if (page > 1) return listing(`${SITE}/page/${page}/?s=${encodeURIComponent(q)}`, true);
-    return listing(`${SITE}/?s=${encodeURIComponent(q)}`);
+    return listing(hijalaSearchUrl(query, options), page);
   },
 
   async browseGenre(label, page, options) {
-    return genreListing(label, page, options);
+    const genre = hijalaGenreName(label);
+    if (!genre) return [];
+    return listing(hijalaSearchUrl("", options, genre), page, !options?.sort || options.sort === "default");
   },
 
   async browseAll(page, options) {
-    return listing(hijalaListingUrl(options, page));
+    return listing(hijalaSearchUrl("", options), page, !options?.sort || options.sort === "default");
   },
 
   async detail(id) {
     const slug = hijalaSlug(id);
     if (!slug) throw new Error(`hijala: bad detail id ${id}`);
-    const html = await fetchMangaHtml(`${SITE}/${encodeURIComponent(slug)}/`, `${SITE}/`, "chapterlist");
+    const html = await fetchMangaHtml(`${SITE}/series/${encodeURIComponent(slug)}`, `${SITE}/series`, RSC_MARKER);
     if (!html) throw new Error(`hijala: detail fetch failed for ${id}`);
     const detail = parseHijalaDetail(html, slug);
     if (!detail) throw new Error(`hijala: detail parse found nothing for ${id}`);
@@ -382,13 +429,11 @@ export const hijalaSource: MangaSource = {
   },
 
   async chapter(mangaId, chapterId) {
-    const slug = hijalaSlug(chapterId);
-    if (!slug) throw new Error(`hijala: bad chapter ref ${mangaId}/${chapterId}`);
-    const url = `${SITE}/${encodeURIComponent(slug)}/`;
-    const series = hijalaSlug(mangaId);
-    const html = await fetchMangaHtml(url, series ? `${SITE}/${encodeURIComponent(series)}/` : `${SITE}/`, "readerarea");
+    const url = hijalaChapterUrl(mangaId, chapterId);
+    if (!url) throw new Error(`hijala: bad chapter ref ${mangaId}/${chapterId}`);
+    const html = await fetchMangaHtml(url, url.replace(/\/chapter-[^/]+$/, ""), RSC_MARKER);
     if (!html) throw new Error(`hijala: chapter fetch failed for ${chapterId}`);
-    const reader = parseHijalaChapter(html, url);
+    const reader = parseHijalaChapter(html);
     if (!reader) throw new Error(`hijala: no pages parsed for ${chapterId}`);
     return reader;
   },

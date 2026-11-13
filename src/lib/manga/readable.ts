@@ -18,7 +18,7 @@ export function chapterImageReferer(copy: ChapterCopy): string {
     case "mangalik":
       return "https://lekmanga.site/";
     case "hijala":
-      return "https://hijala.com/";
+      return "https://hijala.org/";
     default:
       return "https://mangawy.org/";
   }

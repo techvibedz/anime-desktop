@@ -28,7 +28,7 @@ async function main() {
   // Referers per source (moved out of the reader).
   assert.equal(chapterImageReferer(asq), "https://3asq.online/");
   assert.equal(chapterImageReferer(lik), "https://lekmanga.site/");
-  assert.equal(chapterImageReferer({ source: "hijala", mangaId: "x", id: "x-3" }), "https://hijala.com/");
+  assert.equal(chapterImageReferer({ source: "hijala", mangaId: "x", id: "x-3" }), "https://hijala.org/");
   assert.equal(chapterImageReferer(wy), "https://mangawy.org/");
 
   // Live primary: no alternates lookup, one probe pair.

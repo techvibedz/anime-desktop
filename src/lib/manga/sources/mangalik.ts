@@ -312,6 +312,37 @@ export function parseMangalikChapter(html: string, base: string): MangaReaderDat
 
 // ── network ──────────────────────────────────────────────────────────────────
 
+/** Latin query → Madara slug ("One Piece" → "one-piece"); null for non-Latin
+ * or very short queries, where a guessed slug would be noise. */
+export function exactSlugFor(query: string): string | null {
+  const slug = query
+    .toLowerCase()
+    .replace(/[’']/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug.length >= 3 && /[a-z]/.test(slug) ? slug : null;
+}
+
+/** The site's WP search buries flagship series under their spinoffs ("one
+ * piece" → 15 One Piece side works, never /manga/one-piece/ itself — verified
+ * 2026-11-13), so the cross-source matcher never found mangalik's 1165-chapter
+ * copy. Probe the exact slug directly (no WebView job) and surface it first. */
+async function exactSlugCard(query: string): Promise<MangaCard | null> {
+  const slug = exactSlugFor(query);
+  if (!slug) return null;
+  const html = await Promise.resolve(window.pantoufa.fetchHtml?.(`${SITE}/manga/${slug}/`, `${SITE}/`, { attempts: 1, timeoutMs: 6000 })).catch(() => null);
+  if (!html || !html.includes("wp-manga")) return null;
+  const detail = parseMangalikDetail(html, slug);
+  if (!detail || !detail.chapters.length) return null;
+  const { synopsis: _s, genres: _g, chapters: _c, author: _a, year: _y, ...card } = detail;
+  return card;
+}
+
+export function withExactSlugFirst(results: MangaCard[], exact: MangaCard | null): MangaCard[] {
+  if (!exact || results.some((card) => card.id === exact.id)) return results;
+  return [exact, ...results];
+}
+
 export const mangalikSource: MangaSource = {
   id: "mangalik",
   label: "مانجا ليك",
@@ -330,8 +361,13 @@ export const mangalikSource: MangaSource = {
 
   async search(query, options) {
     const path = madaraSearchPath(query.trim(), (options?.genres ?? []).map(mangalikGenreSlug), options, options?.page ?? 1, typeGenre(options));
-    const html = await fetchMangaHtml(`${SITE}${path}`, `${SITE}/`, "wp-manga");
-    return html ? parseMangalikSearch(html) : [];
+    const unfiltered =
+      (options?.page ?? 1) === 1 && !options?.genres?.length && !options?.type && !options?.status;
+    const [html, exact] = await Promise.all([
+      fetchMangaHtml(`${SITE}${path}`, `${SITE}/`, "wp-manga"),
+      unfiltered ? exactSlugCard(query.trim()) : Promise.resolve(null),
+    ]);
+    return withExactSlugFirst(html ? parseMangalikSearch(html) : [], exact);
   },
 
   async browseGenre(label, page, options) {
