@@ -42,12 +42,21 @@ interface ReaderPrefs {
   column: number;
   /** Desktop only: gap between pages in vertical mode. */
   gap: boolean;
+  /** Auto-scroll speed level, 1 (slowest) … AUTO_LEVELS (fastest). */
+  autoSpeed: number;
 }
 
 const PREFS_KEY = "manga_reader_prefs_desktop_v1";
 const RATIOS_KEY = "manga_page_ratios_v1";
 const FIT_MODES: FitMode[] = ["width", "screen", "height", "stretch", "original", "smart"];
-const DEFAULT_PREFS: ReaderPrefs = { mode: "vertical", direction: "rtl", fit: "width", column: 55, gap: false };
+const DEFAULT_PREFS: ReaderPrefs = { mode: "vertical", direction: "rtl", fit: "width", column: 55, gap: false, autoSpeed: 4 };
+
+// ── auto-scroll (mobile parity) ──
+// Continuous mode scrolls at AUTO_PX_PER_SEC[level-1] px/s; the paged modes
+// turn a page every AUTO_PAGE_SECONDS[level-1] seconds.
+const AUTO_PX_PER_SEC = [20, 35, 50, 70, 95, 125, 160, 200, 250, 320];
+const AUTO_PAGE_SECONDS = [14, 12, 10, 8.5, 7, 6, 5, 4, 3.2, 2.5];
+const AUTO_LEVELS = AUTO_PX_PER_SEC.length;
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
@@ -62,6 +71,7 @@ function loadPrefs(): ReaderPrefs {
       fit: FIT_MODES.includes(parsed.fit as FitMode) ? (parsed.fit as FitMode) : "width",
       column: typeof parsed.column === "number" ? clamp(parsed.column, 25, 100) : DEFAULT_PREFS.column,
       gap: parsed.gap === true,
+      autoSpeed: typeof parsed.autoSpeed === "number" ? clamp(Math.round(parsed.autoSpeed), 1, AUTO_LEVELS) : DEFAULT_PREFS.autoSpeed,
     };
   } catch {
     return DEFAULT_PREFS;
@@ -356,6 +366,12 @@ export function MangaReaderPage() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [chapterQuery, setChapterQuery] = useState("");
   const [viewport, setViewport] = useState(() => ({ w: window.innerWidth, h: window.innerHeight }));
+  // Auto-scroll: `autoOn` is the toggle, `autoPaused` the user's pause,
+  // `autoHold` a short hold while the user scrolls by hand.
+  const [autoOn, setAutoOn] = useState(false);
+  const [autoPaused, setAutoPaused] = useState(false);
+  const [autoHold, setAutoHold] = useState(false);
+  const autoHoldTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const [scrollRoot, setScrollRoot] = useState<HTMLDivElement | null>(null);
@@ -404,6 +420,8 @@ export function MangaReaderPage() {
     userInteractedRef.current = false;
     pendingPageRef.current = 0;
     prefetchRef.current = null;
+    setAutoOn(false);
+    setAutoPaused(false);
     scrollRef.current?.scrollTo({ top: 0 });
 
     // A copy whose images are gone (3asq Naruto 590-700 all 404) is replaced
@@ -640,6 +658,66 @@ export function MangaReaderPage() {
     else navigate(mangaDetailPath({ source, id: mangaId, title: mangaTitle, cover: coverParam }));
   }, [navigate, source, mangaId, mangaTitle, coverParam]);
 
+  // ── auto-scroll ──
+  const autoRunning = autoOn && !autoPaused && !autoHold && !listOpen && !settingsOpen && !!pages && progressReady;
+  const toggleAuto = useCallback(() => {
+    setAutoPaused(false);
+    setAutoOn((on) => !on);
+  }, []);
+  const stopAuto = useCallback(() => { setAutoOn(false); setAutoPaused(false); }, []);
+  const changeAutoSpeed = useCallback((delta: number) => {
+    setPrefs((p) => ({ ...p, autoSpeed: clamp(p.autoSpeed + delta, 1, AUTO_LEVELS) }));
+  }, []);
+  /** Manual wheel/drag scrolling holds auto-scroll briefly, then it resumes. */
+  const holdAuto = useCallback(() => {
+    if (!autoOn) return;
+    setAutoHold(true);
+    if (autoHoldTimer.current) clearTimeout(autoHoldTimer.current);
+    autoHoldTimer.current = setTimeout(() => setAutoHold(false), 1200);
+  }, [autoOn]);
+  useEffect(() => () => { if (autoHoldTimer.current) clearTimeout(autoHoldTimer.current); }, []);
+
+  // Continuous mode: per-frame scroll with a float accumulator (scrollTop
+  // rounds to device pixels, so slow speeds would otherwise never move).
+  useEffect(() => {
+    if (!autoRunning || prefs.mode !== "vertical") return;
+    const root = scrollRef.current;
+    if (!root) return;
+    const pxPerSec = AUTO_PX_PER_SEC[clamp(prefs.autoSpeed, 1, AUTO_LEVELS) - 1];
+    let pos = root.scrollTop;
+    let last = 0;
+    let raf = 0;
+    const frame = (ts: number) => {
+      const dt = last ? Math.min(ts - last, 64) / 1000 : 0;
+      last = ts;
+      // Content above re-measured or the user nudged it: adopt the real offset.
+      if (Math.abs(root.scrollTop - pos) > 2) pos = root.scrollTop;
+      pos += pxPerSec * dt;
+      const max = root.scrollHeight - root.clientHeight;
+      if (pos >= max - 1) {
+        root.scrollTop = max;
+        setAutoOn(false);
+        setChrome(true);
+        return;
+      }
+      root.scrollTop = pos;
+      raf = requestAnimationFrame(frame);
+    };
+    raf = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(raf);
+  }, [autoRunning, prefs.mode, prefs.autoSpeed]);
+
+  // Paged modes: turn the page on a timer (restarts whenever the page changes).
+  useEffect(() => {
+    if (!autoRunning || prefs.mode === "vertical") return;
+    const seconds = AUTO_PAGE_SECONDS[clamp(prefs.autoSpeed, 1, AUTO_LEVELS) - 1];
+    const timer = setTimeout(() => {
+      if (indexRef.current >= total - 1) { setAutoOn(false); setChrome(true); return; }
+      jumpTo(indexRef.current + 1);
+    }, seconds * 1000);
+    return () => clearTimeout(timer);
+  }, [autoRunning, prefs.mode, prefs.autoSpeed, index, total, jumpTo]);
+
   // ── chrome auto-hide ──
   // Windowed: mouse movement reveals the chrome, which fades after 3.5s.
   // Fullscreen: chrome hides on entry and only a click on the page toggles it —
@@ -681,6 +759,9 @@ export function MangaReaderPage() {
       }
       if (e.key === "f" || e.key === "F") { toggleFullscreen(); return; }
       if (listOpen || settingsOpen) return;
+      if (e.key === "a" || e.key === "A" || e.key === "ش") { toggleAuto(); return; }
+      if (autoOn && (e.key === "+" || e.key === "=")) { changeAutoSpeed(1); return; }
+      if (autoOn && (e.key === "-" || e.key === "_")) { changeAutoSpeed(-1); return; }
       const rtl = prefs.direction === "rtl";
       if (prefs.mode === "vertical") {
         if (e.key === "n" || e.key === "N") { if (newerChapter) goToChapter(newerChapter); return; }
@@ -698,7 +779,7 @@ export function MangaReaderPage() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [prefs.mode, prefs.direction, listOpen, settingsOpen, step, jumpTo, total, exit, newerChapter, olderChapter, goToChapter]);
+  }, [prefs.mode, prefs.direction, listOpen, settingsOpen, step, jumpTo, total, exit, newerChapter, olderChapter, goToChapter, toggleAuto, changeAutoSpeed, autoOn]);
 
   // Paged modes: the wheel turns pages (debounced so one flick = one page).
   const wheelLock = useRef(0);
@@ -756,7 +837,8 @@ export function MangaReaderPage() {
         <div ref={attachScroll} tabIndex={-1}
           className="h-full overflow-y-auto overscroll-contain outline-none"
           onClick={() => setChrome((v) => !v)}
-          onWheel={() => { userInteractedRef.current = true; }}>
+          onWheel={() => { userInteractedRef.current = true; holdAuto(); }}
+          onMouseDown={(e) => { if (e.button === 1) holdAuto(); }}>
           <div className="pb-4 pt-16">
             {pages.map((uri, i) => (
               <VerticalPage key={uri} uri={uri} page={i} fit={prefs.fit} columnPx={columnPx} viewportH={viewport.h}
@@ -809,6 +891,11 @@ export function MangaReaderPage() {
           </button>
           <div className="text-xs text-m-night-muted">الفصل {chapterNumber}{total ? ` · ${index + 1} / ${total}` : ""}</div>
         </div>
+        <button type="button" onClick={toggleAuto} title={`${autoOn ? t.mangaAutoScrollStop : t.mangaAutoScrollStart} (A)`}
+          aria-pressed={autoOn}
+          className={`flex h-10 w-10 items-center justify-center rounded-full ${autoOn ? "bg-m-accent text-m-sheet" : "hover:bg-white/10"}`}>
+          <MIcon d={autoOn ? ICONS.stop : ICONS.play} size={17} />
+        </button>
         <button type="button" onClick={toggleFullscreen} title="ملء الشاشة (F)" className="flex h-10 w-10 items-center justify-center rounded-full hover:bg-white/10">
           <MIcon d={ICONS.maximize} size={18} />
         </button>
@@ -825,6 +912,32 @@ export function MangaReaderPage() {
             <PageSlider total={total} index={index} onSeek={jumpTo} direction={prefs.mode === "paged" ? prefs.direction : "rtl"} />
             <ChromeButton label={t.mangaChaptersList} onClick={() => setListOpen(true)} icon={ICONS.list} />
             <ChromeButton label={t.mangaNextChapter} disabled={!newerChapter} onClick={() => newerChapter && goToChapter(newerChapter)} icon={ICONS.forward} iconAfter />
+          </div>
+        </div>
+      )}
+
+      {/* ── auto-scroll controls (visible while armed) ── */}
+      {autoOn && pages && (
+        <div className={`pointer-events-none absolute inset-x-0 z-10 flex justify-center transition-[bottom] duration-200 ${chrome ? "bottom-24" : "bottom-6"}`}>
+          <div dir="ltr" className="pointer-events-auto flex items-center gap-1 rounded-full border border-m-night-line bg-black/80 p-1.5 shadow-xl backdrop-blur"
+            onClick={(e) => e.stopPropagation()}>
+            <button type="button" onClick={stopAuto} title={t.mangaAutoScrollStop} aria-label={t.mangaAutoScrollStop}
+              className="flex h-9 w-9 items-center justify-center rounded-full text-m-night-muted hover:bg-white/10 hover:text-m-sheet">
+              <MIcon d={ICONS.close} size={16} />
+            </button>
+            <button type="button" onClick={() => changeAutoSpeed(-1)} disabled={prefs.autoSpeed <= 1} title={`${t.mangaAutoSlower} (-)`} aria-label={t.mangaAutoSlower}
+              className="flex h-9 w-9 items-center justify-center rounded-full hover:bg-white/10 disabled:opacity-35">
+              <MIcon d={ICONS.minus} size={18} />
+            </button>
+            <span className="min-w-[40px] text-center font-mono text-sm font-bold text-m-night-accent" aria-label={`${t.mangaAutoSpeed} ${prefs.autoSpeed}`}>×{prefs.autoSpeed}</span>
+            <button type="button" onClick={() => changeAutoSpeed(1)} disabled={prefs.autoSpeed >= AUTO_LEVELS} title={`${t.mangaAutoFaster} (+)`} aria-label={t.mangaAutoFaster}
+              className="flex h-9 w-9 items-center justify-center rounded-full hover:bg-white/10 disabled:opacity-35">
+              <MIcon d={ICONS.plus} size={18} />
+            </button>
+            <button type="button" onClick={() => setAutoPaused((v) => !v)} title={autoPaused ? t.mangaAutoResume : t.mangaAutoPause} aria-label={autoPaused ? t.mangaAutoResume : t.mangaAutoPause}
+              className="ms-1 flex h-9 w-9 items-center justify-center rounded-full bg-m-accent text-m-sheet hover:opacity-90">
+              <MIcon d={autoPaused ? ICONS.play : ICONS.pause} size={16} />
+            </button>
           </div>
         </div>
       )}
@@ -883,6 +996,18 @@ export function MangaReaderPage() {
                   <ChoiceChip dark label={t.mangaDirectionLtr} active={prefs.direction === "ltr"} onClick={() => setPrefs((p) => ({ ...p, direction: "ltr" }))} />
                 </SettingBlock>
               )}
+              <div>
+                <div className="mb-2 flex items-center justify-between text-sm font-bold text-m-night-muted">
+                  <span>{t.mangaAutoSpeed}</span><span dir="ltr">×{prefs.autoSpeed}</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <input type="range" min={1} max={AUTO_LEVELS} step={1} value={prefs.autoSpeed} dir="ltr" aria-label={t.mangaAutoSpeed}
+                    onChange={(e) => setPrefs((p) => ({ ...p, autoSpeed: Number(e.target.value) }))}
+                    className="flex-1 accent-[#F09572]" />
+                  <ChoiceChip dark label={autoOn ? t.mangaAutoScrollStop : t.mangaAutoScrollStart} active={autoOn}
+                    onClick={() => { toggleAuto(); setSettingsOpen(false); }} />
+                </div>
+              </div>
               <SettingBlock label={t.mangaReaderFit}>
                 {([
                   ["width", t.mangaFitWidth], ["screen", t.mangaFitScreen], ["height", t.mangaFitHeight],
@@ -908,7 +1033,7 @@ export function MangaReaderPage() {
                 </>
               )}
               <div className="rounded border border-m-night-line bg-m-night-panel px-4 py-3 text-xs leading-6 text-m-night-muted">
-                الأسهم / Space / PageUp-PageDown للتنقل · N و P للفصل التالي والسابق · F لملء الشاشة · Esc للخروج
+                الأسهم / Space / PageUp-PageDown للتنقل · N و P للفصل التالي والسابق · A للتمرير التلقائي و + / - لسرعته · F لملء الشاشة · Esc للخروج
               </div>
             </div>
           </div>
