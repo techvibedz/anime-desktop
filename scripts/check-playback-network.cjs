@@ -201,6 +201,12 @@ const quiet = { info() {}, warn() {}, log() {} };
     window: { pantoufa: { setVideoReferer() {} } }, advanceToNext: () => advances++, stepDownQuality: () => false,
     triggerReextract: () => reextracts++, setInterval: fn => { tick = fn; return 1; }, clearInterval() {},
     useEffect: fn => { cleanup = fn(); },
+    // Link-speed guard (lib/linkSpeed): no readings in this harness, so the
+    // guard must stay inert and every existing recovery path below runs.
+    sortedServersRef: { current: [] }, activeServerUrlRef: { current: null }, manualPickUrlRef: { current: null },
+    brokenIdsRef: { current: new Set() }, serverFailureKey: (s) => s.iframeUrl, SLOW_LINK_GRACE_MS: 5000,
+    speedSampleFor: () => null, measureServerSpeed: () => Promise.resolve(null),
+    groupHosts: () => new Map(), groupKey: () => '', serverVerdict: () => null,
   };
   run(effect, player);
   assert.equal(player.hasPlayedRef.current, true, 're-extraction retains mid-watch recovery budget');

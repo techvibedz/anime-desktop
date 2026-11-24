@@ -1,3 +1,4 @@
+import { measureServerSpeed, recordUnresponsive } from "./linkSpeed";
 import { storage } from "./storage";
 import { resolveWitanimeEpisode } from "./witanimeMatch";
 import { fuzzyScore, sourceSearchQueries } from "./fuzzy";
@@ -1469,11 +1470,18 @@ export function fetchCompleteVideoServers(
           // replaying the dead URL for the rest of the 90s TTL.
           if (!(await isReachableMedia(result.data.videoUrl, server.iframeUrl))) {
             invalidateResolveCache(server.iframeUrl);
+            // A resolved stream that won't even answer a 2-byte Range probe
+            // in 8s (vid3rb's crawling file box did exactly this) must not
+            // stay top-ranked as "unmeasured": rank it last, keep it listed.
+            recordUnresponsive(server.iframeUrl);
             return;
           }
           options.onPartial?.(completePayload([{ ...server, videoUrl: result.data.videoUrl }], {
             animeTitle: resolvedTitle, animeHref: options.animeHref || "", episodeTitle: base?.data.episodeTitle || "",
           }));
+          // Reachable isn't playable: measure what the link really delivers so
+          // the player ranks a crawling host last before the user hits Play.
+          void measureServerSpeed(server, result.data.videoUrl, result.data.type);
         }).catch(() => {});
       }
       options.onCandidates?.(completePayload(servers, {

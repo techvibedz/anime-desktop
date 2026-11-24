@@ -23,6 +23,7 @@ import {
   type AudioIntent,
 } from "../lib/videoProviders";
 import { saveProgress, getProgress } from "../lib/history";
+import { subscribeSpeed, groupHosts, groupKey, serverVerdict, measureServerSpeed, speedSampleFor } from "../lib/linkSpeed";
 import { cueAt, parseVtt, type SubtitleCue } from "../lib/subtitles";
 import { recordEpisodeWatched } from "../lib/completion";
 import { extractEpisodeNumber } from "../lib/episode-utils";
@@ -162,6 +163,9 @@ function formatTime(s: number): string {
 }
 
 const STALL_THRESHOLD_MS = 15000;
+// How long a stream measured too slow (lib/linkSpeed) may sit loading or
+// rebuffering before we move to a faster server.
+const SLOW_LINK_GRACE_MS = 5000;
 // The mobile app owns server discovery now. Keep the previous source-specific
 // effects in place as an easy rollback path, but do not run them alongside the
 // shared three-source pipeline (that would duplicate requests and race state).
@@ -430,30 +434,51 @@ export function WatchPage() {
   const healthForSortRef = useRef<Map<string, HealthStat>>(serverHealth);
   // Fold fresh crowd data into the ordering only until the user starts playback.
   if (!userActivated) healthForSortRef.current = serverHealth;
+  // Measured link speed per stream (lib/linkSpeed). Bumped on every new
+  // reading so the order below re-ranks crawling hosts last.
+  // The server the user chose by hand (not the auto-pick / auto-switch) —
+  // exempt from speed-based switching.
+  const manualPickUrlRef = useRef<string | null>(null);
+  const [speedTick, setSpeedTick] = useState(0);
+  useEffect(() => subscribeSpeed(() => setSpeedTick((n) => n + 1)), []);
   const sortedServers = useMemo(() => {
-    const base = sortVideoServers(servers
-      // Hide unrecognized witanime embeds (mega.nz etc.), but always keep
-      // anime4up-sourced servers — their data-watch URLs often don't match
-      // a known provider regex yet still play fine in an iframe.
-      .filter((s) => s.provider !== "generic" || s.source === "anime4up" || s.source === "offline" || /witanime\.site\/watch\/stream-gate\//i.test(s.iframeUrl)));
-    const stats = healthForSortRef.current;
-    if (stats.size === 0) return base;
-    const statOf = (s: ServerWithSource) => stats.get(healthKey(s.source, s.provider));
-    // Crowd says a host is failing today → bottom; otherwise coarse health
-    // buckets, then the provider/quality order above (stable).
-    return base
-      .map((s, i) => ({ s, i }))
-      .sort((a, b) => {
-        const ua = healthTier(statOf(a.s)) === "unstable" ? 1 : 0;
-        const ub = healthTier(statOf(b.s)) === "unstable" ? 1 : 0;
-        if (ua !== ub) return ua - ub;
-        const ha = healthBucket(statOf(a.s));
-        const hb = healthBucket(statOf(b.s));
-        if (ha !== hb) return hb - ha;
-        return a.i - b.i;
-      })
-      .map(({ s }) => s);
-  }, [servers, serverHealth]);
+    const ordered = (() => {
+      const base = sortVideoServers(servers
+        // Hide unrecognized witanime embeds (mega.nz etc.), but always keep
+        // anime4up-sourced servers — their data-watch URLs often don't match
+        // a known provider regex yet still play fine in an iframe.
+        .filter((s) => s.provider !== "generic" || s.source === "anime4up" || s.source === "offline" || /witanime\.site\/watch\/stream-gate\//i.test(s.iframeUrl)));
+      const stats = healthForSortRef.current;
+      if (stats.size === 0) return base;
+      const statOf = (s: ServerWithSource) => stats.get(healthKey(s.source, s.provider));
+      // Crowd says a host is failing today → bottom; otherwise coarse health
+      // buckets, then the provider/quality order above (stable).
+      return base
+        .map((s, i) => ({ s, i }))
+        .sort((a, b) => {
+          const ua = healthTier(statOf(a.s)) === "unstable" ? 1 : 0;
+          const ub = healthTier(statOf(b.s)) === "unstable" ? 1 : 0;
+          if (ua !== ub) return ua - ub;
+          const ha = healthBucket(statOf(a.s));
+          const hb = healthBucket(statOf(b.s));
+          if (ha !== hb) return hb - ha;
+          return a.i - b.i;
+        })
+        .map(({ s }) => s);
+    })();
+    // Measured link speed outranks the static provider order: servers proven
+    // to keep up on THIS connection first, then unmeasured ones, then those
+    // measured unable to sustain their bitrate (or living on a host that
+    // crawled for a sibling stream). Stable within each tier.
+    const hosts = groupHosts(ordered);
+    const tier = (srv: ServerWithSource) => {
+      const v = serverVerdict(srv, hosts.get(groupKey(srv)));
+      return v === "fast" ? 0 : v === "slow" ? 2 : 1;
+    };
+    return ordered.map((srv, i) => ({ srv, i, t: tier(srv) }))
+      .sort((a, b) => a.t - b.t || a.i - b.i)
+      .map(({ srv }) => srv);
+  }, [servers, serverHealth, speedTick]);
 
   const serverDiscoveryGuardRef = useRef(createGenerationGuard());
   const activeServerUrlRef = useRef<string | null>(null);
@@ -1040,11 +1065,16 @@ export function WatchPage() {
   useEffect(() => {
     if (sortedServers.length === 0) return;
     const firstGood = sortedServers.findIndex((s) => !brokenIds.has(serverFailureKey(s)));
-    if (firstGood >= 0 && activeIdx === null) {
-      activeServerUrlRef.current = sortedServers[firstGood].iframeUrl;
+    if (firstGood < 0) return;
+    // Until Play is pressed the pick is only a highlight, so keep it on the
+    // best-ranked server: a speed reading that demotes a crawling host must
+    // move the pick off it BEFORE the click, not after a minute of buffering.
+    const pickedUrl = sortedServers[firstGood].iframeUrl;
+    if (activeIdx === null || (!userActivated && activeServerUrlRef.current !== pickedUrl)) {
+      activeServerUrlRef.current = pickedUrl;
       setActiveIdx(firstGood);
     }
-  }, [sortedServers, brokenIds, activeIdx]);
+  }, [sortedServers, brokenIds, activeIdx, userActivated]);
 
   // Late source arrivals can insert a higher-ranked server before the selected
   // row. Keep selection attached to its URL so discovery never switches video
@@ -1063,7 +1093,7 @@ export function WatchPage() {
   // distinct servers per episode (the pick can shift as anime4up servers
   // stream in) so we never burn scraper slots speculatively.
   const prefetchedRef = useRef<Set<string>>(new Set());
-  useEffect(() => { prefetchedRef.current = new Set(); }, [episodeUrl]);
+  useEffect(() => { prefetchedRef.current = new Set(); manualPickUrlRef.current = null; }, [episodeUrl]);
   useEffect(() => {
     if (userActivated) return;            // real resolve flow has taken over
     if (activeIdx === null) return;
@@ -1121,8 +1151,11 @@ export function WatchPage() {
     const curRes = resOf(cur.name);
     if (!curRes) return false;
     let best = -1, bestRes = 0;
+    const hosts = groupHosts(list);
     list.forEach((s, i) => {
       if (s.provider !== "vid3rb" || brokenIdsRef.current.has(serverFailureKey(s))) return;
+      // Same file box: a sibling measured (or inheriting) slow would stall too.
+      if (serverVerdict(s, hosts.get(groupKey(s))) === "slow") return;
       const r = resOf(s.name);
       if (r > 0 && r < curRes && r > bestRes) { best = i; bestRes = r; }
     });
@@ -1533,6 +1566,39 @@ export function WatchPage() {
     applyAudioIntent(v, userAudioIntentRef.current);
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
     const proxied = proxify(resolvedUrl, resolvedEmbed || resolvedUrl);
+    // Link-speed guard (lib/linkSpeed). The server being played — by URL, the
+    // index can drift as late sources stream in.
+    const currentServer = () => sortedServersRef.current.find((s) => s.iframeUrl === activeServerUrlRef.current);
+    {
+      const cur = currentServer();
+      // Normally already measured during discovery warm-up; a manual pick or
+      // a server resolved on click gets measured now.
+      if (cur && /^https?:/i.test(resolvedUrl) && !speedSampleFor(cur.iframeUrl)) {
+        void measureServerSpeed(cur, resolvedUrl, resolvedType);
+      }
+    }
+    // Re-measure the stream being played when it stalls (at most every 30s);
+    // the new reading re-ranks the list and linkTooSlow picks it up.
+    let lastRemeasureAt = 0;
+    const remeasureOnStall = () => {
+      const cur = currentServer();
+      if (!cur || !/^https?:/i.test(resolvedUrl) || Date.now() - lastRemeasureAt < 30_000) return;
+      lastRemeasureAt = Date.now();
+      void measureServerSpeed(cur, resolvedUrl, resolvedType, { force: true });
+    };
+    // True when this server was measured unable to sustain its bitrate AND a
+    // candidate not known to be slow is available. A server the user picked
+    // by hand is theirs to wait on — never yanked for speed.
+    const linkTooSlow = (): boolean => {
+      const cur = currentServer();
+      if (!cur || manualPickUrlRef.current === cur.iframeUrl) return false;
+      const list = sortedServersRef.current;
+      const hosts = groupHosts(list);
+      if (serverVerdict(cur, hosts.get(groupKey(cur))) !== "slow") return false;
+      return list.some((s) => s.iframeUrl !== cur.iframeUrl
+        && !brokenIdsRef.current.has(serverFailureKey(s))
+        && serverVerdict(s, hosts.get(groupKey(s))) !== "slow");
+    };
     // Reset re-extract gate for the new stream — covers both HLS and
     // mp4 paths so the second error path also has a recovery shot.
     reextractUsedRef.current = false;
@@ -1630,6 +1696,18 @@ export function WatchPage() {
       // only when BOTH buffer growth and incoming bytes stop. The hard
       // metadata deadline still fires for a stream that drips but never
       // becomes playable (corrupt/truncated file, bitrate far above link).
+      // Measured too slow for this bitrate: waiting out the 10-22s deadlines,
+      // the proxy retry and a step-down onto the same crawling host is what
+      // made "servers don't work" — go straight to a server that can keep up.
+      if (neverStarted && now - loadStartedAt > 6000) remeasureOnStall();
+      if (neverStarted && !userPausedRef.current && !partyHoldPlaybackRef.current
+          && now - loadStartedAt > SLOW_LINK_GRACE_MS && linkTooSlow()) {
+        advanced = true;
+        console.warn("[player] link measured too slow for this server — switching");
+        advanceToNext();
+        return;
+      }
+
       const dataIdleMs = now - lastTimeUpdate;
       const streamDead = dataIdleMs > noDataLimitMs && now - lastBufferGrowthAt > noDataLimitMs;
       const metadataHardOut = now - loadStartedAt > metadataDeadlineMs;
@@ -1653,6 +1731,13 @@ export function WatchPage() {
       if (isInitialLoading || isBufferingMidStream) {
         healthyTicks = 0;
         const elapsed = now - lastTimeUpdate;
+        if (elapsed > 4000) remeasureOnStall();
+        if (isBufferingMidStream && elapsed > SLOW_LINK_GRACE_MS && linkTooSlow()) {
+          advanced = true;
+          console.warn(`[player] rebuffering on a link measured too slow (${elapsed}ms) — switching server`);
+          advanceToNext();
+          return;
+        }
         if (elapsed > STALL_THRESHOLD_MS) {
           if (isBufferingMidStream && transportFallbackRef.current?.()) return;
           // Mid-stream stall on a progressive direct stream (vid3rb /
@@ -2476,7 +2561,11 @@ export function WatchPage() {
     () => fastestKey(sortedServers.map((s) => healthKey(s.source, s.provider)), serverHealth),
     [sortedServers, serverHealth],
   );
+  const speedHosts = useMemo(() => groupHosts(sortedServers), [sortedServers, speedTick]);
   const healthBadge = (s: ServerWithSource) => {
+    if (serverVerdict(s, speedHosts.get(groupKey(s))) === "slow") {
+      return <span className="ms-1.5 rounded-md bg-gold/15 px-1.5 py-px text-[10px] font-bold text-gold">🐢 {t.serverSlowLink}</span>;
+    }
     const key = healthKey(s.source, s.provider);
     const stat = serverHealth.get(key);
     const tier = healthTier(stat);
@@ -3796,6 +3885,7 @@ export function WatchPage() {
                     if (broken) setBrokenIds((prev) => { const c = new Set(prev); c.delete(serverFailureKey(s)); return c; });
                     // Manual pick: give the walk a fresh backoff budget.
                     autoSwitchCountRef.current = 0;
+                    manualPickUrlRef.current = s.iframeUrl;
                     activateServer(i);
                   }}
                   className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition ${

@@ -83,6 +83,8 @@ contextBridge.exposeInMainWorld("pantoufa", {
     >,
   probeMedia: (url: string, iframeUrl?: string) =>
     ipcRenderer.invoke("pantoufa:probe-media", { url, iframeUrl }) as Promise<{ ok: boolean; status: number }>,
+  measureMedia: (url: string, iframeUrl?: string, maxMs?: number) =>
+    ipcRenderer.invoke("pantoufa:measure-media", { url, iframeUrl, maxMs }) as Promise<{ ok: boolean; kbps: number; needKbps: number; bytes: number; ms: number; host: string; status: number }>,
   probeMangaPage: (url: string, referer?: string) =>
     ipcRenderer.invoke("pantoufa:probe-manga-page", { url, referer }) as Promise<{ status: number; contentType: string; challenge: boolean }>,
   cancelBackgroundScrapes: () =>

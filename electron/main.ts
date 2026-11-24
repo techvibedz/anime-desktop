@@ -4031,6 +4031,175 @@ app.whenReady().then(() => {
     }
   });
 
+  // Real download throughput of a resolved stream. Discovery only proves a
+  // server ANSWERS; on this user's ISP whole datacenter routes crawl (measured
+  // 2026-11-24: Hetzner Falkenstein — vid3rb's files-4/5/6/10 — at 20-80KB/s
+  // while every other DC ran at 4-10MB/s), so a reachable server could still
+  // never play. Reads a slice of the file (progressive) or of the first media
+  // segment (HLS) and reports body throughput plus what the stream needs.
+  ipcMain.handle("pantoufa:measure-media", async (
+    _evt,
+    opts: { url: string; iframeUrl?: string; maxMs?: number },
+  ): Promise<{ ok: boolean; kbps: number; needKbps: number; bytes: number; ms: number; host: string; status: number }> => {
+    const deadline = Date.now() + Math.min(Math.max(Number(opts?.maxMs) || 6000, 2000), 12000);
+    const empty = { ok: false, kbps: 0, needKbps: 0, bytes: 0, ms: 0, host: "", status: 0 };
+    const ua = mainWindow?.webContents.getUserAgent() || PLAYBACK_UA;
+    let refOrigin = "";
+    try { refOrigin = opts?.iframeUrl ? new URL(opts.iframeUrl).origin : ""; } catch {}
+    const headersFor = (withRef: boolean, extra: Record<string, string> = {}) => ({
+      "User-Agent": ua,
+      "Accept-Language": "en-US,en;q=0.9",
+      Accept: "*/*",
+      ...(withRef && refOrigin ? { Referer: `${refOrigin}/`, Origin: refOrigin, "X-Pantoufa-Proxy": "1" } : {}),
+      ...extra,
+    });
+    // net.request rather than session.fetch: Electron's fetch reports an empty
+    // `res.url`, and the FINAL host (vid3rb's files-N box, not video.vid3rb.com)
+    // is what a slow verdict must attach to.
+    type Opened = { status: number; finalUrl: string; header: (n: string) => string; msg: Electron.IncomingMessage; req: Electron.ClientRequest };
+    const openOnce = (url: string, headers: Record<string, string>) => new Promise<Opened | null>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const done = (v: Opened | null) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } };
+      let req: Electron.ClientRequest;
+      try {
+        allowHost(url);
+        req = net.request({ url, session: session.defaultSession, redirect: "manual", useSessionCookies: true });
+        for (const [k, v] of Object.entries(headers)) { try { req.setHeader(k, v); } catch {} }
+      } catch { done(null); return; }
+      timer = setTimeout(() => { try { req.abort(); } catch {} done(null); }, Math.max(500, deadline - Date.now()));
+      let finalUrl = url;
+      let hops = 0;
+      req.on("redirect", (_status, _method, redirectUrl) => {
+        if (++hops > 6) { try { req.abort(); } catch {} done(null); return; }
+        finalUrl = redirectUrl;
+        try { allowHost(redirectUrl); } catch {}
+        try { req.followRedirect(); } catch { done(null); }
+      });
+      req.on("response", (msg) => {
+        done({
+          status: msg.statusCode, finalUrl, msg, req,
+          header: (n) => { const h = msg.headers[n.toLowerCase()]; return Array.isArray(h) ? h[0] || "" : String(h || ""); },
+        });
+      });
+      req.on("error", () => done(null));
+      req.end();
+    });
+    const get = async (url: string, extra: Record<string, string> = {}) => {
+      for (const withRef of refOrigin ? [false, true] : [false]) {
+        const r = await openOnce(url, headersFor(withRef, extra));
+        if (r && (r.status === 200 || r.status === 206)) return r;
+        if (r) { try { r.req.abort(); } catch {} }
+        if (Date.now() >= deadline) break;
+      }
+      return null;
+    };
+    const readText = (r: Opened) => new Promise<string>((resolve) => {
+      const parts: Buffer[] = [];
+      let settled = false;
+      const finish = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(Buffer.concat(parts).toString("utf8")); };
+      const timer = setTimeout(() => { try { r.req.abort(); } catch {} finish(); }, Math.max(300, deadline - Date.now()));
+      r.msg.on("data", (c: Buffer) => { parts.push(c); });
+      r.msg.on("end", finish);
+      r.msg.on("error", finish);
+    });
+    // Steady-state body throughput. CDNs like vid3rb burst the first MBs then
+    // pace (nginx limit_rate_after), so a short read reported 3.7MB/s for a
+    // file that then streamed far slower. Once the read spans long enough,
+    // only bytes after the first BURST_SKIP_MS count. TTFB excluded: it's
+    // latency, not the rate playback can sustain.
+    const BURST_SKIP_MS = 1500;
+    const readRate = (r: Opened, maxBytes: number) => new Promise<{ bytes: number; ms: number; kbps: number }>((resolve) => {
+      const t0 = Date.now();
+      let bytes = 0;
+      let markBytes = -1;
+      let markAt = 0;
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { r.req.abort(); } catch {}
+        const end = Date.now();
+        const ms = Math.max(1, end - t0);
+        const steady = markBytes >= 0 && end - markAt >= 1000
+          ? (bytes - markBytes) / ((end - markAt) / 1000)
+          : bytes / (ms / 1000);
+        resolve({ bytes, ms, kbps: Math.round(steady / 1024) });
+      };
+      const timer = setTimeout(finish, Math.max(300, deadline - Date.now()));
+      r.msg.on("data", (c: Buffer) => {
+        bytes += c.length;
+        if (markBytes < 0 && Date.now() - t0 >= BURST_SKIP_MS) { markBytes = bytes; markAt = Date.now(); }
+        if (bytes >= maxBytes) finish();
+      });
+      r.msg.on("end", finish);
+      r.msg.on("error", finish);
+    });
+    const hostOf = (u: string) => { try { return new URL(u).host; } catch { return ""; } };
+    try {
+      const url = new URL(String(opts?.url || ""));
+      if (!/^https?:$/.test(url.protocol)) return empty;
+      // Ran out the whole window without an answer: discovery already proved
+      // this stream reachable, so silence for seconds is the link crawling
+      // (anime4up's CDN took 28s for one 600KB segment) — a zero rate, not
+      // "unknown". An HTTP error inside the window stays unknown.
+      const timedOut = (host: string, needKbps = 0) => Date.now() >= deadline - 150
+        ? { ok: true, kbps: 0, needKbps, bytes: 0, ms: 0, host, status: 0 }
+        : { ...empty, needKbps };
+      const first = await get(url.toString(), { Range: "bytes=0-" });
+      if (!first) return timedOut(url.host);
+      const ctype = first.header("content-type").toLowerCase();
+      const looksHls = /mpegurl/.test(ctype) || /\.m3u8(\?|$)/i.test(url.pathname + url.search);
+      if (!looksHls) {
+        // Progressive: the needed rate depends on the file's bitrate, which
+        // the renderer estimates from the provider/quality.
+        const { bytes, ms, kbps } = await readRate(first, 4_000_000);
+        return { ok: true, kbps, needKbps: 0, bytes, ms, host: hostOf(first.finalUrl), status: first.status };
+      }
+      // HLS: master → lowest variant (ABR can always fall back to it) → a
+      // media segment a few in (the first is often tiny).
+      let playlistUrl = first.finalUrl;
+      let text = await readText(first);
+      let needKbps = 0;
+      if (/#EXT-X-STREAM-INF/i.test(text)) {
+        const lines = text.split(/\r?\n/);
+        let best: { bw: number; uri: string } | null = null;
+        for (let i = 0; i < lines.length; i++) {
+          const m = /^#EXT-X-STREAM-INF:.*?\bBANDWIDTH=(\d+)/i.exec(lines[i]);
+          if (!m) continue;
+          const uri = (lines.slice(i + 1).find((l) => l.trim() && !l.startsWith("#")) || "").trim();
+          const bw = Number(m[1]);
+          if (uri && (!best || bw < best.bw)) best = { bw, uri };
+        }
+        if (!best) return empty;
+        needKbps = Math.round(best.bw / 8 / 1024);
+        playlistUrl = new URL(best.uri, playlistUrl).toString();
+        const media = await get(playlistUrl);
+        if (!media) return timedOut(hostOf(playlistUrl), needKbps);
+        playlistUrl = media.finalUrl;
+        text = await readText(media);
+      }
+      const segs = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+      if (!segs.length) return empty;
+      const segIdx = Math.min(2, segs.length - 1);
+      const segUrl = new URL(segs[segIdx], playlistUrl).toString();
+      // A bare media playlist has no BANDWIDTH: estimate the bitrate from the
+      // segment's size over its EXTINF duration.
+      const durs = [...text.matchAll(/#EXTINF:([\d.]+)/gi)].map((m) => Number(m[1]));
+      const seg = await get(segUrl);
+      if (!seg) return timedOut(hostOf(segUrl), needKbps);
+      const total = Number(seg.header("content-length") || 0);
+      const { bytes, ms, kbps } = await readRate(seg, 3_000_000);
+      if (!needKbps && total > 0 && durs[segIdx] > 0) needKbps = Math.round(total / 1024 / durs[segIdx]);
+      // A segment that answered but delivered nothing in the window is a
+      // stream that can't play: ok with zero rate, not "unknown".
+      return { ok: true, kbps, needKbps, bytes, ms, host: hostOf(seg.finalUrl), status: seg.status };
+    } catch {
+      return empty;
+    }
+  });
+
   // A user Play-click arrived: drop every queued/in-flight background scrape
   // (warm-ups, home/listing pre-resolves) so the priority extraction starts
   // immediately instead of waiting behind warm-up captures.
