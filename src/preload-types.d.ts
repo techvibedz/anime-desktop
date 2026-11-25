@@ -41,8 +41,12 @@ declare global {
         opts?: { background?: boolean },
       ) => Promise<{ url: string; type: "hls" | "mp4"; subtitles?: { url: string; label?: string; lang?: string }[]; denied?: boolean } | null>;
       probeMedia: (url: string, iframeUrl?: string) => Promise<{ ok: boolean; status: number }>;
-      measureMedia?: (url: string, iframeUrl?: string, maxMs?: number) => Promise<{ ok: boolean; kbps: number; needKbps: number; bytes: number; ms: number; host: string; status: number }>;
+      measureMedia?: (url: string, iframeUrl?: string, maxMs?: number) => Promise<{ ok: boolean; kbps: number; needKbps: number; bytes: number; ms: number; host: string; status: number; totalBytes?: number }>;
       cancelBackgroundScrapes: () => Promise<{ cancelled: number }>;
+      readAheadOpen?: (url: string, runtimeSec?: number) => Promise<{ src: string; id: string } | null>;
+      readAheadStats?: (id: string) => Promise<{ total: number; kbps: number; needKbps: number; aheadSec: number; downloading: boolean; host: string; fatal: number } | null>;
+      readAheadRuntime?: (id: string, runtimeSec: number) => Promise<boolean>;
+      readAheadClose?: (id: string) => Promise<boolean>;
       probeMangaPage?: (url: string, referer?: string) => Promise<{ status: number; contentType: string; challenge: boolean }>;
       fetchText: (url: string) => Promise<string | null>;
       fetchHtml: (

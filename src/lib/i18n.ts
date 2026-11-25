@@ -739,6 +739,8 @@ export const ar = {
   healthWorks: (pct: number) => `يعمل ${pct}%`,
   // Measured on this connection (lib/linkSpeed): can't keep up with the video.
   serverSlowLink: "بطيء على شبكتك",
+  // Measured at 3×+ the video's bitrate on this connection.
+  serverFastLink: "سريع على شبكتك",
   // Settings
   settingsSkipFiller: "المحتوى الأصلي فقط",
   settingsSkipFillerDesc: "إخفاء حلقات الفلر وتخطّيها تلقائيًا عند تشغيل الحلقة التالية",

@@ -84,11 +84,19 @@ contextBridge.exposeInMainWorld("pantoufa", {
   probeMedia: (url: string, iframeUrl?: string) =>
     ipcRenderer.invoke("pantoufa:probe-media", { url, iframeUrl }) as Promise<{ ok: boolean; status: number }>,
   measureMedia: (url: string, iframeUrl?: string, maxMs?: number) =>
-    ipcRenderer.invoke("pantoufa:measure-media", { url, iframeUrl, maxMs }) as Promise<{ ok: boolean; kbps: number; needKbps: number; bytes: number; ms: number; host: string; status: number }>,
+    ipcRenderer.invoke("pantoufa:measure-media", { url, iframeUrl, maxMs }) as Promise<{ ok: boolean; kbps: number; needKbps: number; bytes: number; ms: number; host: string; status: number; totalBytes?: number }>,
   probeMangaPage: (url: string, referer?: string) =>
     ipcRenderer.invoke("pantoufa:probe-manga-page", { url, referer }) as Promise<{ status: number; contentType: string; challenge: boolean }>,
   cancelBackgroundScrapes: () =>
     ipcRenderer.invoke("pantoufa:cancel-background-scrapes") as Promise<{ cancelled: number }>,
+  // Read-ahead proxy for progressive streams: play the returned local src.
+  readAheadOpen: (url: string, runtimeSec?: number) =>
+    ipcRenderer.invoke("pantoufa:readahead-open", { url, runtimeSec }) as Promise<{ src: string; id: string } | null>,
+  readAheadStats: (id: string) =>
+    ipcRenderer.invoke("pantoufa:readahead-stats", id) as Promise<{ total: number; kbps: number; needKbps: number; aheadSec: number; downloading: boolean; host: string; fatal: number } | null>,
+  readAheadRuntime: (id: string, runtimeSec: number) =>
+    ipcRenderer.invoke("pantoufa:readahead-runtime", { id, runtimeSec }) as Promise<boolean>,
+  readAheadClose: (id: string) => ipcRenderer.invoke("pantoufa:readahead-close", id) as Promise<boolean>,
   // Sidecar subtitle text (VTT) fetched in the main process so the renderer can
   // attach it as a same-origin blob <track> (no CDN CORS needed).
   fetchText: (url: string) => ipcRenderer.invoke("pantoufa:fetch-text", url) as Promise<string | null>,

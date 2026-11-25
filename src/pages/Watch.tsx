@@ -23,7 +23,7 @@ import {
   type AudioIntent,
 } from "../lib/videoProviders";
 import { saveProgress, getProgress } from "../lib/history";
-import { subscribeSpeed, groupHosts, groupKey, serverVerdict, measureServerSpeed, speedSampleFor } from "../lib/linkSpeed";
+import { subscribeSpeed, groupHosts, groupKey, serverVerdict, serverTier, tierRank, measureServerSpeed, speedSampleFor, markPlaybackSlow, progressiveNeedKbps, setExpectedDurationSec, setPlayingStream } from "../lib/linkSpeed";
 import { cueAt, parseVtt, type SubtitleCue } from "../lib/subtitles";
 import { recordEpisodeWatched } from "../lib/completion";
 import { extractEpisodeNumber } from "../lib/episode-utils";
@@ -466,15 +466,13 @@ export function WatchPage() {
         })
         .map(({ s }) => s);
     })();
-    // Measured link speed outranks the static provider order: servers proven
-    // to keep up on THIS connection first, then unmeasured ones, then those
-    // measured unable to sustain their bitrate (or living on a host that
-    // crawled for a sibling stream). Stable within each tier.
+    // Measured link speed outranks the static provider order, graded by
+    // headroom: ≥3× the bitrate, ≥2×, ≥1.3×, then unmeasured, then servers
+    // measured (or proven by playback) unable to sustain their bitrate. A
+    // pass/fail verdict let a 52KB/s anime3rb file outrank a 1.9MB/s anime4up
+    // stream on the static order alone. Stable within each tier.
     const hosts = groupHosts(ordered);
-    const tier = (srv: ServerWithSource) => {
-      const v = serverVerdict(srv, hosts.get(groupKey(srv)));
-      return v === "fast" ? 0 : v === "slow" ? 2 : 1;
-    };
+    const tier = (srv: ServerWithSource) => tierRank(serverTier(srv, hosts.get(groupKey(srv))));
     return ordered.map((srv, i) => ({ srv, i, t: tier(srv) }))
       .sort((a, b) => a.t - b.t || a.i - b.i)
       .map(({ srv }) => srv);
@@ -1093,7 +1091,12 @@ export function WatchPage() {
   // distinct servers per episode (the pick can shift as anime4up servers
   // stream in) so we never burn scraper slots speculatively.
   const prefetchedRef = useRef<Set<string>>(new Set());
-  useEffect(() => { prefetchedRef.current = new Set(); manualPickUrlRef.current = null; }, [episodeUrl]);
+  // When the current server was (re)activated, and how many times this
+  // episode was moved off a server for speed (startup race + drain switch) —
+  // bounded so a link where everything crawls can't loop.
+  const activatedAtRef = useRef(0);
+  const speedSwitchesRef = useRef(0);
+  useEffect(() => { prefetchedRef.current = new Set(); manualPickUrlRef.current = null; speedSwitchesRef.current = 0; }, [episodeUrl]);
   useEffect(() => {
     if (userActivated) return;            // real resolve flow has taken over
     if (activeIdx === null) return;
@@ -1121,6 +1124,7 @@ export function WatchPage() {
     if (autoAdvanceTimer.current !== null) { clearTimeout(autoAdvanceTimer.current); autoAdvanceTimer.current = null; }
     autoAdvanceTargetRef.current = null;
     if (hasPlayedRef.current && videoRef.current) stepDownSeekRef.current = videoRef.current.currentTime;
+    activatedAtRef.current = Date.now();
     activeServerUrlRef.current = sortedServersRef.current[idx]?.iframeUrl || null;
     setActiveIdx(idx);
     setUserActivated(true);
@@ -1250,6 +1254,51 @@ export function WatchPage() {
       activateServer(idx);
     }, delay);
   }, [status, userActivated, sortedServers, brokenIds, activateServer, isOffline]);
+
+  // Startup race. The pick at Play is only as good as the readings that had
+  // landed by then: an early click locked the player onto whatever was first —
+  // an hgcloud server whose resolve took 25s and then crawled at half its
+  // bitrate — while anime4up streams measured at 1.4MB/s sat ready below it.
+  // Until the first frame, an auto-picked server still resolving/loading after
+  // 4s (a normal start is 2-3.5s) yields to a READY (pre-resolved) server
+  // measured clearly faster.
+  // Nothing is on screen yet, so the switch is invisible. Manual picks stay.
+  useEffect(() => {
+    if (!userActivated || hasPlayedRef.current || isOffline) return;
+    if (status !== "resolving" && status !== "playing") return;
+    if (speedSwitchesRef.current >= 3) return;
+    const list = sortedServers;
+    const cur = list.find((s) => s.iframeUrl === activeServerUrlRef.current);
+    if (!cur || manualPickUrlRef.current === cur.iframeUrl) return;
+    const hosts = groupHosts(list);
+    const rankOf = (s: ServerWithSource) => tierRank(serverTier(s, hosts.get(groupKey(s))));
+    const curRank = rankOf(cur);
+    if (curRank === 0) return;
+    const cand = list.find((s) => s.iframeUrl !== cur.iframeUrl && !!s.videoUrl
+      && !brokenIds.has(serverFailureKey(s)) && rankOf(s) <= 1 && rankOf(s) < curRank);
+    if (!cand) return;
+    const timer = window.setTimeout(() => {
+      if (hasPlayedRef.current || activeServerUrlRef.current !== cur.iframeUrl) return;
+      const idx = sortedServersRef.current.findIndex((s) => s.iframeUrl === cand.iframeUrl);
+      if (idx < 0) return;
+      speedSwitchesRef.current += 1;
+      console.info(`[player] startup: ${cur.name} still loading — switching to ready, faster ${cand.name}`);
+      activateServer(idx);
+    }, Math.max(0, 4000 - (Date.now() - activatedAtRef.current)));
+    return () => window.clearTimeout(timer);
+  }, [sortedServers, status, userActivated, brokenIds, activateServer, isOffline]);
+
+  // Size-based bitrate estimates need the runtime: saved progress knows it
+  // for a resumed episode, the media element once metadata lands.
+  useEffect(() => {
+    setExpectedDurationSec(/\/movie\//i.test(episodeUrl) ? 100 * 60 : null);
+    let alive = true;
+    void getProgress(episodeUrl).then((p) => {
+      if (alive && p && p.durationMs > 60_000) setExpectedDurationSec(p.durationMs / 1000);
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, [episodeUrl]);
+  useEffect(() => { if (duration > 60) setExpectedDurationSec(duration); }, [duration]);
 
   // Fast advance when iframe fails to load (did-fail-load in main process).
   // Fires within ~1s vs the iframe onError which takes ~5s on some platforms.
@@ -1580,8 +1629,15 @@ export function WatchPage() {
     // Re-measure the stream being played when it stalls (at most every 30s);
     // the new reading re-ranks the list and linkTooSlow picks it up.
     let lastRemeasureAt = 0;
+    // Read-ahead session serving this progressive stream (electron/readAhead).
+    // Its own download rate replaces re-probing: a second connection to a
+    // vid3rb file gets 503'd and splits the link the player is using.
+    let raId: string | null = null;
+    let raStats: { total: number; kbps: number; needKbps: number; aheadSec: number; downloading: boolean; host: string; fatal: number } | null = null;
+    let raStatsAt = 0;
     const remeasureOnStall = () => {
       const cur = currentServer();
+      if (raId) return;
       if (!cur || !/^https?:/i.test(resolvedUrl) || Date.now() - lastRemeasureAt < 30_000) return;
       lastRemeasureAt = Date.now();
       void measureServerSpeed(cur, resolvedUrl, resolvedType, { force: true });
@@ -1670,9 +1726,102 @@ export function WatchPage() {
     let lastBufferedEnd = 0;
     let lastBufferGrowthAt = Date.now();
 
+    // ── Can't-keep-up detector ──
+    // Probes see a connection's opening seconds; playback sees the sustained
+    // rate. A stream that rebuffers twice in 90s, or whose buffer stays thin
+    // and stops growing for 25s, is downloading no faster than it plays — it
+    // WILL keep stalling (the old 15s stall threshold never fired on 2-3s
+    // micro-stalls: an mp4upload FHD file at 1.3× its guessed bitrate stalled
+    // 5 times in a minute and was never switched). Move to a server proven to
+    // keep up BEFORE the picture freezes again. Manual picks are respected.
+    let firstFrameAt = 0;
+    let lastSeekAt = 0;
+    let drainLastCt = -1;
+    let stuckTicks = 0;
+    const rebufferTimes: number[] = [];
+    const aheadSamples: { t: number; ahead: number }[] = [];
+    const onSeeking = () => { lastSeekAt = Date.now(); };
+    const bufferAheadNow = (): number => {
+      try {
+        for (let i = 0; i < v.buffered.length; i++) {
+          if (v.buffered.start(i) <= v.currentTime + 0.25 && v.buffered.end(i) > v.currentTime) return v.buffered.end(i) - v.currentTime;
+        }
+      } catch {}
+      return 0;
+    };
+    const speedSwitch = (reason: string): boolean => {
+      const cur = currentServer();
+      if (!cur || manualPickUrlRef.current === cur.iframeUrl || speedSwitchesRef.current >= 3) return false;
+      const list = sortedServersRef.current;
+      const hosts = groupHosts(list);
+      const rankOf = (s: ServerWithSource) => tierRank(serverTier(s, hosts.get(groupKey(s))));
+      // Only servers MEASURED to keep up (great/good/ok); pre-resolved first.
+      const best = list
+        .filter((s) => s.iframeUrl !== cur.iframeUrl && !brokenIdsRef.current.has(serverFailureKey(s)) && rankOf(s) <= 2)
+        .sort((a, b) => rankOf(a) - rankOf(b) || Number(!!b.videoUrl) - Number(!!a.videoUrl))[0];
+      if (!best) return false;
+      const need = raStats?.needKbps
+        || speedSampleFor(cur.iframeUrl)?.needKbps
+        || (resolvedType === "hls" ? 90 : progressiveNeedKbps(cur.name, resolvedUrl, raStats?.total || 0));
+      const idx = list.findIndex((s) => s.iframeUrl === best.iframeUrl);
+      if (idx < 0) return false;
+      speedSwitchesRef.current += 1;
+      advanced = true;
+      console.warn(`[player] ${cur.name} can't keep up (${reason}) — switching to ${best.name}`);
+      markPlaybackSlow(cur.iframeUrl, need);
+      activateServer(idx);
+      return true;
+    };
+    const checkCantKeepUp = (now: number): boolean => {
+      const ct = v.currentTime;
+      if (!played || v.paused || v.ended || userPausedRef.current || partyHoldPlaybackRef.current) {
+        drainLastCt = ct; stuckTicks = 0;
+        return false;
+      }
+      const stuck = drainLastCt >= 0 && Math.abs(ct - drainLastCt) < 0.05;
+      drainLastCt = ct;
+      // A seek's own refill is not the link failing.
+      const seekQuiet = now - lastSeekAt > 8000;
+      stuckTicks = stuck ? stuckTicks + 1 : 0;
+      if (stuckTicks === 2 && seekQuiet) rebufferTimes.push(now);
+      while (rebufferTimes.length && now - rebufferTimes[0] > 90_000) rebufferTimes.shift();
+      const dur = v.duration;
+      if (Number.isFinite(dur) && dur > 0 && dur - ct < 45) return false; // finishing anyway
+      if (!firstFrameAt || now - firstFrameAt < 10_000) return false;    // startup jitter
+      // Depth of what's downloaded ahead: hls.js keeps up to 300s in the
+      // element; a read-ahead stream keeps it in the proxy's cache.
+      const raDepth = raId && raStats && raStats.total > 0 ? raStats.aheadSec : null;
+      const ahead = bufferAheadNow() + (raDepth ?? 0);
+      if (!stuck && seekQuiet) {
+        aheadSamples.push({ t: now, ahead });
+        while (aheadSamples.length && now - aheadSamples[0].t > 40_000) aheadSamples.shift();
+      } else if (!seekQuiet) aheadSamples.length = 0;
+      const rebufferedTwice = rebufferTimes.length >= 2;
+      let draining = false;
+      if ((resolvedType === "hls" || raDepth != null) && !stuck) {
+        const old = aheadSamples.find((x) => now - x.t >= 25_000);
+        draining = !!old && ahead < 15 && ahead <= old.ahead + 1;
+      }
+      if (!rebufferedTwice && !draining) return false;
+      const why = rebufferedTwice ? `rebuffered ${rebufferTimes.length}× in 90s` : `buffer stuck at ${ahead.toFixed(0)}s ahead`;
+      if (speedSwitch(why)) return true;
+      // Nothing measured faster: a lower anime3rb quality is the remaining fix.
+      if (rebufferedTwice && stepDownQuality()) { advanced = true; return true; }
+      // Don't re-fire every second on the same evidence.
+      rebufferTimes.length = 0;
+      aheadSamples.length = 0;
+      return false;
+    };
+
     const checkStall = () => {
       if (advanced) return;
       const now = Date.now();
+      if (raId && now - raStatsAt > 2000) {
+        raStatsAt = now;
+        const id = raId;
+        void window.pantoufa?.readAheadStats?.(id).then((st) => { if (raId === id) raStats = st; }).catch(() => {});
+      }
+      if (checkCantKeepUp(now)) return;
       const isInitialLoading = !played && !v.paused;
       const isBufferingMidStream = played && !v.paused && !v.ended && v.currentTime === lastTime;
       // Initial-load-never-started, INDEPENDENT of v.paused. With autoPlay, a
@@ -1817,6 +1966,7 @@ export function WatchPage() {
     const onPlaying = () => {
       startupReleased = true;
       played = true;
+      if (!firstFrameAt) firstFrameAt = Date.now();
       hasPlayedRef.current = true;
       autoSwitchCountRef.current = 0;
       recoveryRoundRef.current = 0;
@@ -1865,7 +2015,12 @@ export function WatchPage() {
     v.addEventListener("canplay", maybeStartPlayback);
     v.addEventListener("loadeddata", maybeStartPlayback);
     v.addEventListener("stalled", onStalled);
-    
+    v.addEventListener("seeking", onSeeking);
+    const onMetaRuntime = () => {
+      if (raId && Number.isFinite(v.duration) && v.duration > 60) void window.pantoufa?.readAheadRuntime?.(raId, v.duration);
+    };
+    v.addEventListener("loadedmetadata", onMetaRuntime);
+
     const interval = setInterval(checkStall, 1000);
 
     if (resolvedType === "hls" && Hls.isSupported()) {
@@ -2038,15 +2193,24 @@ export function WatchPage() {
       // Known progressive providers start with native Range streaming. The
       // proxy now streams too, and is the fallback for blocked DNS/transport;
       // other providers start there for its Referer strategies and cookies.
-      const playsDirect = resolvedUrl.startsWith("pantoufa-file:") || /mp4upload|videa\.hu|vidvaita|vidit|vid3rb\.com/i.test(resolvedUrl);
-      v.src = playsDirect ? resolvedUrl : proxied;
-      if (playsDirect && !resolvedUrl.startsWith("pantoufa-file:")) {
-        let used = false;
-        transportFallbackRef.current = () => {
-          if (used) return false;
-          used = true;
+      const isLocalFile = resolvedUrl.startsWith("pantoufa-file:");
+      const playsDirect = isLocalFile || /mp4upload|videa\.hu|vidvaita|vidit|vid3rb\.com/i.test(resolvedUrl);
+      if (!playsDirect || isLocalFile) {
+        v.src = playsDirect ? resolvedUrl : proxied;
+      } else {
+        // Transport ladder: read-ahead proxy (minutes of cushion) → the CDN
+        // URL directly (Chromium's ~20s buffer) → the main-process proxy (for
+        // blocked DNS/transport). Each failure steps down once, keeping the
+        // playhead. A token the CDN rejected skips straight to re-extraction:
+        // a dead URL fails the same way on every transport.
+        const ladder: { label: string; src: string }[] = [
+          { label: "direct CDN", src: resolvedUrl },
+          { label: "proxy", src: proxied },
+        ];
+        let step = -1;
+        const switchTo = (next: { label: string; src: string }) => {
           const position = v.currentTime || stepDownSeekRef.current;
-          console.warn("[player] direct MP4 failed — retrying via proxy");
+          console.warn(`[player] progressive transport failed — retrying via ${next.label}`);
           played = false;
           startupReleased = false;
           lastBufferedEnd = 0;
@@ -2056,9 +2220,40 @@ export function WatchPage() {
             if (!userPausedRef.current && !partyHoldPlaybackRef.current) v.play().catch(() => {});
           };
           v.addEventListener("loadedmetadata", resume, { once: true, signal: recoveryController.signal });
-          v.src = proxied;
+          v.src = next.src;
+        };
+        transportFallbackRef.current = () => {
+          if (raStats && [401, 403, 404, 410].includes(raStats.fatal)) return false;
+          if (step + 1 >= ladder.length) return false;
+          step += 1;
+          if (raId) { void window.pantoufa?.readAheadClose?.(raId); raId = null; raStats = null; setPlayingStream(null); }
+          switchTo(ladder[step]);
           return true;
         };
+        const open = window.pantoufa?.readAheadOpen;
+        const runtime = Number.isFinite(v.duration) && v.duration > 60 ? v.duration : undefined;
+        if (!open) {
+          step = 0;
+          v.src = resolvedUrl;
+        } else {
+          open(resolvedUrl, runtime).then((r) => {
+            if (recoveryController.signal.aborted) { if (r) void window.pantoufa?.readAheadClose?.(r.id); return; }
+            if (step >= 0) return; // a fallback already took over
+            if (r?.src) {
+              raId = r.id;
+              setPlayingStream(currentServer()?.iframeUrl || null);
+              console.info(`[player] read-ahead proxy for ${new URL(resolvedUrl).host}`);
+              v.src = r.src;
+            } else {
+              step = 0;
+              v.src = resolvedUrl;
+            }
+          }).catch(() => {
+            if (recoveryController.signal.aborted || step >= 0) return;
+            step = 0;
+            v.src = resolvedUrl;
+          });
+        }
       }
     }
 
@@ -2073,6 +2268,9 @@ export function WatchPage() {
       v.removeEventListener("canplay", maybeStartPlayback);
       v.removeEventListener("loadeddata", maybeStartPlayback);
       v.removeEventListener("stalled", onStalled);
+      v.removeEventListener("seeking", onSeeking);
+      v.removeEventListener("loadedmetadata", onMetaRuntime);
+      if (raId) { void window.pantoufa?.readAheadClose?.(raId); raId = null; setPlayingStream(null); }
       // Chromium does NOT pause a media element just because React detached
       // it from the DOM — a direct-src <video> (vid3rb/videa/mp4upload, the
       // top-ranked providers) keeps playing audio in the background after the
@@ -2083,7 +2281,7 @@ export function WatchPage() {
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
       try { v.removeAttribute("src"); v.load(); } catch {}
     };
-  }, [resolvedUrl, resolvedType, resolvedEmbed, advanceToNext, stepDownQuality]);
+  }, [resolvedUrl, resolvedType, resolvedEmbed, advanceToNext, stepDownQuality, activateServer]);
 
   // Resume position — wait for metadata before seeking.
   useEffect(() => {
@@ -2563,8 +2761,12 @@ export function WatchPage() {
   );
   const speedHosts = useMemo(() => groupHosts(sortedServers), [sortedServers, speedTick]);
   const healthBadge = (s: ServerWithSource) => {
-    if (serverVerdict(s, speedHosts.get(groupKey(s))) === "slow") {
+    const linkTier = serverTier(s, speedHosts.get(groupKey(s)));
+    if (linkTier === "slow") {
       return <span className="ms-1.5 rounded-md bg-gold/15 px-1.5 py-px text-[10px] font-bold text-gold">🐢 {t.serverSlowLink}</span>;
+    }
+    if (linkTier === "great") {
+      return <span className="ms-1.5 rounded-md bg-mint/15 px-1.5 py-px text-[10px] font-bold text-mint">⚡ {t.serverFastLink}</span>;
     }
     const key = healthKey(s.source, s.provider);
     const stat = serverHealth.get(key);

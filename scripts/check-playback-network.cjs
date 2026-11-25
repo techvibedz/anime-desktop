@@ -170,7 +170,7 @@ const quiet = { info() {}, warn() {}, log() {} };
   const ast = ts.createSourceFile('Watch.tsx', watch, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   let effect;
   function visit(node) {
-    if (ts.isCallExpression(node) && node.expression.getText(ast) === 'useEffect' && node.arguments[1]?.getText(ast) === '[resolvedUrl, resolvedType, resolvedEmbed, advanceToNext, stepDownQuality]') effect = node.getText(ast);
+    if (ts.isCallExpression(node) && node.expression.getText(ast) === 'useEffect' && node.arguments[1]?.getText(ast) === '[resolvedUrl, resolvedType, resolvedEmbed, advanceToNext, stepDownQuality, activateServer]') effect = node.getText(ast);
     ts.forEachChild(node, visit);
   }
   visit(ast); assert.ok(effect, 'Watch stream wiring effect found');
@@ -207,6 +207,9 @@ const quiet = { info() {}, warn() {}, log() {} };
     brokenIdsRef: { current: new Set() }, serverFailureKey: (s) => s.iframeUrl, SLOW_LINK_GRACE_MS: 5000,
     speedSampleFor: () => null, measureServerSpeed: () => Promise.resolve(null),
     groupHosts: () => new Map(), groupKey: () => '', serverVerdict: () => null,
+    // Can't-keep-up detector + speed switch: inert without readings.
+    serverTier: () => null, tierRank: () => 3, markPlaybackSlow() {}, progressiveNeedKbps: () => 90,
+    activateServer() {}, speedSwitchesRef: { current: 0 }, setPlayingStream() {},
   };
   run(effect, player);
   assert.equal(player.hasPlayedRef.current, true, 're-extraction retains mid-watch recovery budget');
@@ -266,5 +269,62 @@ const quiet = { info() {}, warn() {}, log() {} };
   assert.equal(media.reloads, previousReloads + 1, 'repeated stalled events cannot hide a frozen stream from watchdog');
   assert.equal(advances, 0, 'transient stall gets in-place recovery before switching');
   cleanup();
-  console.log('PASS playback network: warm-cache TTL, transport failover, signed URLs, cancellation, HLS backoff and stall recovery');
+
+  // ── Can't-keep-up detector: switch BEFORE the picture keeps freezing ──
+  const cur = { name: 'hgcloud FHD', iframeUrl: 'cur', provider: 'streamwish' };
+  const alt = { name: 'anime4up1', iframeUrl: 'alt', provider: 'anime4upcdn', videoUrl: 'https://cdn/alt.m3u8' };
+  const switched = [], markedSlow = [];
+  const rank = { great: 0, good: 1, ok: 2, slow: 4 };
+  Object.assign(player, {
+    sortedServersRef: { current: [cur, alt] }, activeServerUrlRef: { current: 'cur' },
+    serverTier: (s) => (s.iframeUrl === 'alt' ? 'great' : null), tierRank: (t) => (t == null ? 3 : rank[t]),
+    markPlaybackSlow: (url) => markedSlow.push(url), activateServer: (idx) => switched.push(idx),
+    speedSwitchesRef: { current: 0 }, manualPickUrlRef: { current: null },
+  });
+  const startPlaying = () => {
+    media.currentTime = 0; media.ranges = [[0, 8]]; media.paused = true; media.readyState = 4;
+    listeners.get('canplay')(); listeners.get('playing')(); media.paused = false;
+  };
+  // A) HLS whose buffer stays ~8s ahead and never grows: downloading no
+  // faster than it plays → switch to the server measured great.
+  player.resolvedType = 'hls'; player.resolvedUrl = signed.replace('video.mp4', 'master.m3u8'); player.hasPlayedRef.current = false;
+  clock = 1_000_000;
+  run(effect, player);
+  startPlaying();
+  for (let i = 0; i < 45 && !switched.length; i++) {
+    clock += 1000; media.currentTime += 1; media.ranges = [[0, media.currentTime + 8]]; tick();
+  }
+  assert.deepEqual(switched, [1], 'thin non-growing HLS buffer switches to the measured-fast server');
+  assert.deepEqual(markedSlow, ['cur'], 'the crawling server is marked slow by playback proof');
+  cleanup();
+
+  // B) Progressive stream rebuffering twice in 90s → switch, even though
+  // each stall is far shorter than the 15s watchdog.
+  switched.length = 0; markedSlow.length = 0; player.speedSwitchesRef.current = 0;
+  player.resolvedType = 'mp4'; player.resolvedUrl = 'https://a3.mp4upload.com:183/d/x/video.mp4'; player.hasPlayedRef.current = false;
+  clock = 2_000_000;
+  run(effect, player);
+  startPlaying();
+  const advance = (n, moving) => { for (let i = 0; i < n && !switched.length; i++) { clock += 1000; if (moving) media.currentTime += 1; media.ranges = [[0, media.currentTime + 2]]; tick(); } };
+  advance(12, true); advance(3, false); advance(5, true); advance(3, false); advance(2, true);
+  assert.deepEqual(switched, [1], 'two short rebuffers switch to the measured-fast server');
+  cleanup();
+
+  // C) A healthy, growing buffer and a manual pick are never switched.
+  switched.length = 0; player.speedSwitchesRef.current = 0;
+  player.resolvedType = 'hls'; player.resolvedUrl = signed.replace('video.mp4', 'master.m3u8'); player.hasPlayedRef.current = false;
+  clock = 3_000_000;
+  run(effect, player);
+  startPlaying();
+  for (let i = 0; i < 60; i++) { clock += 1000; media.currentTime += 1; media.ranges = [[0, media.currentTime + 8 + i * 2]]; tick(); }
+  assert.equal(switched.length, 0, 'growing buffer is left alone');
+  cleanup();
+  player.manualPickUrlRef.current = 'cur';
+  clock = 4_000_000; player.hasPlayedRef.current = false;
+  run(effect, player);
+  startPlaying();
+  for (let i = 0; i < 60; i++) { clock += 1000; media.currentTime += 1; media.ranges = [[0, media.currentTime + 8]]; tick(); }
+  assert.equal(switched.length, 0, 'a server the user picked by hand is never yanked for speed');
+  cleanup();
+  console.log('PASS playback network: warm-cache TTL, transport failover, signed URLs, cancellation, HLS backoff and stall recovery, cant-keep-up switch');
 })().catch(error => { console.error(error); process.exitCode = 1; });

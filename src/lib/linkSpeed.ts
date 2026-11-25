@@ -42,12 +42,28 @@ function qualityOf(name: string): number {
   return 0;
 }
 
+// Expected runtime of the episode being watched, for turning a progressive
+// file's size into its bitrate. The player sets it from the saved progress /
+// the media element once known; 24 min (a TV episode) until then.
+const DEFAULT_DURATION_SEC = 24 * 60;
+let expectedDurationSec = DEFAULT_DURATION_SEC;
+export function setExpectedDurationSec(sec: number | null | undefined): void {
+  expectedDurationSec = sec && Number.isFinite(sec) && sec > 60 ? sec : DEFAULT_DURATION_SEC;
+}
+
 /** KB/s a progressive file needs. vid3rb signs its pacing rate into the URL as
  * `speed=` (measured: always 2.4× the file's average bitrate, e.g. 720p
- * speed=189 for a 110.7MB / 23.5min file = 78KB/s). Others: by quality. */
-export function progressiveNeedKbps(name: string, videoUrl: string): number {
+ * speed=189 for a 110.7MB / 23.5min file = 78KB/s). Otherwise the file size
+ * over the runtime is the real average bitrate — a quality label lies (an
+ * mp4upload "FHD" file was 465MB for 24 min = 323KB/s, not the 180 guessed
+ * from "FHD", so a 238KB/s link was ranked fast and stalled every few
+ * seconds). The label is the last resort. */
+export function progressiveNeedKbps(name: string, videoUrl: string, totalBytes = 0): number {
   const speed = /[?&]speed=(\d+)/.exec(videoUrl);
   if (speed && /vid3rb\.com/i.test(videoUrl)) return Math.max(20, Math.round(Number(speed[1]) / 2.4));
+  if (totalBytes > 8_000_000) {
+    return Math.min(2500, Math.max(30, Math.round(totalBytes / 1024 / expectedDurationSec)));
+  }
   const q = qualityOf(name);
   if (q >= 1080) return 180;
   if (q >= 720) return 90;
@@ -62,6 +78,24 @@ function fresh(s: SpeedSample | undefined): s is SpeedSample {
 export function verdictOf(sample: SpeedSample | null | undefined): SpeedVerdict | null {
   if (!sample || sample.kbps < 0 || sample.needKbps <= 0) return null;
   return sample.kbps >= sample.needKbps * SPEED_HEADROOM ? "fast" : "slow";
+}
+
+/** Graded headroom. "fast" alone put a 52KB/s anime3rb 480p (2× its bitrate,
+ * stalls on any dip, slow to seek) above anime4up at 1.9MB/s (20×) because the
+ * static provider order broke the tie. great ≥3×, good ≥2×, ok ≥1.3×. */
+export type SpeedTier = "great" | "good" | "ok" | "slow";
+export function tierOf(sample: SpeedSample | null | undefined): SpeedTier | null {
+  if (!sample || sample.kbps < 0 || sample.needKbps <= 0) return null;
+  const ratio = sample.kbps / sample.needKbps;
+  if (ratio >= 3) return "great";
+  if (ratio >= 2) return "good";
+  if (ratio >= SPEED_HEADROOM) return "ok";
+  return "slow";
+}
+
+/** Sort key: proven headroom first, unmeasured in the middle, slow last. */
+export function tierRank(tier: SpeedTier | null): number {
+  return tier === "great" ? 0 : tier === "good" ? 1 : tier === "ok" ? 2 : tier === "slow" ? 4 : 3;
 }
 
 export function speedSampleFor(iframeUrl: string): SpeedSample | null {
@@ -102,6 +136,13 @@ async function withProbeSlot<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
+// The server currently streaming through the read-ahead proxy. A probe of it
+// opens a second connection to the same file: vid3rb paces/503s that, and the
+// probe splits the very link the player is using — it read a 720p stream that
+// was playing 3× ahead of real time as "69KB/s, slow". Never probe it.
+let playingStream: string | null = null;
+export function setPlayingStream(iframeUrl: string | null): void { playingStream = iframeUrl; }
+
 /** Measure a resolved stream once per embed (deduped, cached 15 min).
  * Resolves null when the stream can't be measured (custom scheme, probe API
  * missing, zero bytes) — unknown is never treated as slow. */
@@ -112,6 +153,7 @@ export function measureServerSpeed(
   opts: { force?: boolean } = {},
 ): Promise<SpeedSample | null> {
   const cached = speedSampleFor(server.iframeUrl);
+  if (playingStream && playingStream === server.iframeUrl) return Promise.resolve(cached);
   // force: the player is stalling on a stream measured fine earlier — vid3rb
   // redirects each request to whichever files-N box it likes, so a reading
   // can describe a different box than the one playback landed on.
@@ -127,9 +169,9 @@ export function measureServerSpeed(
       if (!r?.ok) return null;
       const needKbps = type === "hls"
         ? (r.needKbps || 90)
-        : progressiveNeedKbps(server.name, videoUrl);
+        : progressiveNeedKbps(server.name, videoUrl, r.totalBytes || 0);
       const sample = recordSpeed(server.iframeUrl, { kbps: r.kbps, needKbps, host: r.host });
-      console.info(`[speed] ${server.name}: ${r.kbps}KB/s (needs ${needKbps}) @ ${r.host} → ${verdictOf(sample)}`);
+      console.info(`[speed] ${server.name}: ${r.kbps}KB/s (needs ${needKbps}) @ ${r.host} → ${tierOf(sample)}`);
       return sample;
     })
     .catch(() => null)
@@ -143,6 +185,15 @@ export function recordUnresponsive(iframeUrl: string): void {
   recordSpeed(iframeUrl, { kbps: 0, needKbps: 1, host: "" });
 }
 
+/** Playback itself proved this stream can't keep up (it rebuffered or its
+ * buffer kept draining). That beats any probe reading — a probe sees a
+ * connection's opening burst, playback sees the sustained rate. No host:
+ * sibling servers can live on other boxes. */
+export function markPlaybackSlow(iframeUrl: string, needKbps = 1): void {
+  const need = Math.max(1, needKbps);
+  recordSpeed(iframeUrl, { kbps: Math.round(need * 0.9), needKbps: need, host: "" });
+}
+
 /** Verdict for a server, falling back to its media host's reading so
  * unmeasured siblings inherit it. A host that crawled for ANY of its streams
  * is slow for all of them: the route is the problem, and it fluctuates (the
@@ -153,14 +204,25 @@ export function serverVerdict(
   server: { name: string; iframeUrl: string; provider: string; videoUrl?: string },
   groupHost?: string | null,
 ): SpeedVerdict | null {
+  const tier = serverTier(server, groupHost);
+  return tier == null ? null : tier === "slow" ? "slow" : "fast";
+}
+
+/** Graded counterpart of serverVerdict, with the same host inheritance. An
+ * inherited reading never vouches for more than "ok": the sibling's own file
+ * and box are unproven. */
+export function serverTier(
+  server: { name: string; iframeUrl: string; provider: string; videoUrl?: string },
+  groupHost?: string | null,
+): SpeedTier | null {
   const own = speedSampleFor(server.iframeUrl);
-  if (own) return verdictOf(own);
+  if (own) return tierOf(own);
   const host = groupHost ? hostSample(groupHost) : null;
   if (!host) return null;
-  const hostVerdict = verdictOf(host);
-  if (hostVerdict !== "fast") return hostVerdict;
-  if (server.provider !== "vid3rb" && !server.videoUrl) return hostVerdict;
-  return verdictOf({ ...host, needKbps: progressiveNeedKbps(server.name, server.videoUrl || "") });
+  const hostTier = tierOf(host);
+  if (hostTier == null || hostTier === "slow") return hostTier;
+  if (server.provider !== "vid3rb" && !server.videoUrl) return "ok";
+  return tierOf({ ...host, needKbps: progressiveNeedKbps(server.name, server.videoUrl || "") }) === "slow" ? "slow" : "ok";
 }
 
 /** Media host of the first measured server in each source+provider group —
@@ -184,5 +246,5 @@ export function groupKey(s: { provider: string; source?: string }): string {
 }
 
 export function __resetSpeedForTests(): void {
-  samples.clear(); hostSamples.clear(); inflight.clear(); probeQueue.length = 0; activeProbes = 0;
+  samples.clear(); hostSamples.clear(); inflight.clear(); probeQueue.length = 0; activeProbes = 0; playingStream = null;
 }

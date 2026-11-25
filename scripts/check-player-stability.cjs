@@ -66,7 +66,7 @@ for (const decl of ['const resolvedUrl = resolved?.url;', 'const resolvedType = 
   assert.ok(src.includes(decl), `wiring primitives declared: ${decl}`);
 }
 assert.ok(
-  src.includes('}, [resolvedUrl, resolvedType, resolvedEmbed, advanceToNext, stepDownQuality]);'),
+  src.includes('}, [resolvedUrl, resolvedType, resolvedEmbed, advanceToNext, stepDownQuality, activateServer]);'),
   'wiring effect depends on primitives + stable callbacks, never the resolved object',
 );
 

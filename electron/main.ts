@@ -11,6 +11,7 @@ import { createDecipheriv, randomBytes } from "node:crypto";
 import https from "node:https";
 import { isIP } from "node:net";
 import { networkInterfaces } from "node:os";
+import { initReadAhead, openReadAhead, readAheadStats, closeReadAhead, setReadAheadRuntime } from "./readAhead";
 
 // Disable QUIC so Chromium falls back to TCP/HTTP2. Restrictive ISPs
 // often block or mangle QUIC (UDP/443), causing ERR_QUIC_PROTOCOL_ERROR
@@ -1048,11 +1049,67 @@ async function extractVidea(iframeUrl: string, background = false) {
     ?? extractViaCapture(iframeUrl, "extractVidea", 25000, background);
 }
 
+// hgcloud.to / streamwish.to / masukestin.com now answer with a ~450-byte
+// obfuscated loader (main.js) that picks a mirror in the browser, so the static
+// page has no player and every hgcloud server fell through to a 20-35s headless
+// capture — the witanime episode's FIRST server, i.e. the one an early Play
+// click waits on. The same file id is served with the packed player on these
+// mirrors (verified 2026-11-25; swdyu/embedwish are mobile's list).
+const STREAMWISH_MIRRORS = ["swdyu.com", "embedwish.com", "hanerix.com", "vibuxer.com", "audinifer.com"];
+const streamwishStubHosts = new Set(["hgcloud.to", "streamwish.to", "masukestin.com"]);
+let streamwishMirrorWinner: string | null = null;
+
+function streamwishFileId(iframeUrl: string): string | null {
+  try { return new URL(iframeUrl).pathname.match(/\/(?:e|v|f|d|embed)\/([a-z0-9]+)/i)?.[1] || null; }
+  catch { return null; }
+}
+
+/** Race the mirrors: last winner first, the rest staggered 500ms apart, first
+ *  playable hit wins. Losers finish in the background (each fetch is capped). */
+function extractStreamwishMirrors(iframeUrl: string, exceptHost: string): Promise<{ url: string; type: "hls" | "mp4"; denied?: boolean } | null> {
+  const id = streamwishFileId(iframeUrl);
+  if (!id) return Promise.resolve(null);
+  const order = [...new Set([streamwishMirrorWinner, ...STREAMWISH_MIRRORS].filter((h): h is string => !!h && h !== exceptHost))];
+  return new Promise((resolve) => {
+    let pending = order.length;
+    let deniedCount = 0;
+    let done = false;
+    if (!pending) { resolve(null); return; }
+    order.forEach((host, i) => {
+      setTimeout(async () => {
+        if (done) { pending--; return; }
+        const r = await extractViaHtml(`https://${host}/e/${id}`, "extractStreamwish:mirror").catch(() => null);
+        pending--;
+        if (r?.denied) deniedCount++;
+        if (!done && r?.url && !r.denied) {
+          done = true;
+          streamwishMirrorWinner = host;
+          console.info(`[extractStreamwish] mirror ${host} → ${r.url.slice(0, 120)}`);
+          resolve({ url: r.url, type: r.type });
+          return;
+        }
+        // Every mirror answered and at least two say the file is gone: it was
+        // deleted — report it instead of burning a 35s capture on it.
+        if (!done && pending === 0) resolve(deniedCount >= 2 ? { url: "", type: "mp4", denied: true } : null);
+      }, i * 500);
+    });
+  });
+}
+
 async function extractStreamwish(iframeUrl: string, background = false) {
   // streamwish inlines its hls source in a packed-JS blob — the static pass
-  // resolves it in well under a second. Headless capture (which also rides
-  // out Cloudflare challenges) remains the fallback.
-  return (await extractViaHtml(iframeUrl, "extractStreamwish"))
+  // resolves it in well under a second. A loader-stub host goes straight to the
+  // mirrors; headless capture (which also rides out Cloudflare challenges)
+  // stays the last resort.
+  let host = "";
+  try { host = new URL(iframeUrl).hostname.replace(/^www\./, "").toLowerCase(); } catch {}
+  if (!streamwishStubHosts.has(host)) {
+    const direct = await extractViaHtml(iframeUrl, "extractStreamwish");
+    if (direct) return direct;
+    // Learn new loader hosts: a tiny page with no player is the stub.
+    streamwishStubHosts.add(host);
+  }
+  return (await extractStreamwishMirrors(iframeUrl, host))
     ?? extractViaCapture(iframeUrl, "extractStreamwish", 35000, background);
 }
 
@@ -1226,7 +1283,7 @@ async function extractViaHtml(
       // Mobile parity: mobile fetches streamwish-family embeds WITHOUT a
       // Referer (their rotated mirrors tarpit the streamwish.to literal — the
       // same reason the playback branch now uses the video-host root).
-      if (!/streamwish|hgcloud|wishfast|wishembed|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(u.hostname)) {
+      if (!/streamwish|hgcloud|wishfast|wishembed|embedwish|swdyu|jwembed|hlswish|vibuxer|audinifer|masukestin|hanerix/.test(u.hostname)) {
         headers.Referer = canon.referer;
         headers.Origin = canon.origin;
       }
@@ -4040,7 +4097,7 @@ app.whenReady().then(() => {
   ipcMain.handle("pantoufa:measure-media", async (
     _evt,
     opts: { url: string; iframeUrl?: string; maxMs?: number },
-  ): Promise<{ ok: boolean; kbps: number; needKbps: number; bytes: number; ms: number; host: string; status: number }> => {
+  ): Promise<{ ok: boolean; kbps: number; needKbps: number; bytes: number; ms: number; host: string; status: number; totalBytes?: number }> => {
     const deadline = Date.now() + Math.min(Math.max(Number(opts?.maxMs) || 6000, 2000), 12000);
     const empty = { ok: false, kbps: 0, needKbps: 0, bytes: 0, ms: 0, host: "", status: 0 };
     const ua = mainWindow?.webContents.getUserAgent() || PLAYBACK_UA;
@@ -4152,10 +4209,14 @@ app.whenReady().then(() => {
       const ctype = first.header("content-type").toLowerCase();
       const looksHls = /mpegurl/.test(ctype) || /\.m3u8(\?|$)/i.test(url.pathname + url.search);
       if (!looksHls) {
-        // Progressive: the needed rate depends on the file's bitrate, which
-        // the renderer estimates from the provider/quality.
+        // Progressive: the needed rate is the file's average bitrate. Report
+        // the full size (Content-Range total, else Content-Length) so the
+        // renderer can divide it by the runtime instead of guessing from the
+        // quality label.
+        const range = /\/(\d+)\s*$/.exec(first.header("content-range"));
+        const totalBytes = range ? Number(range[1]) : first.status === 200 ? Number(first.header("content-length") || 0) : 0;
         const { bytes, ms, kbps } = await readRate(first, 4_000_000);
-        return { ok: true, kbps, needKbps: 0, bytes, ms, host: hostOf(first.finalUrl), status: first.status };
+        return { ok: true, kbps, needKbps: 0, bytes, ms, host: hostOf(first.finalUrl), status: first.status, totalBytes };
       }
       // HLS: master → lowest variant (ABR can always fall back to it) → a
       // media segment a few in (the first is often tiny).
@@ -4204,6 +4265,22 @@ app.whenReady().then(() => {
   // (warm-ups, home/listing pre-resolves) so the priority extraction starts
   // immediately instead of waiting behind warm-up captures.
   ipcMain.handle("pantoufa:cancel-background-scrapes", async () => ({ cancelled: cancelBackgroundJobs() }));
+
+  // Read-ahead proxy for progressive streams (see electron/readAhead.ts).
+  initReadAhead({
+    allowHost,
+    userAgent: () => mainWindow?.webContents.getUserAgent() || PLAYBACK_UA,
+  });
+  ipcMain.handle("pantoufa:readahead-open", async (_e, opts: { url: string; runtimeSec?: number }) => {
+    try { return await openReadAhead(String(opts?.url || ""), Number(opts?.runtimeSec) || undefined); }
+    catch (e) { console.warn("[read-ahead] open failed:", e); return null; }
+  });
+  ipcMain.handle("pantoufa:readahead-stats", (_e, id: string) => readAheadStats(String(id || "")));
+  ipcMain.handle("pantoufa:readahead-runtime", (_e, opts: { id: string; runtimeSec: number }) => {
+    setReadAheadRuntime(String(opts?.id || ""), Number(opts?.runtimeSec) || 0);
+    return true;
+  });
+  ipcMain.handle("pantoufa:readahead-close", (_e, id: string) => { closeReadAhead(String(id || "")); return true; });
 
   // Sidecar subtitle text (VTT) for the custom player. Fetched here so the
   // renderer gets a same-origin blob URL — a bare <track src> would need CORS

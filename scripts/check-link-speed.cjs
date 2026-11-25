@@ -63,6 +63,42 @@ off();
 speed.recordSpeed('z', { kbps: 1, needKbps: 1, host: '' });
 assert.equal(ticks, 1);
 
+// Graded tiers: headroom decides the order, not pass/fail (a 52KB/s anime3rb
+// 480p at 2× must rank below anime4up at 1.9MB/s).
+const at = Date.now();
+assert.equal(speed.tierOf({ kbps: 1900, needKbps: 110, host: '', at }), 'great');
+assert.equal(speed.tierOf({ kbps: 52, needKbps: 26, host: '', at }), 'good');
+assert.equal(speed.tierOf({ kbps: 238, needKbps: 180, host: '', at }), 'ok');
+assert.equal(speed.tierOf({ kbps: 66, needKbps: 141, host: '', at }), 'slow');
+assert.equal(speed.tierOf(null), null);
+assert.ok(speed.tierRank('great') < speed.tierRank('good'));
+assert.ok(speed.tierRank('ok') < speed.tierRank(null), 'measured ok outranks unmeasured');
+assert.ok(speed.tierRank(null) < speed.tierRank('slow'), 'unmeasured outranks slow');
+
+// File size over runtime is the real bitrate: the 465MB mp4upload "FHD" file
+// needs ~323KB/s, not the 180 guessed from its label.
+speed.setExpectedDurationSec(null);
+assert.equal(speed.progressiveNeedKbps('Mp4upload FHD', 'https://a3.mp4upload.com:183/d/x/video.mp4', 465117205), 315);
+speed.setExpectedDurationSec(100 * 60);
+assert.equal(speed.progressiveNeedKbps('Movie', 'https://x/video.mp4', 1_200_000_000), 195);
+speed.setExpectedDurationSec(null);
+assert.equal(speed.progressiveNeedKbps('Anime3rb 720p', 'https://video.vid3rb.com/video/x?speed=189', 465117205), 79, 'vid3rb speed= still wins');
+assert.equal(speed.progressiveNeedKbps('Some 480p', '', 1000), 45, 'tiny/unknown size falls back to the label');
+
+// Playback proof beats a probe: a stream that rebuffered ranks slow.
+speed.__resetSpeedForTests();
+speed.recordSpeed('mp', { kbps: 3000, needKbps: 90, host: 'a3.mp4upload.com' });
+assert.equal(speed.serverTier({ name: 'x', iframeUrl: 'mp', provider: 'mp4upload' }, null), 'great');
+speed.markPlaybackSlow('mp', 315);
+assert.equal(speed.serverTier({ name: 'x', iframeUrl: 'mp', provider: 'mp4upload' }, null), 'slow');
+assert.equal(speed.serverVerdict({ name: 'x', iframeUrl: 'mp', provider: 'mp4upload' }, null), 'slow');
+
+// An inherited host reading never vouches for more than "ok".
+speed.__resetSpeedForTests();
+speed.recordSpeed('p480', { kbps: 2000, needKbps: 34, host: 'files-2.vid3rb.com' });
+hosts = speed.groupHosts([s480, s720]);
+assert.equal(speed.serverTier(s720, hosts.get(speed.groupKey(s720))), 'ok');
+
 // Warm-up spreads across providers before a second quality of one.
 const list = [
   { name: 'Anime3rb 1080p', provider: 'vid3rb', iframeUrl: 'a' },
