@@ -1,11 +1,12 @@
 import { Link, NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
-import { useState, useEffect, useRef, type FormEvent } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, type FormEvent } from "react";
 import { useAuth } from "../lib/auth";
 import { clearHomeCache } from "../lib/api";
 import { getUnreadCount, subscribeNotifications } from "../lib/notifications";
 import { isAdmin } from "../lib/presence";
 import { useOnlineStatus } from "../lib/net";
 import { t } from "../lib/i18n";
+import { LiquidGlassDefs } from "./LiquidGlassDefs";
 
 // Stroke icon set — one visual voice for the whole shell.
 export function Icon({ d, size = 20, stroke = 1.8 }: { d: string; size?: number; stroke?: number }) {
@@ -63,7 +64,7 @@ const NAV_ADMIN: NavEntry[] = [
 
 const COLLAPSE_KEY = "@sidebar_collapsed_v1";
 
-function NavItem({ item, unread, collapsed }: { item: NavEntry; unread: number; collapsed: boolean }) {
+function NavItem({ item, unread, collapsed, paper }: { item: NavEntry; unread: number; collapsed: boolean; paper: boolean }) {
   return (
     <NavLink
       to={item.to}
@@ -73,15 +74,15 @@ function NavItem({ item, unread, collapsed }: { item: NavEntry; unread: number; 
         `group relative flex items-center gap-3 rounded-control py-2.5 text-[14px] font-semibold transition-colors duration-150 ${
           collapsed ? "justify-center px-0" : "px-3"
         } ${
-          isActive
-            ? "bg-accent/[0.12] text-white"
-            : "text-text-muted hover:bg-white/[0.05] hover:text-white"
+          paper
+            ? isActive ? "text-m-ink" : "text-m-muted hover:bg-black/[0.04] hover:text-m-ink"
+            : isActive ? "text-white" : "text-text-muted hover:bg-white/[0.05] hover:text-white"
         }`
       }
     >
       {({ isActive }) => (
         <>
-          <span className={`relative flex shrink-0 ${isActive ? "text-accent" : ""}`}>
+          <span className={`relative flex shrink-0 ${isActive ? (paper ? "text-m-accent" : "text-accent") : ""}`}>
             <Icon d={item.d} />
             {item.badge && unread > 0 && collapsed && (
               <span className="absolute -end-1 -top-1 h-2 w-2 rounded-full bg-mint" aria-hidden />
@@ -99,18 +100,55 @@ function NavItem({ item, unread, collapsed }: { item: NavEntry; unread: number; 
   );
 }
 
-function NavGroup({ label, items, unread, collapsed }: { label: string; items: NavEntry[]; unread: number; collapsed: boolean }) {
+function NavGroup({ label, items, unread, collapsed, paper }: { label: string; items: NavEntry[]; unread: number; collapsed: boolean; paper: boolean }) {
   return (
     <div className="space-y-0.5">
       {collapsed ? (
-        <div className="mx-auto my-2 h-px w-8 bg-white/[0.06]" />
+        <div className={`mx-auto my-2 h-px w-8 ${paper ? "bg-black/[0.08]" : "bg-white/[0.06]"}`} />
       ) : (
-        <p className="px-3 pb-1.5 pt-4 text-[11px] font-bold tracking-wide text-text-muted/70">{label}</p>
+        <p className={`px-3 pb-1.5 pt-4 text-[11px] font-bold tracking-wide ${paper ? "text-m-muted/80" : "text-text-muted/70"}`}>{label}</p>
       )}
       {items.map((item) => (
-        <NavItem key={item.to} item={item} unread={unread} collapsed={collapsed} />
+        <NavItem key={item.to} item={item} unread={unread} collapsed={collapsed} paper={paper} />
       ))}
     </div>
+  );
+}
+
+// The liquid bubble behind the active sidebar item: one glass droplet that
+// slides (springy overshoot + a brief stretch) to whichever item is active.
+// Pure CSS transforms — composited, no layout work while it moves.
+function NavBubble({ containerRef, path, collapsed, paper }: { containerRef: React.RefObject<HTMLDivElement | null>; path: string; collapsed: boolean; paper: boolean }) {
+  const [box, setBox] = useState<{ top: number; height: number } | null>(null);
+  const [moving, setMoving] = useState(false);
+  const prevTop = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    const measure = () => {
+      const root = containerRef.current;
+      const el = root?.querySelector<HTMLElement>('a[aria-current="page"]');
+      if (!root || !el) { setBox(null); return; }
+      const top = el.offsetTop;
+      setBox({ top, height: el.offsetHeight });
+      if (prevTop.current != null && prevTop.current !== top) {
+        setMoving(false);
+        requestAnimationFrame(() => setMoving(true));
+      }
+      prevTop.current = top;
+    };
+    // Measure after the commit: the list's ref is attached after this child's
+    // layout effect runs, so measuring synchronously found nothing.
+    const raf = requestAnimationFrame(measure);
+    window.addEventListener("resize", measure);
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", measure); };
+  }, [containerRef, path, collapsed]);
+  if (!box) return null;
+  return (
+    <span
+      aria-hidden
+      className={`lg-bubble ${paper ? "lg-bubble-paper" : ""} ${moving ? "lg-bubble-moving" : ""}`}
+      style={{ transform: `translateY(${box.top}px)`, height: box.height }}
+      onAnimationEnd={() => setMoving(false)}
+    />
   );
 }
 
@@ -137,6 +175,7 @@ export function Layout() {
     try { return localStorage.getItem(COLLAPSE_KEY) === "1"; } catch { return false; }
   });
   const menuRef = useRef<HTMLDivElement>(null);
+  const navListRef = useRef<HTMLDivElement>(null);
   const { online } = useOnlineStatus();
   const admin = isAdmin(user?.email);
   const path = location.pathname;
@@ -222,19 +261,21 @@ export function Layout() {
     return () => window.removeEventListener("click", onClick);
   }, []);
 
+  // Floating glass sidebar inset 12px from the window edge; content clears it.
   const sidebarW = collapsed ? "w-[76px]" : "w-64";
-  const mainPs = collapsed ? "ps-[76px]" : "ps-64";
+  const mainPs = collapsed ? "ps-[100px]" : "ps-[280px]";
   const avatar = user?.user_metadata?.avatar_url as string | undefined;
   const initial = user?.email?.[0]?.toUpperCase() ?? "?";
 
   return (
     <div className="min-h-screen bg-bg text-text">
-      <aside className={`fixed inset-y-0 start-0 z-sticky flex ${sidebarW} flex-col border-e border-white/[0.05] bg-bg-deep transition-[width] duration-200`}>
+      <LiquidGlassDefs />
+      <aside className={`lg ${manga ? "lg-paper" : "lg-dark"} fixed inset-y-3 start-3 z-sticky flex ${sidebarW} flex-col rounded-[24px] transition-[width] duration-200`}>
         <div className={`flex h-16 shrink-0 items-center ${collapsed ? "justify-center" : "justify-between px-4"}`}>
           {!collapsed && (
             <Link to="/" className="flex items-center gap-2.5">
               <img src="./logo.png" alt="" className="h-8 w-8 rounded-[10px]" />
-              <span className="text-[19px] font-extrabold tracking-tight text-white">{t.appName}</span>
+              <span className={`text-[19px] font-extrabold tracking-tight ${manga ? "text-m-ink" : "text-white"}`}>{t.appName}</span>
             </Link>
           )}
           <button
@@ -242,17 +283,20 @@ export function Layout() {
             onClick={() => setCollapsed((v) => !v)}
             aria-label={t.menu}
             title={t.menu}
-            className="flex h-9 w-9 items-center justify-center rounded-control text-text-muted transition-colors hover:bg-white/[0.06] hover:text-white"
+            className={`flex h-9 w-9 items-center justify-center rounded-control transition-colors ${manga ? "text-m-muted hover:bg-black/[0.05] hover:text-m-ink" : "text-text-muted hover:bg-white/[0.06] hover:text-white"}`}
           >
             <Icon d={ICONS.collapse} size={18} />
           </button>
         </div>
 
         <nav className={`no-scrollbar flex-1 overflow-y-auto pb-4 ${collapsed ? "px-3" : "px-3"}`}>
-          <NavGroup label={t.navBrowse} items={NAV_BROWSE} unread={unread} collapsed={collapsed} />
-          <NavGroup label={t.navLibrary} items={NAV_LIBRARY} unread={unread} collapsed={collapsed} />
-          <NavGroup label={t.navAccount} items={NAV_ACCOUNT} unread={unread} collapsed={collapsed} />
-          {admin && <NavGroup label={t.navAdmin} items={NAV_ADMIN} unread={unread} collapsed={collapsed} />}
+          <div ref={navListRef} className="relative">
+            <NavBubble containerRef={navListRef} path={path} collapsed={collapsed} paper={manga} />
+            <NavGroup label={t.navBrowse} items={NAV_BROWSE} unread={unread} collapsed={collapsed} paper={manga} />
+            <NavGroup label={t.navLibrary} items={NAV_LIBRARY} unread={unread} collapsed={collapsed} paper={manga} />
+            <NavGroup label={t.navAccount} items={NAV_ACCOUNT} unread={unread} collapsed={collapsed} paper={manga} />
+            {admin && <NavGroup label={t.navAdmin} items={NAV_ADMIN} unread={unread} collapsed={collapsed} paper={manga} />}
+          </div>
         </nav>
       </aside>
 
@@ -260,7 +304,7 @@ export function Layout() {
         {!manga && (
           <header
             className={`sticky top-0 z-sticky -mb-16 flex h-16 items-center gap-3 px-8 transition-colors duration-200 ${
-              scrolled ? "border-b border-white/[0.06] bg-bg/[0.97] shadow-[0_8px_24px_-12px_rgba(0,0,0,0.8)]" : "bg-gradient-to-b from-bg/80 to-transparent"
+              scrolled ? "lg lg-dark !rounded-none !border-x-0 !border-t-0" : "bg-gradient-to-b from-bg/80 to-transparent"
             }`}
           >
             {canGoBack && (
@@ -269,7 +313,7 @@ export function Layout() {
                 onClick={() => (window.history.length > 1 ? navigate(-1) : navigate("/"))}
                 aria-label={t.back}
                 title={t.back}
-                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/[0.06] text-white transition-colors hover:bg-white/[0.12]"
+                className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-full lg lg-refract lg-hover text-white"
               >
                 <Icon d={ICONS.back} size={18} stroke={2.2} />
               </button>
@@ -286,7 +330,7 @@ export function Layout() {
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder={t.searchPlaceholderShort}
                   aria-label={t.search}
-                  className="h-10 w-full rounded-full border border-white/[0.08] bg-white/[0.06] pe-14 ps-10 text-sm text-white outline-none backdrop-blur-md transition-colors placeholder:text-text-muted focus:border-accent/60 focus:bg-black/40"
+                  className="lg h-10 w-full rounded-full pe-14 ps-10 text-sm text-white outline-none transition-colors placeholder:text-text-muted focus:border-accent/60"
                 />
                 <kbd className="pointer-events-none absolute inset-y-0 end-3 my-auto flex h-6 items-center rounded-md border border-white/10 px-1.5 font-display text-[10px] text-text-muted">
                   Ctrl K
@@ -301,7 +345,7 @@ export function Layout() {
                 disabled={refreshing}
                 aria-label={t.refresh}
                 title={t.refresh}
-                className="flex h-10 w-10 items-center justify-center rounded-full bg-white/[0.06] text-white transition-colors hover:bg-white/[0.12] disabled:opacity-60"
+                className="relative flex h-10 w-10 items-center justify-center rounded-full lg lg-refract lg-hover text-white disabled:opacity-60"
               >
                 <span className={refreshing ? "animate-spin" : ""}><Icon d={ICONS.refresh} size={18} /></span>
               </button>
@@ -309,7 +353,7 @@ export function Layout() {
                 to="/notifications"
                 aria-label={t.notifications}
                 title={t.notifications}
-                className="relative flex h-10 w-10 items-center justify-center rounded-full bg-white/[0.06] text-white transition-colors hover:bg-white/[0.12]"
+                className="relative flex h-10 w-10 items-center justify-center rounded-full lg lg-refract lg-hover text-white"
               >
                 <Icon d={ICONS.bell} size={18} />
                 {unread > 0 && (
@@ -324,14 +368,14 @@ export function Layout() {
                   type="button"
                   onClick={() => setShowMenu((v) => !v)}
                   aria-label={t.profileTitle}
-                  className="flex h-10 items-center gap-2 rounded-full bg-white/[0.06] p-1 pe-1 ps-1 transition-colors hover:bg-white/[0.12]"
+                  className="relative flex h-10 items-center gap-2 rounded-full lg lg-refract lg-hover p-1 pe-1 ps-1"
                 >
                   <span className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-full bg-accent text-sm font-bold text-on-accent">
                     {avatar ? <img src={avatar} alt="" className="h-8 w-8 object-cover" /> : initial}
                   </span>
                 </button>
                 {showMenu && (
-                  <div className="absolute end-0 top-full z-modal mt-2 w-64 animate-sheetUp overflow-hidden rounded-card border border-white/[0.08] bg-surface p-1.5 shadow-lift">
+                  <div className="lg lg-dark absolute end-0 top-full z-modal mt-2 w-64 animate-sheetUp overflow-hidden rounded-[20px] p-1.5">
                     <div className="px-3 pb-2 pt-2.5">
                       <p className="truncate text-xs text-text-muted" dir="ltr">{user?.email ?? t.guest}</p>
                     </div>
